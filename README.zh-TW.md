@@ -4,33 +4,67 @@
 
 **Firn** 是一套開源、輕量級的 macOS Docker Linux VM 執行環境，以 Swift 與 Go 原生建構於 Apple `Virtualization.framework`（`VZVirtualMachine`）、`virtio-vsock`、`virtiofs` 與 Rosetta（`x86_64`）之上。
 
-它致力於以極低閒置資源取代龐大的桌面容器 Helper：不到 2 秒冷啟動、閒置僅 ~0.5% CPU、接近 1 GiB/s 的 vsock TCP 轉發吞吐、**不畏 macOS `vmenet` 數量耗盡與企業 VPN 的 vsock L3/L4 使用者態網路**、**cgroup v2 閒置冷凍與 zram 分層記憶體回收**、**17 ms 目標優先 Auto-Thaw**、**`https://*.firn.local`** 本機 HTTPS 代理、互動式 **`firn shell`** 與原生 **選單列監控 App（`Firn.app`）**。
+它致力於以極低閒置資源取代龐大的桌面容器 Helper：約 2.2 秒 Guest 開機（冷啟動 `firn up` 約 2.8 秒）、閒置僅 **0.3% CPU**、**~2.5k req/s HTTP/1.1 Keep-Alive** 與高速 vsock TCP 轉發、**不畏 macOS `vmenet` 數量耗盡與企業 VPN 的 vsock L3/L4 使用者態網路**、**cgroup v2 閒置冷凍與 zram 分層記憶體回收**、**~29 ms TCP / ~88 ms HTTPS 目標優先 Auto-Thaw**、**`https://*.firn.local`** 本機 HTTPS 代理、互動式 **`firn shell`** 與原生 **選單列監控 App（`Firn.app`）**。
 
 ## 為什麼選擇 Firn？
 
-- **近乎零待機功耗**：以 Docker `/events` 長輪詢事件驅動，無容器待機時 `firnd` 維持 **0.0% CPU**、VM 僅 **~0.5% CPU**。
-- **同時保留 10+ worktree 環境不吃光記憶體**：閒置 Compose 專案透過 `cgroup.freeze` 暫停並將冷頁壓縮回收到記憶體 `zram` 與 swapfile（容器 RAM 縮減約 **98%**）；一旦本機流量打進連接埠或 `*.firn.local`，目標容器毫秒級自動解凍接手連線。
+- **近乎零待機功耗**：以 Docker `/events` 長輪詢事件驅動，無容器待機時 `firnd` 與 VM 總計僅佔 **0.3% CPU**（RSS `~569 MiB`）。
+- **同時保留 10+ worktree 環境不吃光記憶體**：閒置 Compose 專案透過 `cgroup.freeze` 暫停並將冷頁壓縮回收到記憶體 `zram` 與 swapfile（容器 RAM 縮減約 **80–98%**，`zram0` 壓縮率約 `8.8×`）；一旦本機流量打進連接埠或 `*.firn.local`，目標容器毫秒級自動解凍接手連線。
 - **容器出網不受 `vmenet*` 上限與 VPN 影響**：除了 `vmnet` 外，`firn-guestd` 透過 `firn0` TUN + gVisor 使用者態網路堆疊走 `AF_VSOCK` 直接由 macOS 主機出網與解析 DNS，天然吃系統路由、企業代理與 split-DNS VPN。
 - **高吞吐迴環連線與雙棧支援**：256 KiB 非阻塞 `poll()` 轉發搭配 1 MiB socket buffer 與 `127.0.0.1` + `[::1]` 雙棧監聽，避開 IPv6 fallback 延遲。
 - **開箱即用的本機 HTTPS 與 SSH Agent 轉發**：內建主機 Root CA 與 `Network.framework` TLS 反向代理（`:8443`），並自動轉發 macOS `SSH_AUTH_SOCK` 至 `firn shell` 與容器建置流程。
 
 ## 實測數據（v0.3.0，同台 Apple Silicon Mac）
 
-在同台 Apple Silicon 工作站執行完整 6 容器本地開發環境（`PostgreSQL 18`、`Valkey/Redis`、`Qdrant`、`SpiceDB`、`SeaweedFS`、`Mailpit`）的實測對照：
+在同台工作站（**Apple M5 Max**、18 核心 CPU、36.0 GiB 記憶體、macOS 27.2.1、Docker `29.8.2`、Compose `5.5.0`，宿主存在 `251` 個 `vmenet*` 介面）以相同條件執行 **Firn v0.3.0** 與 **OrbStack** 完整 7 大類實測對照：
 
-| 指標 | Firn v0.3.0 | 商業桌面容器方案（同機實測） |
-| --- | --- | --- |
-| Guest 冷啟動就緒（`[firn-init] ready`） | **`1.73s`**（首次建盤 `1.17s`） | — |
-| 閒置宿主 CPU 佔用（0 容器待機） | **`0.5%`**（`firnd 0.0%` + VM `0.5%`） | **`96.5%`**（9 專案 / 62 容器） |
-| 宿主記憶體 RSS | **`~503–994 MiB`**（VM + daemon） | **`4,194.8 MiB`**（僅 Helper） |
-| `docker run --rm --entrypoint true postgres:18-alpine`（3 次中位數） | **`370.3 ms`** | `657.1 ms` |
-| VirtioFS 走訪 240 個原始碼檔案（3 次中位數） | **`357.9 ms`** | `626.0 ms` |
-| PostgreSQL `200x SELECT 1` TCP 平均延遲 | **`0.141 ms`**（`p50 0.134 ms`） | `0.182 ms` |
-| PostgreSQL `19.25 MiB` 批次查詢吞吐（中位數） | **`896.4 MiB/s`**（`21.5 ms`） | `164.6 MiB/s`（`118.6 ms`） |
-| 專案冷凍＋記憶體回收（`firn freeze --reclaim`） | `602.8 MB → 11.3 MB`（**釋放 98.1%**） | — |
-| 目標優先 Auto-Thaw（冷凍狀態直連 Redis `PING`） | **`17.3 ms`**（解凍 RTT `24.97 ms`） | — |
-| HTTPS Auto-Thaw（`https://*.firn.local:8443`） | **`0.281s`（HTTP 200）** | — |
-| 容器無代理 HTTPS 出網（宿主存在 251 個 `vmenet*`） | **`HTTP/2 200`**（走 `firn0` vsock netstack） | — |
+可於任何 Mac 上直接重現（僅相依 Python 3 標準函式庫；若系統具備 Go 工具鏈會編譯暫時性靜態輔助程式，所有暫存資源皆以 `firn-bench-*` 命名並於 `finally` 清除，不會更動現有容器與預設 `docker context`）：
+
+```sh
+python3 scripts/benchmark.py            # 執行並排對照報表（--compare）
+python3 scripts/benchmark.py --json     # 輸出完整結構化 JSON 報告
+```
+
+> **實測環境說明**：量測當下 OrbStack 亦同時承載 9 個既有背景 Compose 專案（共 62 個執行中容器，`OrbStack Helper` RSS 為 `3,388–7,395 MiB`、CPU `118–180%`）。Firn 於第 1–6 類測試期間無背景專案，於第 7 類同時啟動 3 組 2 容器基準測試專案。
+
+### 第 1–6 類：跨執行環境對照
+
+| 類別 | 測試指標 | Firn v0.3.0 | OrbStack |
+| --- | --- | --- | --- |
+| **1. 生命週期與 CLI** | `docker version`（5 次中位數） | `28.3 ms` | **`22.5 ms`** |
+| | `docker run --rm alpine:3.21 true`（5 次中位數） | **`401.1 ms`** | `477.6 ms` |
+| | `docker run --rm --entrypoint true postgres:18-alpine`（5 次中位數） | **`384.5 ms`** | `408.4 ms` |
+| | 3 服務 Compose 熱啟動 `up -d --wait`（`postgres` + `valkey` + `mailpit`） | `2,627.1 ms` | **`2,072.9 ms`** |
+| | 3 服務 Compose 卸除 `down -v --remove-orphans` | `4,422.3 ms` | **`825.5 ms`** |
+| **2. 具名 Volume I/O** | 循序寫入 256 MiB（`dd ... bs=1M count=256 conv=fsync`） | `709.8 MiB/s`（`360.7 ms`） | **`1,724.3 MiB/s`**（`148.5 ms`） |
+| | 循序讀取 256 MiB（`dd`，寫後 page-cache 命中） | `3,949.5 MiB/s`（`64.8 ms`） | **`4,913.7 MiB/s`**（`52.1 ms`） |
+| | 小檔突發讀寫（`1,000 × 4 KiB` 建立 + 寫入 + `fsync` + 刪除） | **`1,131.4 ms`（`883.8 ops/s`）** | `1,654.9 ms`（`604.3 ops/s`） |
+| **3. Bind Mount / VirtioFS** | 1,000 檔目錄走訪（`find /work -type f`，首次冷 / 3 次中位數） | **`445.0 ms` 冷** / `472.1 ms` 中位數 | `587.9 ms` 冷 / **`393.9 ms` 中位數** |
+| | 讀取全部 1,000 個檔案（容器內耗時 / 總耗時） | `407.2 ms`（總計 `891.9 ms`） | **`35.9 ms`**（總計 `371.0 ms`） |
+| | 建立 + 寫入 + 刪除 `500 × 4 KiB` 檔案（容器內耗時 / 總耗時） | `405.7 ms`（總計 `822.6 ms`） | **`140.7 ms`**（總計 `616.8 ms`） |
+| **4. 宿主 ↔ 容器網路** | 原始 TCP 128 MiB 宿主 → 容器 | `418.3 MiB/s`（`306.0 ms`） | **`2,360.3 MiB/s`**（`54.2 ms`） |
+| | 原始 TCP 128 MiB 容器 → 宿主 | `213.4 MiB/s`（`599.9 ms`） | **`4,172.3 MiB/s`**（`30.7 ms`） |
+| | HTTP/1.1 Keep-Alive（500 次請求，並行 16，Mailpit `/api/v1/info`） | **`2,514.0 req/s`**（`p50 5.70 ms`） | `2,197.1 req/s`（`p50 6.07 ms`） |
+| | HTTP/1.1 逐次新建連線（500 次請求，並行 16，Mailpit `/api/v1/info`） | `1,283.0 req/s`（`p50 10.21 ms`） | **`2,506.7 req/s`**（`p50 5.36 ms`） |
+| | 本機 HTTPS `https://mailpit.<stack>.firn.local:8443/api/v1/info`（`curl`） | **`HTTP 200`（`104.4 ms`）** | — |
+| | PostgreSQL `200x SELECT 1` RTT（平均 / p50 / p95） | `0.292 / 0.285 / 0.400 ms` | **`0.179 / 0.156 / 0.346 ms`** |
+| | PostgreSQL `19.25 MiB` 批次查詢（`20,185 × 1,000 B`，3 次中位數） | `213.1 MiB/s`（`90.3 ms`） | **`251.9 MiB/s`**（`76.4 ms`） |
+| **5. 對外 HTTPS 出網** | `alpine:3.21` 無代理 HTTPS 下載（宿主存在 `251` 個 `vmenet*`） | **`HTTP 200`**（`0.45 MiB/s`, `1.04s`, `firn0`） | **`HTTP 200`**（`1.83 MiB/s`, `0.25s`） |
+| **6. 映像檔建置** | `docker build --no-cache`（`FROM alpine:3.21`，500 個小檔） | **`464.5 ms`** | `2,180.0 ms`（慢 `4.7×`） |
+
+### 第 7 類：Firn VM 生命週期、多專案記憶體回收與 Auto-Thaw
+
+| 測試指標 | 實測結果 |
+| --- | --- |
+| 乾淨關機（`firn down`） | **`1,074.4 ms`**（`1.07s`） |
+| 冷啟動（`firn up` 總耗時 / Guest `[firn-init] ready`） | **`2,832.0 ms`** 總計（Daemon `2,532.5 ms`）/ **`2.19s`** Guest 開機時間 |
+| 閒置宿主佔用（`top -l 2 -s 5`，0 容器待機） | **`0.3%` CPU**、**`769.6 MiB`** Footprint（`firnd 23.9 MiB` + `VM 745.7 MiB`）、**`569.2 MiB`** RSS |
+| 同機 OrbStack 快照（9 專案 / 62 容器） | Helper **`118.1–180.3%` CPU**、**`3,388.2–7,395.4 MiB` RSS** |
+| 同時執行 3 組雙容器專案（`valkey:9.1.3-alpine` + `mailpit:v1.31.0`，共 6 容器）活躍記憶體 | `95.99 MiB`（`zram0` `0.02 MiB`） |
+| 冷凍並回收 3 組專案（`firn freeze <stack> --reclaim`） | `95.99 MiB → 19.24 MiB`（**釋放 `80.0%`**；`42.20 MiB` swap 壓縮為 **`4.78 MiB`** 存於 `zram0`，宿主 CPU **`0.6%`**） |
+| 目標優先 TCP Auto-Thaw（冷凍狀態直連 Valkey `PING` → `+PONG`） | **`28.75 ms`**（確認 `pausedCount = 0`） |
+| HTTPS Auto-Thaw（冷凍狀態請求 `https://mailpit.<stack>.firn.local:8443/`） | **`88.17 ms`**（`HTTP 200`，確認 `pausedCount = 0`） |
+| `firn bench --project <stack> --compare-orbstack` | 冷凍 `100.32 ms`、Guest 解凍 `41.21 ms`、宿主解凍 RTT `42.81 ms`、Balloon `8.00 GiB → 1.23 GiB` |
 
 ## 系統架構
 
