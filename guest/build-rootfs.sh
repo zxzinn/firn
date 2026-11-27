@@ -94,6 +94,7 @@ EOF
     truncate -s 2G /out/rootfs.ext4.tmp
     mke2fs -t ext4 -d /rootfs -L firn-root /out/rootfs.ext4.tmp >/dev/null
     mv /out/rootfs.ext4.tmp /out/rootfs.ext4
+    chmod 0644 /out/vmlinux.Image /out/initramfs.img /out/rootfs.ext4
   '
 
 printf '%s\n' "${FIRN_IMAGE_VERSION:-local-build}" >"$OUT_DIR/version.txt"
