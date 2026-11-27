@@ -51,7 +51,7 @@ func writeJSON(w http.ResponseWriter, code int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay) http.Handler {
+func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay, k3sMgr *K3sManager, hostHome string) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +195,128 @@ func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay) http.Handler
 			return
 		}
 		engine.ApplyConfig(cfg.IdleSeconds, cfg.Domain, cfg.ExemptProjects)
+		if k3sMgr != nil {
+			k3sMgr.SetDomain(cfg.Domain)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/k8s/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, k3sMgr.Status())
+	})
+	mux.HandleFunc("/k8s/enable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		st, err := k3sMgr.Enable()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "status": st})
+			return
+		}
+		_, _ = engine.RefreshTopology(time.Now())
+		writeJSON(w, http.StatusOK, st)
+	})
+	mux.HandleFunc("/k8s/disable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		st, err := k3sMgr.Disable()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "status": st})
+			return
+		}
+		_, _ = engine.RefreshTopology(time.Now())
+		writeJSON(w, http.StatusOK, st)
+	})
+	mux.HandleFunc("/k8s/reset", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		keepBin := r.URL.Query().Get("keepBinary") != "0"
+		st, err := k3sMgr.Reset(keepBin)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "status": st})
+			return
+		}
+		_, _ = engine.RefreshTopology(time.Now())
+		writeJSON(w, http.StatusOK, st)
+	})
+	mux.HandleFunc("/k8s/freeze", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		if err := k3sMgr.Freeze(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, k3sMgr.Status())
+	})
+	mux.HandleFunc("/k8s/thaw", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		if err := k3sMgr.Thaw(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, k3sMgr.Status())
+	})
+	mux.HandleFunc("/k8s/kubeconfig", func(w http.ResponseWriter, r *http.Request) {
+		kc, err := k3sMgr.Kubeconfig()
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"kubeconfig": kc, "context": "firn"})
+	})
+
+	mux.HandleFunc("/machines", func(w http.ResponseWriter, r *http.Request) {
+		list, err := ListLinuxMachines(engine, engine.Domain())
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"machines": list})
+	})
+	mux.HandleFunc("/machines/create", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		var req MachineCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		m, err := CreateLinuxMachine(engine, req, hostHome)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, m)
+	})
+	mux.HandleFunc("/machines/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/machines/")
+		name, action, ok := strings.Cut(rest, "/")
+		name, _ = url.PathUnescape(name)
+		if !ok || name == "" || action == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected /machines/<name>/<start|stop|delete>"})
+			return
+		}
+		if err := ControlLinuxMachine(engine, name, action); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": name, "action": action})
 	})
 
 	mux.HandleFunc("/disk/usage", func(w http.ResponseWriter, r *http.Request) {
@@ -267,17 +388,70 @@ func main() {
 	dockerSock := flag.String("docker-socket", "/var/run/docker.sock", "Docker unix socket path")
 	debugSock := flag.String("socket", "/run/firn/reaper.sock", "Local unix debug socket path")
 	configPath := flag.String("config", "/etc/firn/reaper.json", "Reaper config path")
+	hostHome := flag.String("host-home", "", "Host home mount target")
+	fsMode := flag.String("fs-mode", "firnfs", "Host filesystem mount mode (firnfs|virtiofs)")
 	flag.Parse()
 
 	cfg := loadGuestConfig(*configPath)
 	docker := NewDockerClient(*dockerSock)
 	engine := NewReaperEngine(docker, cfg.IdleSeconds, cfg.Domain, cfg.ExemptProjects)
+	k3sMgr := NewK3sManager(cfg.Domain)
 	relay := NewProxyAndDNSRelay(engine)
-	handler := buildControlMux(engine, relay)
+
+	var fsMount *firnFSMount
+	firnfsActive := false
+	if *fsMode == "firnfs" && *hostHome != "" {
+		for attempt := 0; attempt < 25; attempt++ {
+			m, err := startFirnFS(*hostHome, "10.89.0.1:2385")
+			if err == nil {
+				fsMount = m
+				firnfsActive = true
+				_ = os.MkdirAll("/run/firn", 0o755)
+				_ = os.WriteFile("/run/firn/fs.ready", []byte("firnfs\n"), 0o644)
+				break
+			}
+			if attempt == 24 {
+				log.Printf("[firn-guestd] firnfs mount unavailable (%v); guest init will fall back to virtiofs", err)
+			}
+			time.Sleep(80 * time.Millisecond)
+		}
+	}
+	if fsMount != nil {
+		defer fsMount.Unmount()
+	}
+
+	engine.extraPortsFn = func() []PortMapping {
+		if k3sMgr.IsEnabled() {
+			return []PortMapping{{
+				HostPort:      k3sDefaultAPIPort,
+				GuestPort:     k3sDefaultAPIPort,
+				GuestHost:     "127.0.0.1",
+				Project:       "k3s",
+				Service:       "kubernetes",
+				ContainerName: "firn-k3s",
+				ContainerIP:   "10.89.0.2",
+			}}
+		}
+		return nil
+	}
+	engine.capabilitiesFn = func() GuestCapabilities {
+		_, kvmErr := os.Stat("/dev/kvm")
+		_, driErr := os.Stat("/dev/dri")
+		return GuestCapabilities{
+			NestedKVM:     kvmErr == nil,
+			GPUDRI:        driErr == nil,
+			FirnfsActive:  firnfsActive,
+			FastVirtioNet: interfaceHasIPv4("eth0", "10.89.0.2"),
+			K3sRunning:    k3sMgr.IsRunning(),
+		}
+	}
+
+	handler := buildControlMux(engine, relay, k3sMgr, *hostHome)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go engine.WatchDockerEvents(ctx)
+	k3sMgr.MaybeAutoStart()
 
 	go func() {
 		if err := StartNetstack(); err != nil {
@@ -285,7 +459,7 @@ func main() {
 		}
 	}()
 	go func() {
-		if err := serveShellBridge(vsockShellPort); err != nil {
+		if err := serveShellBridge(vsockShellPort, *hostHome); err != nil {
 			log.Printf("[firn-guestd] shell bridge exited: %v", err)
 		}
 	}()

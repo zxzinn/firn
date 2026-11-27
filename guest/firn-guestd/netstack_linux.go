@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,7 +59,28 @@ func configureTunInterface() error {
 	return nil
 }
 
+func interfaceHasIPv4(ifaceName, wantIP string) bool {
+	ifi, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return false
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if strings.HasPrefix(a.String(), wantIP+"/") || a.String() == wantIP {
+			return true
+		}
+	}
+	return false
+}
+
 func StartNetstack() error {
+	if interfaceHasIPv4("eth0", "10.89.0.2") {
+		log.Printf("[firn-guestd] eth0 (10.89.0.2/24 jumbo virtio-net) active; skipping legacy firn0 TUN netstack")
+		return nil
+	}
 	tunFD, err := openTunDevice(netstackTunName)
 	if err != nil {
 		return err

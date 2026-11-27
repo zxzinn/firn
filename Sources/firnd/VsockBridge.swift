@@ -2,7 +2,6 @@ import Darwin
 import Foundation
 import FirnCore
 import SystemConfiguration
-import Virtualization
 
 public func spawnIOThread(_ body: @escaping () -> Void) {
     Thread.detachNewThread(body)
@@ -24,10 +23,14 @@ private func setBlocking(_ fd: Int32) {
 
 private func tuneStreamSocket(_ fd: Int32) {
     var yes: Int32 = 1
-    var bufBytes: Int32 = 1 << 20
     _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
-    _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufBytes, socklen_t(MemoryLayout<Int32>.size))
-    _ = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufBytes, socklen_t(MemoryLayout<Int32>.size))
+    for bufBytes in [Int32(4 << 20), Int32(2 << 20), Int32(1 << 20)] {
+        var val = bufBytes
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &val, socklen_t(MemoryLayout<Int32>.size))
+        if setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &val, socklen_t(MemoryLayout<Int32>.size)) == 0 {
+            break
+        }
+    }
 }
 
 public func configureClientSocket(_ fd: Int32) {
@@ -36,142 +39,69 @@ public func configureClientSocket(_ fd: Int32) {
     _ = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
 }
 
-private func flushNonBlockingBuffer(to dstFD: Int32, buf: [UInt8], off: inout Int, len: inout Int) -> Bool {
-    while off < len {
-        let w = buf.withUnsafeBytes { ptr -> Int in
+private func streamOneDirection(srcFD: Int32, dstFD: Int32) {
+    let bufSize = 1 << 20
+    var buf = [UInt8](repeating: 0, count: bufSize)
+    while true {
+        let n = buf.withUnsafeMutableBytes { ptr -> Int in
             guard let base = ptr.baseAddress else { return -1 }
-            return write(dstFD, base.advanced(by: off), len - off)
+            return Darwin.read(srcFD, base, bufSize)
         }
-        if w > 0 {
-            off += w
+        if n < 0 && errno == EINTR {
             continue
         }
-        if w < 0 && errno == EINTR { continue }
-        if w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
-        return false
+        if n <= 0 {
+            _ = Darwin.shutdown(dstFD, SHUT_WR)
+            return
+        }
+        var off = 0
+        var writeFailed = false
+        while off < n {
+            let w = buf.withUnsafeBytes { ptr -> Int in
+                guard let base = ptr.baseAddress else { return -1 }
+                return Darwin.write(dstFD, base.advanced(by: off), n - off)
+            }
+            if w > 0 {
+                off += w
+                continue
+            }
+            if w < 0 && errno == EINTR {
+                continue
+            }
+            writeFailed = true
+            break
+        }
+        if writeFailed {
+            _ = Darwin.shutdown(srcFD, SHUT_RD)
+            _ = Darwin.shutdown(dstFD, SHUT_WR)
+            return
+        }
     }
-    if off >= len {
-        off = 0
-        len = 0
-    }
-    return true
 }
 
-public func spliceBidirectional(fd unixFD: Int32, vsockConn: VZVirtioSocketConnection) {
+public func spliceBidirectional(fd unixFD: Int32, vsockConn: any StreamChannel) {
     let aFD = unixFD
     let bFD = vsockConn.fileDescriptor
-    setNonBlocking(aFD)
-    setNonBlocking(bFD)
+    setBlocking(aFD)
+    setBlocking(bFD)
     tuneStreamSocket(aFD)
     tuneStreamSocket(bFD)
 
-    var aToB = [UInt8](repeating: 0, count: 262144)
-    var bToA = [UInt8](repeating: 0, count: 262144)
-    var aToBOff = 0
-    var aToBLen = 0
-    var bToAOff = 0
-    var bToALen = 0
-    var aEOF = false
-    var bEOF = false
-    var aWriteClosed = false
-    var bWriteClosed = false
-
-    outer: while !(aEOF && aToBLen == 0 && bEOF && bToALen == 0) {
-        var aEvents: Int16 = 0
-        var bEvents: Int16 = 0
-        if !aEOF && aToBLen == 0 { aEvents |= Int16(POLLIN) }
-        if bToAOff < bToALen { aEvents |= Int16(POLLOUT) }
-        if !bEOF && bToALen == 0 { bEvents |= Int16(POLLIN) }
-        if aToBOff < aToBLen { bEvents |= Int16(POLLOUT) }
-        if aEvents == 0 && bEvents == 0 { break }
-
-        var fds = [
-            pollfd(fd: aEvents != 0 ? aFD : -1, events: aEvents, revents: 0),
-            pollfd(fd: bEvents != 0 ? bFD : -1, events: bEvents, revents: 0),
-        ]
-        let ready = poll(&fds, 2, -1)
-        if ready < 0 {
-            if errno == EINTR { continue }
-            break
-        }
-        if (fds[0].revents & Int16(POLLNVAL)) != 0 || (fds[1].revents & Int16(POLLNVAL)) != 0 {
-            break
-        }
-
-        if aToBOff < aToBLen && (fds[1].revents & Int16(POLLOUT | POLLERR | POLLHUP)) != 0 {
-            if !flushNonBlockingBuffer(to: bFD, buf: aToB, off: &aToBOff, len: &aToBLen) {
-                break outer
-            }
-            if aEOF && aToBLen == 0 && !bWriteClosed {
-                shutdown(bFD, SHUT_WR)
-                bWriteClosed = true
-            }
-        }
-
-        if bToAOff < bToALen && (fds[0].revents & Int16(POLLOUT | POLLERR | POLLHUP)) != 0 {
-            if !flushNonBlockingBuffer(to: aFD, buf: bToA, off: &bToAOff, len: &bToALen) {
-                break outer
-            }
-            if bEOF && bToALen == 0 && !aWriteClosed {
-                shutdown(aFD, SHUT_WR)
-                aWriteClosed = true
-            }
-        }
-
-        if !aEOF && aToBLen == 0 && (fds[0].revents & Int16(POLLIN | POLLHUP | POLLERR)) != 0 {
-            for _ in 0..<16 {
-                let n = aToB.withUnsafeMutableBytes { ptr in
-                    read(aFD, ptr.baseAddress, ptr.count)
-                }
-                if n > 0 {
-                    aToBOff = 0
-                    aToBLen = n
-                    if !flushNonBlockingBuffer(to: bFD, buf: aToB, off: &aToBOff, len: &aToBLen) {
-                        break outer
-                    }
-                    if aToBLen > 0 { break }
-                    continue
-                }
-                if n < 0 && errno == EINTR { continue }
-                if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
-                aEOF = true
-                if aToBLen == 0 && !bWriteClosed {
-                    shutdown(bFD, SHUT_WR)
-                    bWriteClosed = true
-                }
-                break
-            }
-        }
-
-        if !bEOF && bToALen == 0 && (fds[1].revents & Int16(POLLIN | POLLHUP | POLLERR)) != 0 {
-            for _ in 0..<16 {
-                let n = bToA.withUnsafeMutableBytes { ptr in
-                    read(bFD, ptr.baseAddress, ptr.count)
-                }
-                if n > 0 {
-                    bToAOff = 0
-                    bToALen = n
-                    if !flushNonBlockingBuffer(to: aFD, buf: bToA, off: &bToAOff, len: &bToALen) {
-                        break outer
-                    }
-                    if bToALen > 0 { break }
-                    continue
-                }
-                if n < 0 && errno == EINTR { continue }
-                if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
-                bEOF = true
-                if bToALen == 0 && !aWriteClosed {
-                    shutdown(aFD, SHUT_WR)
-                    aWriteClosed = true
-                }
-                break
-            }
-        }
+    let group = DispatchGroup()
+    group.enter()
+    spawnIOThread {
+        streamOneDirection(srcFD: aFD, dstFD: bFD)
+        group.leave()
+    }
+    group.enter()
+    spawnIOThread {
+        streamOneDirection(srcFD: bFD, dstFD: aFD)
+        group.leave()
     }
 
-    close(aFD)
-    // Retain vsockConn across poll loop so VZVirtioSocketConnection never closes early.
     withExtendedLifetime(vsockConn) {
+        group.wait()
+        close(aFD)
         vsockConn.close()
     }
 }
@@ -272,12 +202,12 @@ public func writeAll(fd: Int32, data: Data) -> Bool {
 }
 
 public final class VsockBridge {
-    private let runner: VZMachineRunner
+    private let runner: any VMBackend
     private var dockerListenFD: Int32 = -1
     private var shellListenFD: Int32 = -1
     private var running = false
 
-    public init(runner: VZMachineRunner) {
+    public init(runner: any VMBackend) {
         self.runner = runner
     }
 
@@ -294,7 +224,7 @@ public final class VsockBridge {
                 }
                 spawnIOThread {
                     do {
-                        let vsockConn = try self.runner.connectVsock(port: 2375, timeoutSeconds: 5.0)
+                        let vsockConn = try self.runner.connectVsock(port: 2375, timeoutSeconds: 15.0)
                         spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
                     } catch {
                         close(clientFD)
@@ -317,7 +247,7 @@ public final class VsockBridge {
                 }
                 spawnIOThread {
                     do {
-                        let vsockConn = try self.runner.connectVsock(port: 2382, timeoutSeconds: 5.0)
+                        let vsockConn = try self.runner.connectVsock(port: 2382, timeoutSeconds: 15.0)
                         spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
                     } catch {
                         close(clientFD)
@@ -356,6 +286,12 @@ public final class VsockBridge {
         runner.registerSocketListener(port: 2383) { conn in
             spawnIOThread {
                 Self.handleSSHAgentConnection(conn)
+            }
+        }
+        // Port 2385: firnfs RPC & FSEvents invalidation stream -> firn-hostnet firnfs.sock.
+        runner.registerSocketListener(port: 2385) { conn in
+            spawnIOThread {
+                Self.relayUnixSocketConnection(conn, socketPath: FirnPaths.firnfsSockURL.path)
             }
         }
     }
@@ -403,7 +339,7 @@ public final class VsockBridge {
         return (statusCode, Data(payload))
     }
 
-    public func openTunnel(host: String, port: UInt16) throws -> VZVirtioSocketConnection {
+    public func openTunnel(host: String, port: UInt16) throws -> any StreamChannel {
         let hostData = Data(host.utf8)
         guard hostData.count > 0 && hostData.count <= 255 else {
             throw NSError(domain: "Firn", code: 30, userInfo: [NSLocalizedDescriptionKey: "Invalid tunnel host"])
@@ -455,7 +391,7 @@ public final class VsockBridge {
         return (proto, host, port)
     }
 
-    private static func handleNetstackTCPConnection(_ conn: VZVirtioSocketConnection) {
+    private static func handleNetstackTCPConnection(_ conn: any StreamChannel) {
         let fd = conn.fileDescriptor
         guard let target = readNetstackTunnelHeader(fd), target.proto == 0x01 else {
             _ = writeAll(fd: fd, data: Data([0x01]))
@@ -476,7 +412,7 @@ public final class VsockBridge {
         spliceBidirectional(fd: upFD, vsockConn: conn)
     }
 
-    private static func handleNetstackUDPConnection(_ conn: VZVirtioSocketConnection) {
+    private static func handleNetstackUDPConnection(_ conn: any StreamChannel) {
         let fd = conn.fileDescriptor
         defer { withExtendedLifetime(conn) { conn.close() } }
         guard let target = readNetstackTunnelHeader(fd), target.proto == 0x02 else {
@@ -552,21 +488,25 @@ public final class VsockBridge {
         }
     }
 
-    private static func handleSSHAgentConnection(_ conn: VZVirtioSocketConnection) {
+    private static func handleSSHAgentConnection(_ conn: any StreamChannel) {
         guard let sockPath = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"], !sockPath.isEmpty else {
             withExtendedLifetime(conn) { conn.close() }
             return
         }
-        let agentFD = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard agentFD >= 0 else {
+        relayUnixSocketConnection(conn, socketPath: sockPath)
+    }
+
+    private static func relayUnixSocketConnection(_ conn: any StreamChannel, socketPath: String) {
+        let unixFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard unixFD >= 0 else {
             withExtendedLifetime(conn) { conn.close() }
             return
         }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(sockPath.utf8CString)
+        let pathBytes = Array(socketPath.utf8CString)
         guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
-            close(agentFD)
+            close(unixFD)
             withExtendedLifetime(conn) { conn.close() }
             return
         }
@@ -578,15 +518,15 @@ public final class VsockBridge {
         let len = socklen_t(MemoryLayout.offset(of: \sockaddr_un.sun_path)! + pathBytes.count)
         let rc = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(agentFD, $0, len)
+                Darwin.connect(unixFD, $0, len)
             }
         }
         guard rc == 0 else {
-            close(agentFD)
+            close(unixFD)
             withExtendedLifetime(conn) { conn.close() }
             return
         }
-        spliceBidirectional(fd: agentFD, vsockConn: conn)
+        spliceBidirectional(fd: unixFD, vsockConn: conn)
     }
 
     private static func decodeChunked(_ data: Data) -> Data {
@@ -606,7 +546,7 @@ public final class VsockBridge {
         return out
     }
 
-    private static func handleGuestProxyConnection(_ conn: VZVirtioSocketConnection) {
+    private static func handleGuestProxyConnection(_ conn: any StreamChannel) {
         let fd = conn.fileDescriptor
         var headerBuf = Data()
         var byteBuf = [UInt8](repeating: 0, count: 4096)
@@ -720,7 +660,7 @@ public final class VsockBridge {
         return (raw, defaultPort)
     }
 
-    private static func handleGuestDNSConnection(_ conn: VZVirtioSocketConnection) {
+    private static func handleGuestDNSConnection(_ conn: any StreamChannel) {
         defer { withExtendedLifetime(conn) { conn.close() } }
         let fd = conn.fileDescriptor
         guard let lenData = readExact(fd: fd, count: 2) else { return }
@@ -751,7 +691,7 @@ public final class VsockBridge {
         return out
     }
 
-    private static func currentMacOSDNSServers() -> [String] {
+    public static func currentMacOSDNSServers() -> [String] {
         var result: [String] = []
         if let store = SCDynamicStoreCreate(nil, "firn-dns" as CFString, nil, nil),
            let dnsDict = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],

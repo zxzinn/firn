@@ -1,8 +1,9 @@
 import Darwin
 import Foundation
 import FirnCore
+import Virtualization
 
-private let firnVersion = "0.3.0"
+private let firnVersion = "0.4.0"
 
 private func urlEncoded(_ value: String) -> String {
     var allowed = CharacterSet.urlPathAllowed
@@ -48,10 +49,13 @@ private func findFirnApp() -> URL? {
 }
 
 @discardableResult
-private func runShellCommand(_ executable: String, _ args: [String], capture: Bool = true, inputData: Data? = nil) throws -> (code: Int32, stdout: String, stderr: String) {
+private func runShellCommand(_ executable: String, _ args: [String], capture: Bool = true, inputData: Data? = nil, environment: [String: String]? = nil) throws -> (code: Int32, stdout: String, stderr: String) {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: executable)
     proc.arguments = args
+    if let environment {
+        proc.environment = environment
+    }
     let outPipe = Pipe()
     let errPipe = Pipe()
     if capture {
@@ -89,13 +93,29 @@ private func runShellCommand(_ executable: String, _ args: [String], capture: Bo
     return (proc.terminationStatus, outStr, errStr)
 }
 
-private func findDockerCLI() -> String {
-    for path in ["/opt/homebrew/bin/docker", "/usr/local/bin/docker", "/usr/bin/docker"] {
+private func findExecutableOnPATH(_ name: String) -> String? {
+    for path in ["/opt/homebrew/bin/\(name)", "/usr/local/bin/\(name)", "/usr/bin/\(name)"] {
         if FileManager.default.isExecutableFile(atPath: path) {
             return path
         }
     }
-    return "/usr/bin/env"
+    if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
+        for dir in pathEnv.split(separator: ":") {
+            let candidate = URL(fileURLWithPath: String(dir)).appendingPathComponent(name).path
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+    }
+    return nil
+}
+
+private func findDockerCLI() -> String {
+    return findExecutableOnPATH("docker") ?? "/usr/bin/env"
+}
+
+private func findKubectlCLI() -> String? {
+    return findExecutableOnPATH("kubectl")
 }
 
 private func runDocker(_ args: [String], capture: Bool = true) throws -> (code: Int32, stdout: String, stderr: String) {
@@ -131,26 +151,45 @@ private func padLeft(_ s: String, _ width: Int) -> String {
 }
 
 private func printStatus(_ statusData: [String: Any]) {
+    let hibernated = (statusData["hibernated"] as? Bool) ?? false
+    let backend = (statusData["backend"] as? String) ?? "vz"
     let vm = (statusData["vmMemory"] as? [String: Any]) ?? [:]
     let balloon = (statusData["balloon"] as? [String: Any]) ?? [:]
     let dns = (statusData["dns"] as? [String: Any]) ?? [:]
     let proxy = (statusData["proxy"] as? [String: Any]) ?? [:]
     let hostMem = (statusData["hostMemory"] as? [String: Any]) ?? [:]
     let disk = (statusData["disk"] as? [String: Any]) ?? [:]
+    let caps = (statusData["capabilities"] as? [String: Any]) ?? [:]
+    let route = (statusData["route"] as? [String: Any]) ?? [:]
 
-    print(
-        "VM Memory: total=\(FirnHostClient.formatBytes(u64(vm, "totalBytes"))) " +
-        "available=\(FirnHostClient.formatBytes(u64(vm, "availableBytes"))) " +
-        "balloonTarget=\(FirnHostClient.formatBytes(u64(balloon, "targetBytes"))) " +
-        "swapUsed=\(FirnHostClient.formatBytes(u64(vm, "swapUsedBytes")))/\(FirnHostClient.formatBytes(u64(vm, "swapTotalBytes")))"
-    )
+    if hibernated {
+        let mode = (statusData["hibernateMode"] as? String) ?? "park"
+        print("VM State: HIBERNATED (backend=\(backend), mode=\(mode), savedState=\(FirnHostClient.formatBytes(u64(disk, "savedStateBytes"))))")
+    } else {
+        print(
+            "VM Memory (\(backend)): total=\(FirnHostClient.formatBytes(u64(vm, "totalBytes"))) " +
+            "available=\(FirnHostClient.formatBytes(u64(vm, "availableBytes"))) " +
+            "balloonTarget=\(FirnHostClient.formatBytes(u64(balloon, "targetBytes"))) " +
+            "swapUsed=\(FirnHostClient.formatBytes(u64(vm, "swapUsedBytes")))/\(FirnHostClient.formatBytes(u64(vm, "swapTotalBytes")))"
+        )
+    }
     if !hostMem.isEmpty {
+        let cpu = dbl(hostMem, "cpuPercent")
         print(
             "Host Memory: footprint=\(FirnHostClient.formatBytes(u64(hostMem, "footprintBytes"))) " +
             "(firnd=\(FirnHostClient.formatBytes(u64(hostMem, "daemonFootprintBytes"))), " +
             "vm=\(FirnHostClient.formatBytes(u64(hostMem, "vmFootprintBytes")))) " +
-            "rss=\(FirnHostClient.formatBytes(u64(hostMem, "rssBytes")))"
+            "rss=\(FirnHostClient.formatBytes(u64(hostMem, "rssBytes"))) cpu=\(String(format: "%.1f", cpu))%"
         )
+    }
+    if !caps.isEmpty {
+        let kvm = ((caps["nestedKvm"] as? Bool) ?? (caps["nestedVirtualizationEnabled"] as? Bool) ?? false) ? "yes" : "no"
+        let firnfs = ((caps["firnfsActive"] as? Bool) ?? false) ? "firnfs" : "virtiofs"
+        let jumbo = ((caps["fastVirtioNet"] as? Bool) ?? false) ? "jumbo-16k" : "nat"
+        let k3s = ((caps["k3sRunning"] as? Bool) ?? false) ? "running" : "off"
+        let utun = ((route["utunConnected"] as? Bool) ?? false) ? "connected" : "off"
+        let gpu = ((caps["gpuDri"] as? Bool) ?? (caps["gpuAccelerationEnabled"] as? Bool) ?? false) ? "virtio-gpu" : "none"
+        print("Capabilities: fs=\(firnfs), net=\(jumbo), utun=\(utun), nested_kvm=\(kvm), gpu=\(gpu), k3s=\(k3s)")
     }
     if !disk.isEmpty {
         print(
@@ -234,6 +273,11 @@ private func collectOrbstackMetrics() -> [String: Any]? {
 private func cmdUp(_ args: [String]) throws -> Int32 {
     var cpus: String?
     var memGiB: String?
+    var backendOpt: String?
+    var fsOpt: String?
+    var diskSyncOpt: String?
+    var gpuOpt = false
+    var nestedKvmOpt = false
     var contextName = FirnConfig.defaultDockerContext
     var idx = 0
     while idx < args.count {
@@ -241,6 +285,11 @@ private func cmdUp(_ args: [String]) throws -> Int32 {
         if a == "--cpus", idx + 1 < args.count { cpus = args[idx + 1]; idx += 2; continue }
         if a == "--memory-gib", idx + 1 < args.count { memGiB = args[idx + 1]; idx += 2; continue }
         if a == "--context", idx + 1 < args.count { contextName = args[idx + 1]; idx += 2; continue }
+        if a == "--backend", idx + 1 < args.count { backendOpt = args[idx + 1]; idx += 2; continue }
+        if a == "--fs", idx + 1 < args.count { fsOpt = args[idx + 1]; idx += 2; continue }
+        if a == "--disk-sync", idx + 1 < args.count { diskSyncOpt = args[idx + 1]; idx += 2; continue }
+        if a == "--gpu" { gpuOpt = true; idx += 1; continue }
+        if a == "--nested-kvm" { nestedKvmOpt = true; idx += 1; continue }
         throw NSError(domain: "Firn", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unknown option for `up`: \(a)"])
     }
 
@@ -264,6 +313,11 @@ private func cmdUp(_ args: [String]) throws -> Int32 {
         var env = ProcessInfo.processInfo.environment
         if let cpus { env["FIRN_CPUS"] = cpus }
         if let memGiB { env["FIRN_MEMORY_GIB"] = memGiB }
+        if let backendOpt { env["FIRN_BACKEND"] = backendOpt }
+        if let fsOpt { env["FIRN_FS_MODE"] = fsOpt }
+        if let diskSyncOpt { env["FIRN_DISK_SYNC"] = diskSyncOpt }
+        if gpuOpt { env["FIRN_GPU"] = "true" }
+        if nestedKvmOpt { env["FIRN_NESTED_VIRT"] = "true" }
 
         let started = Date()
         let proc = Process()
@@ -291,6 +345,10 @@ private func cmdUp(_ args: [String]) throws -> Int32 {
         }
         let bootMs = (Date().timeIntervalSince(started) * 1000 * 10).rounded() / 10
         print("[firn] Cold booted Firn VM + dockerd + firn-guestd in \(bootMs) ms")
+    } else if let health = try? FirnHostClient.requestJSON(method: "GET", path: "/health", timeoutSeconds: 2),
+              (health["hibernated"] as? Bool) == true {
+        _ = try FirnHostClient.requestJSON(method: "POST", path: "/resume", timeoutSeconds: 120)
+        print("[firn] Resumed hibernated Firn VM.")
     }
 
     try ensureDockerContext(contextName, dockerSock: FirnPaths.dockerSockURL)
@@ -315,7 +373,7 @@ private func cmdDown() -> Int32 {
     return 0
 }
 
-private func cmdShell(_ args: [String]) throws -> Int32 {
+private func cmdShell(_ args: [String], machine: String? = nil) throws -> Int32 {
     let sockPath = FirnPaths.shellSockURL.path
     guard FileManager.default.fileExists(atPath: sockPath) else {
         throw NSError(domain: "Firn", code: 60, userInfo: [NSLocalizedDescriptionKey: "Shell socket \(sockPath) not found. Run `firn up` first."])
@@ -369,12 +427,15 @@ private func cmdShell(_ args: [String]) throws -> Int32 {
     let rows = ws.ws_row > 0 ? Int(ws.ws_row) : 24
     let cols = ws.ws_col > 0 ? Int(ws.ws_col) : 80
 
-    let handshakeObj: [String: Any] = [
+    var handshakeObj: [String: Any] = [
         "argv": argv,
         "rows": rows,
         "cols": cols,
         "tty": interactive,
     ]
+    if let machine, !machine.isEmpty {
+        handshakeObj["machine"] = machine
+    }
     var handshake = try JSONSerialization.data(withJSONObject: handshakeObj)
     handshake.append(0x0A)
     guard writeAllFD(fd, handshake) else {
@@ -566,6 +627,19 @@ private func cmdDoctor() -> Int32 {
     print("[\(hv == "1" ? "OK" : "FAIL")] Apple Hypervisor/Virtualization support: \(hv == "1" ? "enabled" : "unavailable")")
     if hv != "1" { issues += 1 }
 
+    if #available(macOS 15.0, *) {
+        let nestedSup = VZGenericPlatformConfiguration.isNestedVirtualizationSupported
+        print("[\(nestedSup ? "OK" : "INFO")] macOS 15+ Nested Virtualization (/dev/kvm in guest): \(nestedSup ? "supported (enabled=\(cfg.nestedVirtualization))" : "not supported on this host")")
+    } else {
+        print("[INFO] macOS 15+ Nested Virtualization (/dev/kvm in guest): requires macOS 15+")
+    }
+
+    if let metalGPU = FirnHostClient.metalGPUDeviceName() {
+        let krunkitPath = findExecutableOnPATH("krunkit")
+        let gpuHint = krunkitPath.map { "krunkit installed (\($0))" } ?? "optional Vulkan/Venus GPU runtime `krunkit` not installed (`brew tap libkrun/krun && brew install krunkit`)"
+        print("[OK] Apple Silicon Metal GPU: \(metalGPU) (\(gpuHint))")
+    }
+
     let rosetta = fm.fileExists(atPath: "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta")
     print("[\(rosetta ? "OK" : "INFO")] Rosetta x86_64 Linux runtime: \(rosetta ? "installed" : "not installed (arm64-only mode)")")
 
@@ -579,6 +653,13 @@ private func cmdDoctor() -> Int32 {
         issues += 1
     }
 
+    if let hostnetBin = findRepoRootBinary("firn-hostnet") {
+        print("[OK] firn-hostnet L2/L3 & firnfs engine: \(hostnetBin.path)")
+    } else {
+        print("[FAIL] firn-hostnet binary missing (run `make build`)")
+        issues += 1
+    }
+
     let artifacts = [FirnPaths.kernelURL, FirnPaths.initramfsURL, FirnPaths.rootfsURL, FirnPaths.dataDiskURL]
     let allArtifacts = artifacts.allSatisfy { fm.fileExists(atPath: $0.path) }
     print("[\(allArtifacts ? "OK" : "FAIL")] VM state directory (\(FirnPaths.stateDir.path)): \(allArtifacts ? "all disk/kernel images present" : "missing artifacts")")
@@ -587,7 +668,17 @@ private func cmdDoctor() -> Int32 {
     if FirnHostClient.isDaemonAlive(),
        let health = try? FirnHostClient.requestJSON(method: "GET", path: "/health", timeoutSeconds: 2),
        (health["ok"] as? Bool) == true {
-        print("[OK] firnd daemon & firn-guestd control API: healthy (HTTP :\(cfg.httpProxyPort), HTTPS :\(cfg.httpsProxyPort))")
+        let hib = (health["hibernated"] as? Bool) ?? false
+        if hib {
+            print("[OK] firnd daemon: healthy (HIBERNATED; run `firn resume` or send any Docker request to auto-wake)")
+        } else {
+            let st = try? FirnHostClient.requestJSON(method: "GET", path: "/status", timeoutSeconds: 3)
+            let caps = (st?["capabilities"] as? [String: Any]) ?? [:]
+            let firnfs = ((caps["firnfsActive"] as? Bool) ?? false) ? "firnfs" : "virtiofs (fallback)"
+            let jumbo = ((caps["fastVirtioNet"] as? Bool) ?? false) ? "jumbo-16k" : "nat"
+            let kvm = ((caps["nestedKvm"] as? Bool) ?? false) ? "on" : "off"
+            print("[OK] firnd daemon & firn-guestd API: healthy (fs=\(firnfs), net=\(jumbo), nested_kvm=\(kvm), HTTP :\(cfg.httpProxyPort), HTTPS :\(cfg.httpsProxyPort))")
+        }
     } else {
         print("[INFO] firnd daemon: offline (start with `firn up`)")
     }
@@ -596,6 +687,12 @@ private func cmdDoctor() -> Int32 {
     let ctxCheck = (try? runDocker(["context", "inspect", ctxName]))?.code == 0
     let defaultCtx = (try? runDocker(["context", "show"]))?.stdout.trimmingCharacters(in: .whitespacesAndNewlines) ?? "unknown"
     print("[\(ctxCheck ? "OK" : "INFO")] Docker context '\(ctxName)': \(ctxCheck ? "configured" : "not registered yet") (current default: \(defaultCtx))")
+
+    if let kubectlPath = findKubectlCLI() {
+        print("[OK] kubectl CLI: \(kubectlPath)")
+    } else {
+        print("[INFO] kubectl CLI: not installed (optional for `firn k8s`)")
+    }
 
     let ca = CertAuthority.caTrustStatus()
     print("[\(ca.trusted ? "OK" : "INFO")] Local HTTPS Root CA (\(ca.certPath)): \(ca.exists ? (ca.trusted ? "trusted" : "present (optional: `firn ca install`)") : "generated on first start")")
@@ -607,14 +704,17 @@ private func cmdDoctor() -> Int32 {
     let hasResolver = fm.fileExists(atPath: resolverPath)
     print("[\(hasResolver ? "OK" : "INFO")] macOS split DNS resolver (\(resolverPath)): \(hasResolver ? "installed" : "not installed (optional: `firn dns install`)")")
 
+    let hasRouteDaemon = fm.fileExists(atPath: FirnPaths.routeDaemonPlistURL.path)
+    print("[\(hasRouteDaemon ? "OK" : "INFO")] Host utun container route daemon (\(FirnPaths.routeDaemonPlistURL.path)): \(hasRouteDaemon ? "installed" : "not installed (optional: `firn route up` or `firn route install`)")")
+
     let diskStats = FirnHostClient.hostSparseFileStats()
     if diskStats.logicalBytes > 0 {
-        print("[INFO] APFS data disk: \(FirnHostClient.formatBytes(diskStats.allocatedBytes)) allocated / \(FirnHostClient.formatBytes(diskStats.logicalBytes)) logical")
+        print("[INFO] APFS data disk (diskSync=\(cfg.diskSyncMode)): \(FirnHostClient.formatBytes(diskStats.allocatedBytes)) allocated / \(FirnHostClient.formatBytes(diskStats.logicalBytes)) logical")
     }
 
     if let ifc = try? runShellCommand("/sbin/ifconfig", ["-l"]) {
         let count = ifc.stdout.split(whereSeparator: { $0.isWhitespace }).filter { $0.hasPrefix("vmenet") }.count
-        print("[INFO] Host vmnet interfaces (vmenet*): \(count) (guest egress bypasses vmnet via firn0 vsock netstack)")
+        print("[INFO] Host vmnet interfaces (vmenet*): \(count) (guest egress bypasses vmnet via firn-hostnet jumbo-16k engine)")
     }
 
     let hasPlist = fm.fileExists(atPath: FirnPaths.launchAgentURL.path)
@@ -841,15 +941,586 @@ private func cmdContext(_ action: String) throws -> Int32 {
     }
 }
 
+private func cmdHibernate(_ args: [String]) throws -> Int32 {
+    let asJSON = args.contains("--json")
+    let res = try FirnHostClient.requestJSON(method: "POST", path: "/hibernate", timeoutSeconds: 120)
+    if asJSON {
+        printPrettyJSON(res)
+        return 0
+    }
+    let mode = (res["mode"] as? String) ?? "snapshot"
+    let before = FirnHostClient.formatBytes(u64(res, "hostFootprintBeforeBytes"))
+    let after = FirnHostClient.formatBytes(u64(res, "hostFootprintAfterBytes"))
+    let saved = FirnHostClient.formatBytes(u64(res, "savedStateBytes"))
+    let ms = dbl(res, "durationMs")
+    print("[firn] Hibernated VM (mode=\(mode)) in \(String(format: "%.1f", ms)) ms: host footprint \(before) -> \(after), saved state \(saved)")
+    return 0
+}
+
+private func cmdResume(_ args: [String]) throws -> Int32 {
+    let asJSON = args.contains("--json")
+    let res = try FirnHostClient.requestJSON(method: "POST", path: "/resume", timeoutSeconds: 120)
+    if asJSON {
+        printPrettyJSON(res)
+        return 0
+    }
+    let ok = (res["ok"] as? Bool) ?? false
+    let ms = dbl(res, "durationMs")
+    print("[firn] Resumed VM (ready=\(ok)) in \(String(format: "%.1f", ms)) ms")
+    return ok ? 0 : 1
+}
+
+private func cmdRoute(_ args: [String]) throws -> Int32 {
+    let action = args.first ?? "status"
+    let rest = Array(args.dropFirst())
+    let asJSON = rest.contains("--json")
+
+    switch action {
+    case "status":
+        if FirnHostClient.isDaemonAlive(),
+           let st = try? FirnHostClient.requestJSON(method: "GET", path: "/route/status", timeoutSeconds: 3) {
+            if asJSON {
+                printPrettyJSON(st)
+                return 0
+            }
+            let connected = (st["utunConnected"] as? Bool) ?? false
+            let dnsDirect = (st["directRouteDNS"] as? Bool) ?? false
+            let daemon = (st["routeDaemonInstalled"] as? Bool) ?? false
+            let subnets = ((st["subnets"] as? [String]) ?? ["10.87.0.0/24", "10.88.0.0/16"]).joined(separator: ", ")
+            print("Host utun Container Routing: \(connected ? "CONNECTED" : "OFFLINE") (subnets=\(subnets))")
+            print("Direct container IP DNS answers: \(dnsDirect ? "enabled" : "disabled") (`firn route dns on|off`)")
+            print("LaunchDaemon (\(FirnRouteDaemon.label)): \(daemon ? "installed" : "not installed")")
+            return 0
+        }
+        let cfg = FirnConfig.load()
+        let daemon = FileManager.default.fileExists(atPath: FirnPaths.routeDaemonPlistURL.path)
+        let statusObj: [String: Any] = [
+            "utunConnected": false,
+            "directRouteDNS": cfg.directRouteDNS,
+            "routeDaemonInstalled": daemon,
+            "subnets": ["10.87.0.0/24", "10.88.0.0/16"],
+            "daemonAlive": false,
+        ]
+        if asJSON {
+            printPrettyJSON(statusObj)
+            return 0
+        }
+        print("Host utun Container Routing: OFFLINE (firnd is not running)")
+        print("Direct container IP DNS answers: \(cfg.directRouteDNS ? "enabled" : "disabled")")
+        print("LaunchDaemon (\(FirnRouteDaemon.label)): \(daemon ? "installed" : "not installed")")
+        return 0
+
+    case "dns":
+        let sub = rest.first ?? "status"
+        let enable: Bool
+        switch sub {
+        case "on", "enable", "true":
+            enable = true
+        case "off", "disable", "false":
+            enable = false
+        case "status":
+            let cfg = FirnConfig.load()
+            print("Direct container IP DNS answers: \(cfg.directRouteDNS ? "enabled" : "disabled")")
+            return 0
+        default:
+            throw NSError(domain: "Firn", code: 70, userInfo: [NSLocalizedDescriptionKey: "Usage: firn route dns <status|on|off>"])
+        }
+        if FirnHostClient.isDaemonAlive() {
+            let body = try JSONSerialization.data(withJSONObject: ["directRouteDNS": enable])
+            let res = try FirnHostClient.requestJSON(method: "POST", path: "/config", body: body, timeoutSeconds: 5)
+            if asJSON {
+                printPrettyJSON(res)
+                return 0
+            }
+        } else {
+            var cfg = FirnConfig.load()
+            cfg.directRouteDNS = enable
+            try cfg.save()
+        }
+        print("[firn] Direct container IP DNS answers: \(enable ? "enabled" : "disabled")")
+        return 0
+
+    case "up":
+        guard let hostnet = findRepoRootBinary("firn-hostnet") else {
+            throw NSError(domain: "Firn", code: 71, userInfo: [NSLocalizedDescriptionKey: "firn-hostnet binary not found; run `make build` first."])
+        }
+        try FileManager.default.createDirectory(at: FirnPaths.runDir, withIntermediateDirectories: true)
+        let hostnetArgs = ["utun", "--sock", FirnPaths.utunSockURL.path]
+        if geteuid() == 0 {
+            let res = try runShellCommand(hostnet.path, hostnetArgs, capture: false)
+            return res.code
+        }
+        print("[firn] Elevating with sudo to create utun device and route 10.87.0.0/24 + 10.88.0.0/16 to Firn...")
+        let res = try runShellCommand("/usr/bin/sudo", [hostnet.path] + hostnetArgs, capture: false)
+        return res.code
+
+    case "install":
+        guard let hostnet = findRepoRootBinary("firn-hostnet") else {
+            throw NSError(domain: "Firn", code: 72, userInfo: [NSLocalizedDescriptionKey: "firn-hostnet binary not found; run `make build` first."])
+        }
+        let enableDNS = rest.contains("--dns")
+        let plistText = FirnRouteDaemon.plistContents(
+            hostnetPath: hostnet.path,
+            utunSockURL: FirnPaths.utunSockURL,
+            stateDir: FirnPaths.stateDir
+        )
+        let tmpPlist = FileManager.default.temporaryDirectory.appendingPathComponent("dev.firn.route.\(getpid()).plist")
+        try plistText.write(to: tmpPlist, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: tmpPlist) }
+
+        let targetPath = FirnPaths.routeDaemonPlistURL.path
+        let serviceTarget = "system/\(FirnRouteDaemon.label)"
+        print("[firn] Installing LaunchDaemon at \(targetPath) via sudo...")
+        _ = try? runShellCommand("/usr/bin/sudo", ["/bin/launchctl", "bootout", serviceTarget], capture: false)
+        let cpRes = try runShellCommand("/usr/bin/sudo", ["/usr/bin/install", "-m", "0644", "-o", "root", "-g", "wheel", tmpPlist.path, targetPath], capture: false)
+        if cpRes.code != 0 {
+            throw NSError(domain: "Firn", code: 73, userInfo: [NSLocalizedDescriptionKey: "Failed installing \(targetPath)"])
+        }
+        let bootRes = try runShellCommand("/usr/bin/sudo", ["/bin/launchctl", "bootstrap", "system", targetPath], capture: false)
+        if bootRes.code != 0 {
+            throw NSError(domain: "Firn", code: 74, userInfo: [NSLocalizedDescriptionKey: "launchctl bootstrap failed"])
+        }
+        if enableDNS {
+            if FirnHostClient.isDaemonAlive() {
+                let body = try JSONSerialization.data(withJSONObject: ["directRouteDNS": true])
+                _ = try? FirnHostClient.requestJSON(method: "POST", path: "/config", body: body, timeoutSeconds: 5)
+            } else {
+                var cfg = FirnConfig.load()
+                cfg.directRouteDNS = true
+                try cfg.save()
+            }
+        }
+        print("[firn] Installed and loaded utun route LaunchDaemon (\(FirnRouteDaemon.label)).")
+        return 0
+
+    case "uninstall":
+        let targetPath = FirnPaths.routeDaemonPlistURL.path
+        let serviceTarget = "system/\(FirnRouteDaemon.label)"
+        print("[firn] Removing LaunchDaemon \(targetPath) via sudo...")
+        _ = try? runShellCommand("/usr/bin/sudo", ["/bin/launchctl", "bootout", serviceTarget], capture: false)
+        let rmRes = try runShellCommand("/usr/bin/sudo", ["/bin/rm", "-f", targetPath], capture: false)
+        if rmRes.code != 0 {
+            throw NSError(domain: "Firn", code: 75, userInfo: [NSLocalizedDescriptionKey: "Failed removing \(targetPath)"])
+        }
+        print("[firn] Uninstalled utun route LaunchDaemon.")
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 76, userInfo: [NSLocalizedDescriptionKey: "Usage: firn route <status|up|install [--dns]|uninstall|dns <status|on|off>>"])
+    }
+}
+
+private func targetKubeconfigURL() -> URL {
+    if let rawEnv = ProcessInfo.processInfo.environment["KUBECONFIG"], !rawEnv.isEmpty {
+        let first = String(rawEnv.split(separator: ":").first ?? "")
+        if !first.isEmpty {
+            return URL(fileURLWithPath: (first as NSString).expandingTildeInPath)
+        }
+    }
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kube/config")
+}
+
+private func extractCurrentContextFromYAML(_ yaml: String) -> String? {
+    for line in yaml.split(separator: "\n", omittingEmptySubsequences: false) {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("current-context:") {
+            let val = trimmed.dropFirst("current-context:".count).trimmingCharacters(in: .whitespaces)
+            let unquoted = val.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            if !unquoted.isEmpty && unquoted != "null" && unquoted != "~" {
+                return unquoted
+            }
+        }
+    }
+    return nil
+}
+
+private func mergeFirnKubeconfig(rawYAML: String, switchContext: Bool) throws -> (path: String, preservedContext: String?, activeContext: String) {
+    let fm = FileManager.default
+    let targetURL = targetKubeconfigURL()
+    let kubeDir = targetURL.deletingLastPathComponent()
+    try fm.createDirectory(at: kubeDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+
+    let existingYAML = (try? String(contentsOf: targetURL, encoding: .utf8)) ?? ""
+    let hasExisting = !existingYAML.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let prevContext = hasExisting ? extractCurrentContextFromYAML(existingYAML) : nil
+
+    guard let kubectl = findKubectlCLI() else {
+        if !hasExisting {
+            try Data(rawYAML.utf8).write(to: targetURL, options: .atomic)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
+            return (targetURL.path, nil, extractCurrentContextFromYAML(rawYAML) ?? "firn")
+        }
+        throw NSError(
+            domain: "Firn",
+            code: 80,
+            userInfo: [NSLocalizedDescriptionKey: "Existing kubeconfig at \(targetURL.path) requires `kubectl` for safe context merge; inspect with `firn k8s kubeconfig`."]
+        )
+    }
+
+    let tmpDir = fm.temporaryDirectory.appendingPathComponent("firn-kubeconfig-\(getpid())-\(UUID().uuidString.prefix(8))")
+    try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    defer { try? fm.removeItem(at: tmpDir) }
+
+    let firnFile = tmpDir.appendingPathComponent("firn.yaml")
+    try Data(rawYAML.utf8).write(to: firnFile, options: .atomic)
+    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: firnFile.path)
+
+    if hasExisting {
+        let existingCopy = tmpDir.appendingPathComponent("existing.yaml")
+        try Data(existingYAML.utf8).write(to: existingCopy, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: existingCopy.path)
+
+        for delCmd in ["delete-context", "delete-cluster", "delete-user"] {
+            _ = try? runShellCommand(kubectl, ["--kubeconfig", existingCopy.path, "config", delCmd, "firn"])
+        }
+
+        var env = ProcessInfo.processInfo.environment
+        env["KUBECONFIG"] = "\(existingCopy.path):\(firnFile.path)"
+        let flat = try runShellCommand(kubectl, ["config", "view", "--raw", "--flatten"], environment: env)
+        if flat.code != 0 || flat.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw NSError(domain: "Firn", code: 81, userInfo: [NSLocalizedDescriptionKey: "kubectl config flatten failed: \(flat.stderr)"])
+        }
+        try Data(flat.stdout.utf8).write(to: targetURL, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
+    } else {
+        try Data(rawYAML.utf8).write(to: targetURL, options: .atomic)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: targetURL.path)
+    }
+
+    if switchContext {
+        _ = try? runShellCommand(kubectl, ["--kubeconfig", targetURL.path, "config", "use-context", "firn"])
+    } else if let prevContext {
+        _ = try? runShellCommand(kubectl, ["--kubeconfig", targetURL.path, "config", "use-context", prevContext])
+    }
+
+    let finalYAML = (try? String(contentsOf: targetURL, encoding: .utf8)) ?? rawYAML
+    let active = extractCurrentContextFromYAML(finalYAML) ?? (switchContext ? "firn" : (prevContext ?? "firn"))
+    return (targetURL.path, prevContext, active)
+}
+
+private func cmdK8s(_ args: [String]) throws -> Int32 {
+    let action = args.first ?? "status"
+    let rest = Array(args.dropFirst())
+    let asJSON = rest.contains("--json")
+
+    switch action {
+    case "status":
+        let st = try FirnHostClient.requestJSON(method: "GET", path: "/k8s/status", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(st)
+            return 0
+        }
+        let enabled = (st["enabled"] as? Bool) ?? false
+        let running = (st["running"] as? Bool) ?? false
+        let ready = (st["ready"] as? Bool) ?? false
+        let frozen = (st["frozen"] as? Bool) ?? false
+        let ver = (st["version"] as? String) ?? ""
+        let node = (st["nodeName"] as? String) ?? "firn"
+        let port = u64(st, "apiPort")
+        let mem = FirnHostClient.formatBytes(u64(st, "memoryBytes"))
+        print("Kubernetes (k3s \(ver)): enabled=\(enabled), running=\(running), ready=\(ready), frozen=\(frozen)")
+        print("Node: \(node), API: https://127.0.0.1:\(port), Memory: \(mem)")
+        return 0
+
+    case "enable":
+        let noKubeconfig = rest.contains("--no-kubeconfig")
+        let switchContext = rest.contains("--use")
+        print("[firn] Starting single-node k3s cluster inside Firn VM (first run downloads k3s binary)...")
+        let st = try FirnHostClient.requestJSON(method: "POST", path: "/k8s/enable", timeoutSeconds: 180)
+        if asJSON {
+            printPrettyJSON(st)
+            return 0
+        }
+        let ready = (st["ready"] as? Bool) ?? false
+        let ver = (st["version"] as? String) ?? ""
+        print("[firn] k3s \(ver) ready=\(ready) on https://127.0.0.1:\(u64(st, "apiPort"))")
+        if !noKubeconfig {
+            let kc = try FirnHostClient.requestJSON(method: "GET", path: "/k8s/kubeconfig", timeoutSeconds: 15)
+            if let yaml = kc["kubeconfig"] as? String, !yaml.isEmpty {
+                let merged = try mergeFirnKubeconfig(rawYAML: yaml, switchContext: switchContext)
+                if switchContext {
+                    print("[firn] Merged kubeconfig into \(merged.path) and switched current-context to 'firn'.")
+                } else {
+                    let kept = merged.preservedContext.map { " (preserved current-context '\($0)')" } ?? ""
+                    print("[firn] Merged 'firn' context into \(merged.path)\(kept).")
+                    print("[firn] Run: kubectl --context firn get nodes")
+                }
+            }
+        }
+        return ready ? 0 : 1
+
+    case "disable":
+        let st = try FirnHostClient.requestJSON(method: "POST", path: "/k8s/disable", timeoutSeconds: 30)
+        if asJSON {
+            printPrettyJSON(st)
+            return 0
+        }
+        print("[firn] Disabled k3s (data preserved in /var/lib/firn/k3s; run `firn k8s reset` to wipe).")
+        return 0
+
+    case "reset":
+        let purge = rest.contains("--purge-binary")
+        let path = purge ? "/k8s/reset?keepBinary=0" : "/k8s/reset"
+        let st = try FirnHostClient.requestJSON(method: "POST", path: path, timeoutSeconds: 30)
+        if asJSON {
+            printPrettyJSON(st)
+            return 0
+        }
+        print("[firn] Reset k3s cluster state (keepBinary=\(!purge)).")
+        return 0
+
+    case "freeze":
+        let st = try FirnHostClient.requestJSON(method: "POST", path: "/k8s/freeze", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(st)
+            return 0
+        }
+        print("[firn] Froze k3s cgroup (frozen=\((st["frozen"] as? Bool) ?? true)).")
+        return 0
+
+    case "thaw":
+        let st = try FirnHostClient.requestJSON(method: "POST", path: "/k8s/thaw", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(st)
+            return 0
+        }
+        print("[firn] Thawed k3s cgroup (frozen=\((st["frozen"] as? Bool) ?? false)).")
+        return 0
+
+    case "kubeconfig":
+        let res = try FirnHostClient.requestJSON(method: "GET", path: "/k8s/kubeconfig", timeoutSeconds: 15)
+        guard let yaml = res["kubeconfig"] as? String, !yaml.isEmpty else {
+            throw NSError(domain: "Firn", code: 82, userInfo: [NSLocalizedDescriptionKey: "Kubeconfig not available yet; run `firn k8s enable` first."])
+        }
+        let writeFlag = rest.contains("--write") || rest.contains("--use")
+        let switchContext = rest.contains("--use")
+        if writeFlag && !rest.contains("--raw") {
+            let merged = try mergeFirnKubeconfig(rawYAML: yaml, switchContext: switchContext)
+            print("[firn] Merged 'firn' context into \(merged.path) (current-context: \(merged.activeContext)).")
+        } else {
+            print(yaml, terminator: yaml.hasSuffix("\n") ? "" : "\n")
+        }
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 83, userInfo: [NSLocalizedDescriptionKey: "Usage: firn k8s <status|enable [--no-kubeconfig] [--use]|disable|reset [--purge-binary]|freeze|thaw|kubeconfig [--write] [--use]>"])
+    }
+}
+
+private func cmdMachine(_ args: [String]) throws -> Int32 {
+    let sub = args.first ?? "list"
+    let rest = Array(args.dropFirst())
+    let asJSON = rest.contains("--json")
+
+    switch sub {
+    case "list", "ls":
+        let res = try FirnHostClient.requestJSON(method: "GET", path: "/machines", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        let items = (res["machines"] as? [[String: Any]]) ?? []
+        if items.isEmpty {
+            print("No Linux machines present. Create one with `firn machine create <name> --distro ubuntu`.")
+            return 0
+        }
+        print("\(padRight("NAME", 18)) \(padRight("DISTRO", 10)) \(padRight("STATE", 10)) \(padRight("IP", 16)) \(padLeft("MEM", 10)) \(padRight("DNS", 28))")
+        for m in items {
+            let name = (m["name"] as? String) ?? ""
+            let distro = (m["distro"] as? String) ?? ""
+            let state = (m["state"] as? String) ?? ""
+            let ip = ((m["ip"] as? String).flatMap { $0.isEmpty ? nil : $0 }) ?? "-"
+            let mem = FirnHostClient.formatBytes(u64(m, "memoryBytes"))
+            let dns = (m["dnsName"] as? String) ?? ""
+            print("\(padRight(name, 18)) \(padRight(distro, 10)) \(padRight(state, 10)) \(padRight(ip, 16)) \(padLeft(mem, 10)) \(padRight(dns, 28))")
+        }
+        return 0
+
+    case "create":
+        var name: String?
+        var distro = "ubuntu"
+        var image = ""
+        var idx = 0
+        while idx < rest.count {
+            let a = rest[idx]
+            if a == "--distro", idx + 1 < rest.count { distro = rest[idx + 1]; idx += 2; continue }
+            if a == "--image", idx + 1 < rest.count { image = rest[idx + 1]; idx += 2; continue }
+            if a == "--json" { idx += 1; continue }
+            if !a.hasPrefix("-"), name == nil { name = a; idx += 1; continue }
+            throw NSError(domain: "Firn", code: 84, userInfo: [NSLocalizedDescriptionKey: "Unknown option for `machine create`: \(a)"])
+        }
+        guard let machineName = name, !machineName.isEmpty else {
+            throw NSError(domain: "Firn", code: 85, userInfo: [NSLocalizedDescriptionKey: "Usage: firn machine create <name> [--distro ubuntu|debian|alpine|arch|fedora] [--image IMAGE]"])
+        }
+        let payload: [String: Any] = [
+            "name": machineName,
+            "distro": distro,
+            "image": image,
+            "hostHome": FileManager.default.homeDirectoryForCurrentUser.path,
+        ]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/machines/create", body: body, timeoutSeconds: 180)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Created machine '\(res["name"] ?? machineName)' (distro=\(res["distro"] ?? distro), ip=\(res["ip"] ?? "-"), dns=\(res["dnsName"] ?? "-"))")
+        return 0
+
+    case "shell":
+        guard let machineName = rest.first, !machineName.hasPrefix("-") else {
+            throw NSError(domain: "Firn", code: 86, userInfo: [NSLocalizedDescriptionKey: "Usage: firn machine shell <name> [-- COMMAND...]"])
+        }
+        let cmdArgs = Array(rest.dropFirst())
+        return try cmdShell(cmdArgs, machine: machineName)
+
+    case "start", "stop", "delete", "rm":
+        let mappedAction = sub == "rm" ? "delete" : sub
+        guard let machineName = rest.first(where: { !$0.hasPrefix("-") }) else {
+            throw NSError(domain: "Firn", code: 87, userInfo: [NSLocalizedDescriptionKey: "Usage: firn machine \(sub) <name>"])
+        }
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/machines/\(urlEncoded(machineName))/\(mappedAction)", timeoutSeconds: 30)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Machine '\(machineName)': \(mappedAction) ok.")
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 88, userInfo: [NSLocalizedDescriptionKey: "Usage: firn machine <list|create|shell|start|stop|delete>"])
+    }
+}
+
+private func cmdUpgrade(_ args: [String]) throws -> Int32 {
+    var checkOnly = false
+    var targetVersion: String?
+    var idx = 0
+    while idx < args.count {
+        let a = args[idx]
+        if a == "--check" { checkOnly = true; idx += 1; continue }
+        if a == "--version", idx + 1 < args.count { targetVersion = args[idx + 1]; idx += 2; continue }
+        throw NSError(domain: "Firn", code: 90, userInfo: [NSLocalizedDescriptionKey: "Usage: firn upgrade [--check] [--version vX.Y.Z]"])
+    }
+
+    let apiURL: String
+    if let v = targetVersion {
+        let tag = v.hasPrefix("v") ? v : "v\(v)"
+        apiURL = "https://api.github.com/repos/zxzinn/firn/releases/tags/\(urlEncoded(tag))"
+    } else {
+        apiURL = "https://api.github.com/repos/zxzinn/firn/releases/latest"
+    }
+
+    let resp = try runShellCommand("/usr/bin/curl", ["-fsSL", "-H", "Accept: application/vnd.github+json", apiURL])
+    if resp.code != 0 {
+        throw NSError(domain: "Firn", code: 91, userInfo: [NSLocalizedDescriptionKey: "Failed querying GitHub Releases (\(apiURL)): \(resp.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"])
+    }
+    guard let release = (try? JSONSerialization.jsonObject(with: Data(resp.stdout.utf8))) as? [String: Any],
+          let tagName = release["tag_name"] as? String else {
+        throw NSError(domain: "Firn", code: 92, userInfo: [NSLocalizedDescriptionKey: "Unexpected GitHub release JSON response"])
+    }
+
+    let cleanLatest = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
+    let htmlURL = (release["html_url"] as? String) ?? "https://github.com/zxzinn/firn/releases/tag/\(tagName)"
+    print("Current version: \(firnVersion)")
+    print("Latest release:  \(tagName) (\(htmlURL))")
+
+    if cleanLatest == firnVersion && targetVersion == nil {
+        print("[firn] Already up to date.")
+        return 0
+    }
+    if checkOnly {
+        print("[firn] Update check complete; run `firn upgrade` to download and verify.")
+        return 0
+    }
+
+    let assets = (release["assets"] as? [[String: Any]]) ?? []
+    let tarballAsset = assets.first { ($0["name"] as? String) == "firn-darwin-arm64.tar.gz" }
+    let sumsAsset = assets.first { ($0["name"] as? String) == "SHA256SUMS.txt" }
+    guard let tarballURLStr = tarballAsset?["browser_download_url"] as? String,
+          let sumsURLStr = sumsAsset?["browser_download_url"] as? String else {
+        throw NSError(domain: "Firn", code: 93, userInfo: [NSLocalizedDescriptionKey: "Release \(tagName) does not contain firn-darwin-arm64.tar.gz and SHA256SUMS.txt"])
+    }
+
+    let fm = FileManager.default
+    let tmpDir = fm.temporaryDirectory.appendingPathComponent("firn-upgrade-\(getpid())")
+    try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: tmpDir) }
+
+    let sumsFile = tmpDir.appendingPathComponent("SHA256SUMS.txt")
+    let archiveFile = tmpDir.appendingPathComponent("firn-darwin-arm64.tar.gz")
+
+    let dlSums = try runShellCommand("/usr/bin/curl", ["-fsSL", "-o", sumsFile.path, sumsURLStr])
+    if dlSums.code != 0 {
+        throw NSError(domain: "Firn", code: 94, userInfo: [NSLocalizedDescriptionKey: "Failed downloading SHA256SUMS.txt: \(dlSums.stderr)"])
+    }
+    let dlArc = try runShellCommand("/usr/bin/curl", ["-fSL", "-o", archiveFile.path, tarballURLStr], capture: false)
+    if dlArc.code != 0 {
+        throw NSError(domain: "Firn", code: 95, userInfo: [NSLocalizedDescriptionKey: "Failed downloading \(tarballURLStr)"])
+    }
+
+    let sumsText = try String(contentsOf: sumsFile, encoding: .utf8)
+    var expectedHash: String?
+    for line in sumsText.split(separator: "\n") {
+        let parts = line.split(whereSeparator: { $0.isWhitespace })
+        if parts.count >= 2, parts[1].hasSuffix("firn-darwin-arm64.tar.gz") {
+            expectedHash = String(parts[0]).lowercased()
+            break
+        }
+    }
+    guard let expectedHash else {
+        throw NSError(domain: "Firn", code: 96, userInfo: [NSLocalizedDescriptionKey: "SHA256SUMS.txt missing firn-darwin-arm64.tar.gz entry"])
+    }
+
+    let actualHash = try FirnHostClient.sha256Hex(of: archiveFile).lowercased()
+    guard actualHash == expectedHash else {
+        throw NSError(domain: "Firn", code: 97, userInfo: [NSLocalizedDescriptionKey: "SHA-256 verification failed! expected=\(expectedHash) actual=\(actualHash)"])
+    }
+    print("[firn] Verified SHA-256 checksum (\(actualHash)).")
+
+    let unpackDir = tmpDir.appendingPathComponent("unpack")
+    try fm.createDirectory(at: unpackDir, withIntermediateDirectories: true)
+    let untar = try runShellCommand("/usr/bin/tar", ["-xzf", archiveFile.path, "-C", unpackDir.path])
+    if untar.code != 0 {
+        throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "tar extraction failed: \(untar.stderr)"])
+    }
+
+    let installDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+    for binName in ["firn", "firnd", "firn-hostnet"] {
+        let src = unpackDir.appendingPathComponent(binName)
+        if fm.fileExists(atPath: src.path) {
+            let dst = installDir.appendingPathComponent(binName)
+            let staged = installDir.appendingPathComponent(".\(binName).new.\(getpid())")
+            try? fm.removeItem(at: staged)
+            try fm.copyItem(at: src, to: staged)
+            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged.path)
+            _ = try? fm.replaceItemAt(dst, withItemAt: staged)
+        }
+    }
+    let srcApp = unpackDir.appendingPathComponent("Firn.app")
+    if fm.fileExists(atPath: srcApp.path) {
+        let dstApp = installDir.appendingPathComponent("Firn.app")
+        try? fm.removeItem(at: dstApp)
+        try fm.copyItem(at: srcApp, to: dstApp)
+    }
+    print("[firn] Upgraded Firn binaries in \(installDir.path) to \(tagName). Restart any running daemon with `firn down && firn up`.")
+    return 0
+}
+
 private func printHelp() {
     print("""
     Firn \(firnVersion) - Native macOS Virtualization.framework Docker runtime
 
     Usage:
-      firn up [--cpus N] [--memory-gib N] [--context NAME]
+      firn up [--cpus N] [--memory-gib N] [--context NAME] [--backend vz|krun] [--fs firnfs|virtiofs] [--disk-sync none|fsync] [--gpu] [--nested-kvm]
       firn down
       firn status [--json]
+      firn hibernate [--json]
+      firn resume [--json]
       firn shell [-- COMMAND...]
+      firn k8s <status|enable [--no-kubeconfig] [--use]|disable|reset [--purge-binary]|freeze|thaw|kubeconfig [--write] [--use]>
+      firn machine <list|create <name> [--distro D]|shell <name> [-- CMD]|start|stop|delete>
+      firn route <status|up|install [--dns]|uninstall|dns <status|on|off>>
       firn freeze <project> [--reclaim]
       firn thaw <project>
       firn reclaim [project]
@@ -863,8 +1534,9 @@ private func printHelp() {
       firn gui
       firn doctor
       firn autostart <status|install|uninstall>
+      firn upgrade [--check] [--version vX.Y.Z]
       firn bench [--project NAME] [--compare-orbstack]
-      firn logs [--serial|--daemon]
+      firn logs [--serial|--daemon|--hostnet]
       firn version
     """)
 }
@@ -889,8 +1561,18 @@ private func runCLI() throws -> Int32 {
             printStatus(res)
         }
         return 0
+    case "hibernate":
+        return try cmdHibernate(rest)
+    case "resume":
+        return try cmdResume(rest)
     case "shell":
         return try cmdShell(rest)
+    case "k8s":
+        return try cmdK8s(rest)
+    case "machine":
+        return try cmdMachine(rest)
+    case "route":
+        return try cmdRoute(rest)
     case "freeze":
         guard let proj = rest.first(where: { !$0.hasPrefix("-") }) else {
             throw NSError(domain: "Firn", code: 13, userInfo: [NSLocalizedDescriptionKey: "Usage: firn freeze <project> [--reclaim]"])
@@ -942,10 +1624,19 @@ private func runCLI() throws -> Int32 {
         return cmdDoctor()
     case "autostart":
         return try cmdAutostart(rest.first ?? "status")
+    case "upgrade":
+        return try cmdUpgrade(rest)
     case "bench":
         return try cmdBench(rest)
     case "logs":
-        let url = rest.contains("--daemon") ? FirnPaths.daemonLogURL : FirnPaths.serialLogURL
+        let url: URL
+        if rest.contains("--daemon") {
+            url = FirnPaths.daemonLogURL
+        } else if rest.contains("--hostnet") {
+            url = FirnPaths.hostnetLogURL
+        } else {
+            url = FirnPaths.serialLogURL
+        }
         let txt = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         let lines = txt.split(separator: "\n", omittingEmptySubsequences: false).suffix(80)
         print(lines.joined(separator: "\n"))

@@ -10,6 +10,13 @@ public struct FirnConfig: Codable, Sendable, Equatable {
     public var httpsProxyPort: UInt16
     public var idleSeconds: Int
     public var exemptProjects: [String]
+    public var diskSyncMode: String
+    public var fsMode: String
+    public var nestedVirtualization: Bool
+    public var hibernateSeconds: Int
+    public var backend: String
+    public var gpu: Bool
+    public var directRouteDNS: Bool
 
     public init(
         cpus: Int = 8,
@@ -20,7 +27,14 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         httpProxyPort: UInt16 = 8088,
         httpsProxyPort: UInt16 = 8443,
         idleSeconds: Int = 900,
-        exemptProjects: [String] = []
+        exemptProjects: [String] = [],
+        diskSyncMode: String = "none",
+        fsMode: String = "firnfs",
+        nestedVirtualization: Bool = false,
+        hibernateSeconds: Int = 0,
+        backend: String = "vz",
+        gpu: Bool = false,
+        directRouteDNS: Bool = false
     ) {
         self.cpus = cpus
         self.memoryGiB = memoryGiB
@@ -31,6 +45,13 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         self.httpsProxyPort = httpsProxyPort
         self.idleSeconds = idleSeconds
         self.exemptProjects = exemptProjects
+        self.diskSyncMode = diskSyncMode
+        self.fsMode = fsMode
+        self.nestedVirtualization = nestedVirtualization
+        self.hibernateSeconds = hibernateSeconds
+        self.backend = backend
+        self.gpu = gpu
+        self.directRouteDNS = directRouteDNS
     }
 
     public init(from decoder: Decoder) throws {
@@ -45,6 +66,13 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         self.httpsProxyPort = try c.decodeIfPresent(UInt16.self, forKey: .httpsProxyPort) ?? d.httpsProxyPort
         self.idleSeconds = try c.decodeIfPresent(Int.self, forKey: .idleSeconds) ?? d.idleSeconds
         self.exemptProjects = try c.decodeIfPresent([String].self, forKey: .exemptProjects) ?? d.exemptProjects
+        self.diskSyncMode = try c.decodeIfPresent(String.self, forKey: .diskSyncMode) ?? d.diskSyncMode
+        self.fsMode = try c.decodeIfPresent(String.self, forKey: .fsMode) ?? d.fsMode
+        self.nestedVirtualization = try c.decodeIfPresent(Bool.self, forKey: .nestedVirtualization) ?? d.nestedVirtualization
+        self.hibernateSeconds = try c.decodeIfPresent(Int.self, forKey: .hibernateSeconds) ?? d.hibernateSeconds
+        self.backend = try c.decodeIfPresent(String.self, forKey: .backend) ?? d.backend
+        self.gpu = try c.decodeIfPresent(Bool.self, forKey: .gpu) ?? d.gpu
+        self.directRouteDNS = try c.decodeIfPresent(Bool.self, forKey: .directRouteDNS) ?? d.directRouteDNS
     }
 
     public static var defaultDockerContext: String {
@@ -52,6 +80,14 @@ public struct FirnConfig: Codable, Sendable, Equatable {
             return custom
         }
         return "firn"
+    }
+
+    private static func parseEnvBool(_ raw: String) -> Bool? {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes", "on": return true
+        case "0", "false", "no", "off": return false
+        default: return nil
+        }
     }
 
     public static func load(from directory: URL = FirnPaths.stateDir) -> FirnConfig {
@@ -76,6 +112,13 @@ public struct FirnConfig: Codable, Sendable, Equatable {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         }
+        if let raw = env["FIRN_DISK_SYNC"], raw == "none" || raw == "fsync" { cfg.diskSyncMode = raw }
+        if let raw = env["FIRN_FS_MODE"], raw == "firnfs" || raw == "virtiofs" { cfg.fsMode = raw }
+        if let raw = env["FIRN_NESTED_VIRT"], let b = parseEnvBool(raw) { cfg.nestedVirtualization = b }
+        if let raw = env["FIRN_HIBERNATE_SECONDS"], let val = Int(raw), val >= 0 { cfg.hibernateSeconds = val }
+        if let raw = env["FIRN_BACKEND"], raw == "vz" || raw == "krun" { cfg.backend = raw }
+        if let raw = env["FIRN_GPU"], let b = parseEnvBool(raw) { cfg.gpu = b }
+        if let raw = env["FIRN_DIRECT_ROUTE_DNS"], let b = parseEnvBool(raw) { cfg.directRouteDNS = b }
         return cfg
     }
 
@@ -115,17 +158,60 @@ public enum FirnPaths {
     public static var initramfsURL: URL { imagesDir.appendingPathComponent("initramfs.img") }
     public static var rootfsURL: URL { imagesDir.appendingPathComponent("rootfs.ext4") }
     public static var dataDiskURL: URL { stateDir.appendingPathComponent("data.ext4") }
+    public static var machineIdURL: URL { stateDir.appendingPathComponent("machine-id.bin") }
+    public static var vmStateURL: URL { stateDir.appendingPathComponent("vm-state.vzvmsave") }
     public static var dockerSockURL: URL { runDir.appendingPathComponent("docker.sock") }
     public static var hostSockURL: URL { runDir.appendingPathComponent("firnd.sock") }
     public static var shellSockURL: URL { runDir.appendingPathComponent("shell.sock") }
+    public static var vmnetFDSockURL: URL { runDir.appendingPathComponent("vmnet-fd.sock") }
+    public static var firnfsSockURL: URL { runDir.appendingPathComponent("firnfs.sock") }
+    public static var hostnetSockURL: URL { runDir.appendingPathComponent("hostnet.sock") }
+    public static var utunSockURL: URL { runDir.appendingPathComponent("utun.sock") }
     public static var pidFileURL: URL { runDir.appendingPathComponent("firnd.pid") }
     public static var prevContextURL: URL { stateDir.appendingPathComponent("prev-context") }
     public static var daemonLogURL: URL { stateDir.appendingPathComponent("firnd.log") }
+    public static var hostnetLogURL: URL { stateDir.appendingPathComponent("firn-hostnet.log") }
     public static var serialLogURL: URL { stateDir.appendingPathComponent("serial.log") }
     public static var launchAgentURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents")
             .appendingPathComponent("\(FirnLaunchAgent.label).plist")
+    }
+    public static var routeDaemonPlistURL: URL {
+        URL(fileURLWithPath: "/Library/LaunchDaemons/\(FirnRouteDaemon.label).plist")
+    }
+}
+
+public enum FirnRouteDaemon {
+    public static let label = "dev.firn.route"
+
+    public static func plistContents(hostnetPath: String, utunSockURL: URL, stateDir: URL) -> String {
+        let logPath = stateDir.appendingPathComponent("firn-route.log").path
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>\(label)</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>\(hostnetPath)</string>
+                <string>utun</string>
+                <string>--sock</string>
+                <string>\(utunSockURL.path)</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>KeepAlive</key>
+            <true/>
+            <key>StandardOutPath</key>
+            <string>\(logPath)</string>
+            <key>StandardErrorPath</key>
+            <string>\(logPath)</string>
+        </dict>
+        </plist>
+        """
     }
 }
 

@@ -3,12 +3,13 @@ import Foundation
 import FirnCore
 
 public final class HostControlServer {
-    private let runner: VZMachineRunner
+    private let runner: any VMBackend
     private let bridge: VsockBridge
     private let balloon: BalloonController
     private let autoThaw: AutoThawProxy
-    private let httpsProxy: HTTPSDomainProxy
+    private let httpsProxy: HTTPSDomainProxy?
     private let dnsServer: LocalDNSServer
+    private let hostNet: HostNetSupervisor?
     private let onShutdownRequested: () -> Void
 
     private var listenFD: Int32 = -1
@@ -18,12 +19,13 @@ public final class HostControlServer {
     private var liveConfig: FirnConfig
 
     public init(
-        runner: VZMachineRunner,
+        runner: any VMBackend,
         bridge: VsockBridge,
         balloon: BalloonController,
         autoThaw: AutoThawProxy,
-        httpsProxy: HTTPSDomainProxy,
+        httpsProxy: HTTPSDomainProxy?,
         dnsServer: LocalDNSServer,
+        hostNet: HostNetSupervisor? = nil,
         onShutdownRequested: @escaping () -> Void
     ) {
         self.runner = runner
@@ -32,6 +34,7 @@ public final class HostControlServer {
         self.autoThaw = autoThaw
         self.httpsProxy = httpsProxy
         self.dnsServer = dnsServer
+        self.hostNet = hostNet
         self.liveConfig = runner.config
         self.onShutdownRequested = onShutdownRequested
     }
@@ -119,59 +122,190 @@ public final class HostControlServer {
         return item.value
     }
 
+    private func currentExtraPIDs() -> [Int32] {
+        var pids: [Int32] = []
+        if let hp = hostNet?.childPID, hp > 0 {
+            pids.append(hp)
+        }
+        pids.append(contentsOf: runner.capabilities.guestPIDs)
+        return pids
+    }
+
+    private func hostCommonFields(cfg: FirnConfig, proxy: HostProxyState) -> [String: Any] {
+        let hostMem = HostProcessMetrics.current(daemonPID: getpid(), extraPIDs: currentExtraPIDs())
+        let caStatus = CertAuthority.caTrustStatus()
+        let diskHost = FirnHostClient.hostSparseFileStats()
+        let hostnetStatus = hostNet?.fetchStatus() ?? [:]
+        let utunConnected = (hostnetStatus["utunConnected"] as? Bool) ?? false
+        dnsServer.setDirectRouteEnabled(utunConnected && cfg.directRouteDNS)
+
+        let vmStateStats = FirnHostClient.hostSparseFileStats(at: FirnPaths.vmStateURL)
+        return [
+            "hostMemory": [
+                "footprintBytes": hostMem.footprintBytes,
+                "rssBytes": hostMem.rssBytes,
+                "daemonFootprintBytes": hostMem.daemonFootprintBytes,
+                "vmFootprintBytes": hostMem.vmFootprintBytes,
+                "cpuPercent": hostMem.cpuPercent,
+            ],
+            "balloon": [
+                "targetBytes": runner.getBalloonTargetBytes(),
+                "minBytes": runner.config.minBalloonBytes,
+                "maxBytes": runner.config.maxMemoryBytes,
+            ],
+            "dns": [
+                "domain": cfg.domain,
+                "dnsPort": Int(cfg.dnsPort),
+                "httpProxyPort": Int(cfg.httpProxyPort),
+                "httpsProxyPort": Int(cfg.httpsProxyPort),
+                "recordCount": dnsServer.currentRecords().count,
+                "caTrusted": caStatus.trusted,
+                "pfRedirectActive": FileManager.default.fileExists(atPath: "/etc/pf.anchors/dev.firn"),
+                "directRouteDNS": dnsServer.isDirectRouteEnabled(),
+            ],
+            "proxy": [
+                "httpProxy": proxy.httpProxy,
+                "httpsProxy": proxy.httpsProxy,
+                "noProxy": proxy.noProxy,
+                "vpnActive": proxy.vpnActive,
+                "hostDnsRelay": proxy.hostDnsRelay,
+                "sshAgentActive": !(ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] ?? "").isEmpty,
+            ],
+            "disk": [
+                "hostLogicalBytes": diskHost.logicalBytes,
+                "hostAllocatedBytes": diskHost.allocatedBytes,
+                "savedStateBytes": vmStateStats.allocatedBytes > 0 ? vmStateStats.allocatedBytes : vmStateStats.logicalBytes,
+            ],
+            "hostnet": hostnetStatus,
+            "route": [
+                "utunConnected": utunConnected,
+                "directRouteDNS": cfg.directRouteDNS,
+                "routeDaemonInstalled": FileManager.default.fileExists(atPath: FirnPaths.routeDaemonPlistURL.path),
+                "subnets": ["10.87.0.0/24", "10.88.0.0/16"],
+            ],
+            "ports": autoThaw.currentPortMappings().count,
+            "topologyVersion": autoThaw.currentTopologyVersion(),
+        ]
+    }
+
     private func route(method: String, fullTarget: String, path: String, body: Data) -> (Int, Data) {
         if path == "/health" {
+            if runner.isHibernated {
+                return jsonResponse(["ok": true, "hibernated": true], status: 200)
+            }
             let ok = (try? bridge.guestHTTP(method: "GET", path: "/health"))?.status == 200
-            return jsonResponse(["ok": ok], status: ok ? 200 : 503)
+            return jsonResponse(["ok": ok, "hibernated": false], status: ok ? 200 : 503)
         }
         if path == "/status" {
+            stateLock.lock()
+            let proxy = lastProxyState
+            let cfg = liveConfig
+            stateLock.unlock()
+
+            let caps = runner.capabilities
+            var common = hostCommonFields(cfg: cfg, proxy: proxy)
+
+            if runner.isHibernated {
+                common["hibernated"] = true
+                common["backend"] = caps.backendName
+                common["hibernateMode"] = FileManager.default.fileExists(atPath: FirnPaths.vmStateURL.path) ? "snapshot" : "park"
+                common["capabilities"] = caps.asJSONDictionary()
+                common["vmMemory"] = [
+                    "totalBytes": 0,
+                    "freeBytes": 0,
+                    "availableBytes": 0,
+                    "cachedBytes": 0,
+                    "swapTotalBytes": 0,
+                    "swapFreeBytes": 0,
+                    "swapUsedBytes": 0,
+                ]
+                common["projects"] = []
+                common["idleSeconds"] = cfg.idleSeconds
+                common["domain"] = cfg.domain
+                return jsonResponse(common)
+            }
+
             do {
                 let (_, raw) = try bridge.guestHTTP(method: "GET", path: "/status")
                 guard var dict = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
                     return (500, raw)
                 }
-                stateLock.lock()
-                let proxy = lastProxyState
-                let cfg = liveConfig
-                stateLock.unlock()
-                let hostMem = HostProcessMetrics.current(daemonPID: getpid())
-                let caStatus = CertAuthority.caTrustStatus()
-                let diskHost = FirnHostClient.hostSparseFileStats()
-                dict["hostMemory"] = [
-                    "footprintBytes": hostMem.footprintBytes,
-                    "rssBytes": hostMem.rssBytes,
-                    "daemonFootprintBytes": hostMem.daemonFootprintBytes,
-                    "vmFootprintBytes": hostMem.vmFootprintBytes,
-                ]
-                dict["balloon"] = [
-                    "targetBytes": runner.getBalloonTargetBytes(),
-                    "minBytes": runner.config.minBalloonBytes,
-                    "maxBytes": runner.config.maxMemoryBytes,
-                ]
-                dict["dns"] = [
-                    "domain": cfg.domain,
-                    "dnsPort": Int(cfg.dnsPort),
-                    "httpProxyPort": Int(cfg.httpProxyPort),
-                    "httpsProxyPort": Int(cfg.httpsProxyPort),
-                    "recordCount": dnsServer.currentRecords().count,
-                    "caTrusted": caStatus.trusted,
-                    "pfRedirectActive": FileManager.default.fileExists(atPath: "/etc/pf.anchors/dev.firn"),
-                ]
-                dict["proxy"] = [
-                    "httpProxy": proxy.httpProxy,
-                    "httpsProxy": proxy.httpsProxy,
-                    "noProxy": proxy.noProxy,
-                    "vpnActive": proxy.vpnActive,
-                    "hostDnsRelay": proxy.hostDnsRelay,
-                    "sshAgentActive": !(ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] ?? "").isEmpty,
-                ]
-                dict["disk"] = [
-                    "hostLogicalBytes": diskHost.logicalBytes,
-                    "hostAllocatedBytes": diskHost.allocatedBytes,
-                ]
-                dict["ports"] = autoThaw.currentPortMappings().count
-                dict["topologyVersion"] = autoThaw.currentTopologyVersion()
+                for (k, v) in common {
+                    dict[k] = v
+                }
+                dict["hibernated"] = false
+                dict["backend"] = caps.backendName
+                var mergedCaps = caps.asJSONDictionary()
+                if let guestCaps = dict["capabilities"] as? [String: Any] {
+                    for (gk, gv) in guestCaps {
+                        mergedCaps[gk] = gv
+                    }
+                }
+                if let metalGPU = FirnHostClient.metalGPUDeviceName() {
+                    mergedCaps["metalDeviceName"] = metalGPU
+                }
+                dict["capabilities"] = mergedCaps
                 return jsonResponse(dict)
+            } catch {
+                return jsonResponse(["error": error.localizedDescription], status: 500)
+            }
+        }
+        if method == "POST" && path == "/hibernate" {
+            do {
+                let outcome = try runner.hibernate()
+                autoThaw.pushHibernatedTopology(hibernated: true)
+                return jsonResponse(outcome.asJSONDictionary())
+            } catch {
+                return jsonResponse(["error": error.localizedDescription], status: 500)
+            }
+        }
+        if method == "POST" && path == "/resume" {
+            let started = Date()
+            do {
+                try runner.ensureAwake()
+                var ready = false
+                for _ in 0..<120 {
+                    if let (code, _) = try? bridge.guestHTTP(method: "GET", path: "/health", timeoutSeconds: 2.0), code == 200 {
+                        ready = true
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+                autoThaw.pushHibernatedTopology(hibernated: false)
+                autoThaw.syncTopologyNow()
+                let ms = (Date().timeIntervalSince(started) * 1000.0 * 100.0).rounded() / 100.0
+                return jsonResponse(["ok": ready, "hibernated": false, "durationMs": ms])
+            } catch {
+                return jsonResponse(["error": error.localizedDescription], status: 500)
+            }
+        }
+        if path == "/route/status" {
+            stateLock.lock()
+            let cfg = liveConfig
+            stateLock.unlock()
+            let hostnetStatus = hostNet?.fetchStatus() ?? [:]
+            let utunConnected = (hostnetStatus["utunConnected"] as? Bool) ?? false
+            return jsonResponse([
+                "utunConnected": utunConnected,
+                "directRouteDNS": cfg.directRouteDNS,
+                "routeDaemonInstalled": FileManager.default.fileExists(atPath: FirnPaths.routeDaemonPlistURL.path),
+                "subnets": ["10.87.0.0/24", "10.88.0.0/16"],
+            ])
+        }
+        if path == "/k8s/status" || path == "/k8s/kubeconfig" || path == "/machines" {
+            do {
+                let (code, raw) = try bridge.guestHTTP(method: "GET", path: fullTarget, timeoutSeconds: 15.0)
+                return (code, raw)
+            } catch {
+                return jsonResponse(["error": error.localizedDescription], status: 500)
+            }
+        }
+        if method == "POST" && (path.hasPrefix("/k8s/") || path.hasPrefix("/machines/") || path == "/machines") {
+            let timeout = (path == "/k8s/enable" || path == "/machines/create") ? 180.0 : 30.0
+            do {
+                let (code, raw) = try bridge.guestHTTP(method: "POST", path: fullTarget, body: body.isEmpty ? nil : body, timeoutSeconds: timeout)
+                autoThaw.syncTopologyNow()
+                return (code, raw)
             } catch {
                 return jsonResponse(["error": error.localizedDescription], status: 500)
             }
@@ -222,7 +356,8 @@ public final class HostControlServer {
                 "hostLogicalBytes": hostStats.logicalBytes,
                 "hostAllocatedBytes": hostStats.allocatedBytes,
             ]
-            if let (_, raw) = try? bridge.guestHTTP(method: "GET", path: "/disk/usage", timeoutSeconds: 5.0),
+            if !runner.isHibernated,
+               let (_, raw) = try? bridge.guestHTTP(method: "GET", path: "/disk/usage", timeoutSeconds: 5.0),
                let guest = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] {
                 out["guest"] = guest
             }
@@ -265,6 +400,11 @@ public final class HostControlServer {
                 if let idle = (req["idleSeconds"] as? NSNumber)?.intValue, idle >= 0 { next.idleSeconds = idle }
                 if let dom = req["domain"] as? String, !dom.isEmpty { next.domain = dom }
                 if let exempt = req["exemptProjects"] as? [String] { next.exemptProjects = exempt }
+                if let dsm = req["diskSyncMode"] as? String, dsm == "none" || dsm == "fsync" { next.diskSyncMode = dsm }
+                if let fsm = req["fsMode"] as? String, fsm == "firnfs" || fsm == "virtiofs" { next.fsMode = fsm }
+                if let nv = req["nestedVirtualization"] as? Bool { next.nestedVirtualization = nv }
+                if let hib = (req["hibernateSeconds"] as? NSNumber)?.intValue, hib >= 0 { next.hibernateSeconds = hib }
+                if let drd = req["directRouteDNS"] as? Bool { next.directRouteDNS = drd }
                 liveConfig = next
                 stateLock.unlock()
 
@@ -273,16 +413,18 @@ public final class HostControlServer {
                 } catch {
                     return jsonResponse(["error": error.localizedDescription], status: 500)
                 }
-                let guestPayload: [String: Any] = [
-                    "idleSeconds": next.idleSeconds,
-                    "domain": next.domain,
-                    "exemptProjects": next.exemptProjects,
-                ]
-                if let guestBody = try? JSONSerialization.data(withJSONObject: guestPayload) {
-                    _ = try? bridge.guestHTTP(method: "POST", path: "/config", body: guestBody, timeoutSeconds: 5.0)
+                if !runner.isHibernated {
+                    let guestPayload: [String: Any] = [
+                        "idleSeconds": next.idleSeconds,
+                        "domain": next.domain,
+                        "exemptProjects": next.exemptProjects,
+                    ]
+                    if let guestBody = try? JSONSerialization.data(withJSONObject: guestPayload) {
+                        _ = try? bridge.guestHTTP(method: "POST", path: "/config", body: guestBody, timeoutSeconds: 5.0)
+                    }
+                    autoThaw.syncTopologyNow()
                 }
-                autoThaw.syncTopologyNow()
-                let restartNeeded = (prev.cpus != next.cpus || prev.memoryGiB != next.memoryGiB || prev.domain != next.domain)
+                let restartNeeded = (prev.cpus != next.cpus || prev.memoryGiB != next.memoryGiB || prev.domain != next.domain || prev.diskSyncMode != next.diskSyncMode || prev.fsMode != next.fsMode || prev.nestedVirtualization != next.nestedVirtualization)
                 if let cfgObj = (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(next))) as? [String: Any] {
                     var resp = cfgObj
                     resp["restartRequired"] = restartNeeded

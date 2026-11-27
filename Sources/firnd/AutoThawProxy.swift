@@ -1,7 +1,6 @@
 import Darwin
 import Foundation
 import FirnCore
-import Virtualization
 
 public struct PortMappingEntry: Codable, Sendable {
     public var hostPort: Int
@@ -17,6 +16,7 @@ public struct PortMappingEntry: Codable, Sendable {
 private struct TopologyPayload: Codable {
     var version: UInt64
     var domain: String
+    var hibernated: Bool?
     var ports: [PortMappingEntry]?
     var records: [DNSRecordEntry]?
 }
@@ -26,10 +26,16 @@ public final class AutoThawProxy {
     private let balloon: BalloonController
     private let dnsServer: LocalDNSServer
     private let httpProxyPort: UInt16
+    private let hostNet: HostNetSupervisor?
+    private let delegateProxying: Bool
+    private let isHibernatedCheck: () -> Bool
 
     private let lock = NSLock()
     private var listeners: [Int: [Int32]] = [:]
     private var mappingsByPort: [Int: PortMappingEntry] = [:]
+    private var lastPorts: [PortMappingEntry] = []
+    private var lastRecords: [DNSRecordEntry] = []
+    private var lastDomain: String = "firn.local"
     private var topologyVersion: UInt64 = 0
     private let topoCond = NSCondition()
     private let thawCond = NSCondition()
@@ -40,23 +46,59 @@ public final class AutoThawProxy {
 
     public var onProjectsChanged: (([String]) -> Void)?
 
-    public init(bridge: VsockBridge, balloon: BalloonController, dnsServer: LocalDNSServer, httpProxyPort: UInt16) {
+    public init(
+        bridge: VsockBridge,
+        balloon: BalloonController,
+        dnsServer: LocalDNSServer,
+        httpProxyPort: UInt16,
+        hostNet: HostNetSupervisor? = nil,
+        delegateProxying: Bool = false,
+        isHibernatedCheck: @escaping () -> Bool = { false }
+    ) {
         self.bridge = bridge
         self.balloon = balloon
         self.dnsServer = dnsServer
         self.httpProxyPort = httpProxyPort
+        self.hostNet = hostNet
+        self.delegateProxying = delegateProxying
+        self.isHibernatedCheck = isHibernatedCheck
     }
 
     public func start() {
         running = true
-        try? startHTTPDomainProxy()
+        if !delegateProxying {
+            try? startHTTPDomainProxy()
+        }
         spawnIOThread { [weak self] in
             while self?.running == true {
+                if self?.isHibernatedCheck() == true {
+                    Thread.sleep(forTimeInterval: 0.5)
+                    continue
+                }
                 let ok = self?.syncTopology(longPoll: true) ?? false
                 if !ok && self?.running == true {
                     Thread.sleep(forTimeInterval: 0.5)
                 }
             }
+        }
+    }
+
+    public func pushHibernatedTopology(hibernated: Bool) {
+        lock.lock()
+        let ports = lastPorts
+        let records = lastRecords
+        let dom = lastDomain
+        lock.unlock()
+
+        topoCond.lock()
+        topologyVersion &+= 1
+        let v = topologyVersion
+        topoCond.broadcast()
+        topoCond.unlock()
+
+        let upd = TopologyPayload(version: v, domain: dom, hibernated: hibernated, ports: ports, records: records)
+        if let body = try? JSONEncoder().encode(upd) {
+            hostNet?.pushTopology(body)
         }
     }
 
@@ -85,6 +127,9 @@ public final class AutoThawProxy {
 
     @discardableResult
     private func syncTopology(longPoll: Bool) -> Bool {
+        if isHibernatedCheck() {
+            return false
+        }
         topoCond.lock()
         let since = topologyVersion
         topoCond.unlock()
@@ -93,7 +138,7 @@ public final class AutoThawProxy {
         let timeout = longPoll ? 15.0 : 5.0
         guard let (status, data) = try? bridge.guestHTTP(method: "GET", path: path, timeoutSeconds: timeout),
               status == 200,
-              let payload = try? JSONDecoder().decode(TopologyPayload.self, from: data) else {
+              var payload = try? JSONDecoder().decode(TopologyPayload.self, from: data) else {
             return false
         }
 
@@ -116,11 +161,18 @@ public final class AutoThawProxy {
                 if let p = r.project, !p.isEmpty { projects.insert(p) }
             }
             lock.lock()
+            lastPorts = ports
+            lastRecords = records
+            lastDomain = payload.domain
             let projChanged = projects != lastKnownProjects
             if projChanged {
                 lastKnownProjects = projects
             }
             lock.unlock()
+            payload.hibernated = isHibernatedCheck()
+            if let updData = try? JSONEncoder().encode(payload) {
+                hostNet?.pushTopology(updData)
+            }
             if projChanged {
                 onProjectsChanged?(Array(projects).sorted())
             }
@@ -231,7 +283,7 @@ public final class AutoThawProxy {
         }
     }
 
-    public func openTunnelWithRetry(host: String, port: UInt16, attempts: Int = 5) throws -> VZVirtioSocketConnection {
+    public func openTunnelWithRetry(host: String, port: UInt16, attempts: Int = 5) throws -> any StreamChannel {
         var lastErr: Error?
         for idx in 0..<max(1, attempts) {
             do {

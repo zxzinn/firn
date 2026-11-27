@@ -3,7 +3,6 @@ import Foundation
 import FirnCore
 import Network
 import Security
-import Virtualization
 
 public final class HTTPSDomainProxy {
     private let autoThaw: AutoThawProxy
@@ -233,7 +232,7 @@ public final class HTTPSDomainProxy {
         }
     }
 
-    private func spliceTLSConnection(conn: NWConnection, vsockConn: VZVirtioSocketConnection) {
+    private func spliceTLSConnection(conn: NWConnection, vsockConn: any StreamChannel) {
         let vfd = vsockConn.fileDescriptor
         let closeLock = NSLock()
         var closed = false

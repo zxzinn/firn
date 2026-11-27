@@ -90,7 +90,7 @@ func sanitizeDNSLabel(raw string) string {
 	return strings.Trim(b.String(), "-")
 }
 
-func buildContainerDNSNames(name, service, project, domain string, ports []PortMapping) ([]string, int) {
+func buildContainerDNSNames(name, service, project, domain string, ports []PortMapping, extraLabels ...string) ([]string, int) {
 	if domain == "" {
 		domain = "firn.local"
 	}
@@ -101,6 +101,11 @@ func buildContainerDNSNames(name, service, project, domain string, ports []PortM
 		if fqdn != "" && !seen[fqdn] {
 			seen[fqdn] = true
 			names = append(names, fqdn)
+		}
+	}
+	for _, lbl := range extraLabels {
+		if clean := sanitizeDNSLabel(lbl); clean != "" {
+			add(clean + "." + domain)
 		}
 	}
 	cleanName := sanitizeDNSLabel(name)

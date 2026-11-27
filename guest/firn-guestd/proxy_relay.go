@@ -100,13 +100,31 @@ func (p *ProxyAndDNSRelay) ServeDNS(addr string) error {
 				_, _ = pc.WriteTo(resp, dest)
 				return
 			}
-			resp, err := p.relayDNSViaVsockHost(query)
+			resp, err := p.relayDNSViaHost(query)
 			if err == nil && len(resp) > 0 {
 				_, _ = pc.WriteTo(resp, dest)
 				return
 			}
 		}(pkt, remote)
 	}
+}
+
+func (p *ProxyAndDNSRelay) relayDNSViaHost(query []byte) ([]byte, error) {
+	if interfaceHasIPv4("eth0", "10.89.0.2") {
+		conn, err := net.DialTimeout("udp", "10.89.0.1:53", 500*time.Millisecond)
+		if err == nil {
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			if _, werr := conn.Write(query); werr == nil {
+				resp := make([]byte, 4096)
+				if n, rerr := conn.Read(resp); rerr == nil && n > 0 {
+					_ = conn.Close()
+					return resp[:n], nil
+				}
+			}
+			_ = conn.Close()
+		}
+	}
+	return p.relayDNSViaVsockHost(query)
 }
 
 func (p *ProxyAndDNSRelay) relayDNSViaVsockHost(query []byte) ([]byte, error) {

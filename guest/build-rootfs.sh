@@ -7,10 +7,15 @@ STATE_DIR="${FIRN_HOME:-$HOME/.firn}"
 mkdir -p "$OUT_DIR" "$STATE_DIR/run"
 
 echo "[firn-rootfs] compiling firn-guestd (linux/arm64)..."
+if go version >/dev/null 2>&1; then
+  GO_CMD=(go)
+else
+  GO_CMD=(mise exec go@1.27.4 -- go)
+fi
 (
   cd "$SCRIPT_DIR/firn-guestd"
-  mise exec go@1.27.4 -- env CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-    go build -ldflags="-s -w" -o "$SCRIPT_DIR/firn-guestd-bin" .
+  CGO_ENABLED=0 GOOS=linux GOARCH=arm64 "${GO_CMD[@]}" \
+    build -ldflags="-s -w" -o "$SCRIPT_DIR/firn-guestd-bin" .
 )
 chmod 755 "$SCRIPT_DIR/firn-guestd-bin"
 
@@ -28,7 +33,7 @@ else
 fi
 
 echo "[firn-rootfs] building Alpine 3.21 rootfs, kernel Image, and initramfs via Docker (${DOCKER_ARGS[*]:-default})..."
-docker "${DOCKER_ARGS[@]}" run --rm -i \
+docker "${DOCKER_ARGS[@]}" run --rm --platform linux/arm64 -i \
   -v "$SCRIPT_DIR:/work:ro" \
   -v "$OUT_DIR:/out" \
   alpine:3.21 sh -euxo pipefail -c '
@@ -40,8 +45,8 @@ docker "${DOCKER_ARGS[@]}" run --rm -i \
     cp -a /etc/apk/keys /rootfs/etc/apk/keys
     apk --root /rootfs --initdb --no-cache -q add \
       alpine-base linux-virt mkinitfs docker docker-cli-compose \
-      e2fsprogs iptables ip6tables ca-certificates iproute2 kmod \
-      busybox-extras curl bash procps-ng util-linux-misc
+      e2fsprogs iptables ip6tables iptables-legacy ca-certificates iproute2 kmod \
+      busybox-extras curl bash procps-ng util-linux-misc conntrack-tools socat
 
     python3 - <<'\''PYEOF'\''
 import gzip, struct
@@ -68,10 +73,12 @@ EOF
 
     install -m 0755 /work/init /rootfs/sbin/init
     install -m 0755 /work/firn-guestd-bin /rootfs/usr/local/bin/firn-guestd
-    mkdir -p /rootfs/etc/docker /rootfs/var/lib/firn /rootfs/var/lib/docker /rootfs/mnt/rosetta /rootfs/run/firn /rootfs/etc/firn /rootfs/etc/udhcpc
+    printf 'user_allow_other\n' >/rootfs/etc/fuse.conf
+    mkdir -p /rootfs/etc/docker /rootfs/var/lib/firn /rootfs/var/lib/docker /rootfs/mnt/rosetta /rootfs/mnt/virtiofs-home /rootfs/run/firn /rootfs/etc/firn /rootfs/etc/udhcpc
     cat >/rootfs/etc/docker/daemon.json <<'\''EOF'\''
 {
   "storage-driver": "overlay2",
+  "userland-proxy": false,
   "bip": "10.87.0.1/24",
   "dns": ["10.87.0.1"],
   "exec-opts": ["native.cgroupdriver=cgroupfs"],

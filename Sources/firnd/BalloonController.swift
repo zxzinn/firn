@@ -3,11 +3,11 @@ import Foundation
 import FirnCore
 
 public final class BalloonController {
-    private let runner: VZMachineRunner
+    private let runner: any VMBackend
     private let bridge: VsockBridge
     private let minDeltaBytes: UInt64 = 64 * 1024 * 1024
 
-    public init(runner: VZMachineRunner, bridge: VsockBridge) {
+    public init(runner: any VMBackend, bridge: VsockBridge) {
         self.runner = runner
         self.bridge = bridge
     }
@@ -62,6 +62,7 @@ public final class BalloonController {
     }
 
     public func periodicIdleTrimIfHelpful() {
+        if runner.isHibernated { return }
         let used = queryGuestUsedBytes()
         let desired = computeBalloonTargetBytes(
             usedGuestBytes: used,

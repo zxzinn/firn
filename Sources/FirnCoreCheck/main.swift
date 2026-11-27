@@ -37,17 +37,26 @@ guard let respAAAA = WireDNS.buildLocalResponse(for: queryAAAA, domain: "firn.lo
 }
 expect(respAAAA.last == 1, "Expected ::1 in DNS AAAA answer")
 
+guard let respDirect = WireDNS.buildLocalResponse(for: queryA, domain: "firn.local", knownNames: [], directIPv4: "10.88.0.12") else {
+    fail("Expected direct A response for firn.local")
+}
+expect(Array(respDirect.suffix(4)) == [10, 88, 0, 12], "Expected direct container IP 10.88.0.12 in DNS A answer")
+
 let externalQuery = buildSampleQuery(name: "example.com", qtype: 1)
 expect(WireDNS.buildLocalResponse(for: externalQuery, domain: "firn.local", knownNames: []) == nil, "External query should not be answered locally")
 
 let defaultCfg = FirnConfig()
 expect(defaultCfg.exemptProjects.isEmpty, "Open-source default exemptProjects must be empty")
 expect(defaultCfg.httpsProxyPort == 8443, "Default httpsProxyPort must be 8443")
+expect(defaultCfg.fsMode == "firnfs" && defaultCfg.diskSyncMode == "none" && !defaultCfg.nestedVirtualization, "Expected v0.4.0 default config flags")
 
 let tmpStateDir = FileManager.default.temporaryDirectory.appendingPathComponent("firn-check-\(UUID().uuidString)")
 defer { try? FileManager.default.removeItem(at: tmpStateDir) }
 var customCfg = FirnConfig(cpus: 6, memoryGiB: 6, idleSeconds: 420, exemptProjects: ["db"])
 customCfg.httpsProxyPort = 9443
+customCfg.hibernateSeconds = 1800
+customCfg.fsMode = "virtiofs"
+customCfg.diskSyncMode = "fsync"
 try customCfg.save(to: tmpStateDir)
 let reloadedCfg = FirnConfig.load(from: tmpStateDir)
 expect(reloadedCfg == customCfg, "FirnConfig save/load roundtrip mismatch")
@@ -80,15 +89,20 @@ expect(caStatus.exists && caStatus.fingerprint.contains("SHA256") || caStatus.fi
 
 let plist = FirnLaunchAgent.plistContents(firndPath: "/usr/local/bin/firnd", stateDir: URL(fileURLWithPath: "/tmp/firn-home"))
 expect(plist.contains("dev.firn.firnd") && plist.contains("/usr/local/bin/firnd") && plist.contains("/tmp/firn-home/firnd.log"), "LaunchAgent plist mismatch")
+let routePlist = FirnRouteDaemon.plistContents(hostnetPath: "/usr/local/bin/firn-hostnet", utunSockURL: URL(fileURLWithPath: "/tmp/firn-home/run/utun.sock"), stateDir: URL(fileURLWithPath: "/tmp/firn-home"))
+expect(routePlist.contains("dev.firn.route") && routePlist.contains("utun") && routePlist.contains("/tmp/firn-home/run/utun.sock"), "RouteDaemon plist mismatch")
 
 let probeFile = tmpStateDir.appendingPathComponent("sparse-test.bin")
 FileManager.default.createFile(atPath: probeFile.path, contents: Data(repeating: 0x41, count: 8192))
 let diskStats = FirnHostClient.hostSparseFileStats(at: probeFile)
 expect(diskStats.logicalBytes == 8192 && diskStats.allocatedBytes > 0, "Expected hostSparseFileStats logical=8192 allocated>0")
+let digest = try FirnHostClient.sha256Hex(of: probeFile)
+expect(digest.count == 64, "Expected 64-char sha256 digest")
 
 expect(FirnHostClient.formatBytes(512 * 1024) == "0.5 MiB", "formatBytes MiB mismatch")
 expect(FirnHostClient.formatBytes(2 * 1024 * 1024 * 1024) == "2.00 GiB", "formatBytes GiB mismatch")
 
 expect(HostProcessMetrics.samplePID(getpid())?.footprint ?? 0 > 0, "Expected non-zero proc_pid_rusage footprint for current process")
+_ = FirnHostClient.metalGPUDeviceName()
 
 print("FirnCoreCheck: all checks passed")

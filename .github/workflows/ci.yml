@@ -20,11 +20,23 @@ jobs:
       - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go vet ./...
       - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /tmp/firn-guestd .
 
-  swift-macos:
+  hostnet-and-swift-macos:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: swift build -c release
-      - run: swift run FirnCoreCheck
-      - run: make swift
-      - run: codesign -d --entitlements :- build/firnd
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: host/firn-hostnet/go.mod
+      - name: Test hostnet
+        working-directory: host/firn-hostnet
+        run: |
+          go test -race -count=1 -v ./...
+          go vet ./...
+      - name: Build hostnet & Swift products
+        run: |
+          make hostnet
+          make swift
+      - name: Run FirnCore unit checks
+        run: swift run FirnCoreCheck
+      - name: Verify firnd entitlements
+        run: codesign -d --entitlements :- build/firnd

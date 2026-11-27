@@ -7,6 +7,7 @@ mount -t proc proc /proc 2>/dev/null || true
 mount -t sysfs sysfs /sys 2>/dev/null || true
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mount -o remount,rw / 2>/dev/null || true
+mount --make-rshared / 2>/dev/null || true
 mkdir -p /dev/pts /dev/shm /run /tmp /var/lib/firn /var/lib/docker /var/log/firn /run/firn /sys/fs/cgroup
 mount -t devpts devpts /dev/pts 2>/dev/null || true
 mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
@@ -15,12 +16,12 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
 
 for mod in \
-  virtio_pci virtio_mmio virtio_blk virtio_net virtio_balloon virtiofs \
+  virtio_pci virtio_mmio virtio_blk virtio_net virtio_balloon virtio_gpu virtiofs \
   vsock vmw_vsock_virtio_transport tun lz4 zram \
-  ext4 overlay fuse loop br_netfilter bridge veth \
-  nf_tables nft_compat ip_tables iptable_nat iptable_filter \
+  ext4 overlay fuse loop br_netfilter bridge veth vxlan \
+  nf_tables nft_compat nf_conntrack ip_tables iptable_nat iptable_filter \
   ip6_tables ip6table_nat ip6table_filter \
-  xt_MASQUERADE xt_conntrack xt_addrtype xt_tcpudp binfmt_misc
+  xt_MASQUERADE xt_conntrack xt_addrtype xt_tcpudp xt_comment xt_statistic xt_mark xt_recent binfmt_misc
 do
   modprobe -q "$mod" 2>/dev/null || true
 done
@@ -28,6 +29,8 @@ done
 mkdir -p /dev/net
 [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null || true
 chmod 666 /dev/net/tun 2>/dev/null || true
+[ -e /dev/kvm ] && chmod 666 /dev/kvm 2>/dev/null || true
+[ -d /dev/dri ] && chmod -R 666 /dev/dri 2>/dev/null || true
 
 hostname firn 2>/dev/null || true
 ip link set lo up 2>/dev/null || true
@@ -42,15 +45,14 @@ if [ -e /sys/block/zram0 ]; then
   fi
 fi
 
-# Persistent data disk (/dev/vdb) holds Docker state and backing disk swapfile (priority 10).
-# Avoid synchronous discard on hot container create/unlink paths; run fstrim at shutdown or via `firn disk trim`.
+# Persistent data disk (/dev/vdb) holds Docker state, k3s state, and backing swapfile (priority 10).
 if [ -b /dev/vdb ]; then
   if ! blkid /dev/vdb 2>/dev/null | grep -q 'TYPE='; then
     echo "[firn-init] formatting /dev/vdb (ext4)..."
     mkfs.ext4 -q -F -L firn-data /dev/vdb
   fi
   mount -t ext4 -o noatime,nodiratime /dev/vdb /var/lib/firn
-  mkdir -p /var/lib/firn/docker /var/lib/docker /var/lib/firn/log
+  mkdir -p /var/lib/firn/docker /var/lib/docker /var/lib/firn/log /var/lib/firn/k3s
   mount --bind /var/lib/firn/docker /var/lib/docker
 
   if [ ! -f /var/lib/firn/swapfile ]; then
@@ -66,22 +68,32 @@ fi
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
+sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_rmem="4096 1048576 16777216" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_window_scaling=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1 || true
 sysctl -w vm.swappiness=80 >/dev/null 2>&1 || true
 sysctl -w fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true
 sysctl -w fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true
 
-# Mount host home directory via virtiofs at its exact macOS path.
 HOST_HOME=""
+FS_MODE="firnfs"
+NET_MODE="jumbo"
 for token in $(cat /proc/cmdline); do
   case "$token" in
     firn.home=*) HOST_HOME="${token#firn.home=}" ;;
+    firn.fs=*) FS_MODE="${token#firn.fs=}" ;;
+    firn.net=*) NET_MODE="${token#firn.net=}" ;;
   esac
 done
-if [ -n "$HOST_HOME" ]; then
-  mkdir -p "$HOST_HOME"
-  mount -t virtiofs host-home "$HOST_HOME" 2>/dev/null || true
-fi
+
+# Always keep VirtioFS mounted as fallback backing at /mnt/virtiofs-home.
+mkdir -p /mnt/virtiofs-home
+mount -t virtiofs -o noatime,nodiratime host-home /mnt/virtiofs-home 2>/dev/null || true
 
 # Register Rosetta x86_64 binfmt_misc if shared by Virtualization.framework.
 mkdir -p /mnt/rosetta
@@ -93,27 +105,47 @@ if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null && [ -x /mnt/rosetta/roset
   fi
 fi
 
-# Point host.docker.internal/host.firn.internal to firn0 gateway (10.89.0.1 -> vsock:2380 -> host loopback).
+# Point host.docker.internal/host.firn.internal to host gateway (10.89.0.1).
 printf '127.0.0.1 localhost firn\n::1 localhost firn\n10.89.0.1 host.docker.internal host.firn.internal\n' >/etc/hosts
 
-# Bring up VZ NAT networking in parallel (netstack firn0 serves metric 50 default route regardless).
 if ip link show eth0 >/dev/null 2>&1; then
-  ip link set eth0 up
-  (
-    udhcpc -i eth0 -n -q -t 4 -T 1 >/dev/null 2>&1 || true
-    printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
-  ) &
+  if [ "$NET_MODE" = "nat" ]; then
+    ip link set eth0 up
+    (
+      udhcpc -i eth0 -n -q -t 4 -T 1 >/dev/null 2>&1 || true
+      printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
+    ) &
+  else
+    ip link set dev eth0 mtu 16384 2>/dev/null || ip link set dev eth0 mtu 9000 2>/dev/null || ip link set dev eth0 mtu 1500 2>/dev/null || true
+    ip addr replace 10.89.0.2/24 dev eth0 2>/dev/null || true
+    ip link set eth0 up
+    ip route replace default via 10.89.0.1 dev eth0 metric 20 2>/dev/null || true
+    ip route replace 10.89.1.0/24 via 10.89.0.1 dev eth0 2>/dev/null || true
+    ip neigh replace 10.89.0.1 lladdr 52:54:00:12:34:01 dev eth0 nud permanent 2>/dev/null || true
+  fi
 fi
 
-# Start firn-guestd before dockerd so 127.0.0.1:53 (vsock:2379 DNS relay) and
-# 127.0.0.1:3128 (vsock:2378 proxy relay) are ready when dockerd starts.
-/usr/local/bin/firn-guestd >/var/log/firn/guestd.log 2>&1 &
+# Start firn-guestd so DNS (:53), proxy relay (:3128), and firnfs ($HOST_HOME) come up before dockerd.
+[ -n "$HOST_HOME" ] && mkdir -p "$HOST_HOME"
+GUESTD_ARGS="--host-home=$HOST_HOME --fs-mode=$FS_MODE"
+/usr/local/bin/firn-guestd $GUESTD_ARGS >/var/log/firn/guestd.log 2>&1 &
 GUESTD_PID=$!
 
-for _ in $(seq 1 50); do
-  [ -S /run/firn/reaper.sock ] && break
+for _ in $(seq 1 125); do
+  if [ -S /run/firn/reaper.sock ]; then
+    if [ "$FS_MODE" != "firnfs" ] || [ -z "$HOST_HOME" ] || [ -f /run/firn/fs.ready ]; then
+      break
+    fi
+  fi
   sleep 0.02
 done
+
+# Fallback to VirtioFS bind if firnfs did not signal readiness.
+if [ -n "$HOST_HOME" ] && [ ! -f /run/firn/fs.ready ]; then
+  if [ -d /mnt/virtiofs-home ] && ! grep -q " $HOST_HOME " /proc/mounts 2>/dev/null; then
+    mount --bind /mnt/virtiofs-home "$HOST_HOME" 2>/dev/null || true
+  fi
+fi
 
 # Start containerd + dockerd.
 rm -f /var/run/docker.pid /var/run/containerd/containerd.pid
@@ -138,6 +170,8 @@ echo "[firn-init] ready (uptime $(cat /proc/uptime | awk '{print $1}')s)"
 
 shutdown_clean() {
   echo "[firn-init] shutting down..."
+  pkill -TERM -x k3s 2>/dev/null || true
+  [ -n "$HOST_HOME" ] && umount -l "$HOST_HOME" 2>/dev/null || true
   kill -TERM "$GUESTD_PID" 2>/dev/null || true
   kill -TERM "$DOCKERD_PID" 2>/dev/null || true
   wait "$DOCKERD_PID" 2>/dev/null || true
@@ -163,7 +197,7 @@ while true; do
     DOCKERD_PID=$!
   fi
   if ! kill -0 "$GUESTD_PID" 2>/dev/null; then
-    /usr/local/bin/firn-guestd >>/var/log/firn/guestd.log 2>&1 &
+    /usr/local/bin/firn-guestd $GUESTD_ARGS >>/var/log/firn/guestd.log 2>&1 &
     GUESTD_PID=$!
   fi
   sleep 10 &

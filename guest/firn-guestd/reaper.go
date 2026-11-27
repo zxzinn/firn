@@ -249,11 +249,20 @@ type DiskUsageInfo struct {
 	ZramUsedBytes  uint64 `json:"zramUsedBytes"`
 }
 
+type GuestCapabilities struct {
+	NestedKVM     bool `json:"nestedKvm"`
+	GPUDRI        bool `json:"gpuDri"`
+	FirnfsActive  bool `json:"firnfsActive"`
+	FastVirtioNet bool `json:"fastVirtioNet"`
+	K3sRunning    bool `json:"k3sRunning"`
+}
+
 type StatusResponse struct {
-	IdleSeconds int             `json:"idleSeconds"`
-	Domain      string          `json:"domain"`
-	VMMemory    VMMemoryInfo    `json:"vmMemory"`
-	Projects    []ProjectStatus `json:"projects"`
+	IdleSeconds  int               `json:"idleSeconds"`
+	Domain       string            `json:"domain"`
+	VMMemory     VMMemoryInfo      `json:"vmMemory"`
+	Projects     []ProjectStatus   `json:"projects"`
+	Capabilities GuestCapabilities `json:"capabilities"`
 }
 
 type TopologyResponse struct {
@@ -310,6 +319,8 @@ type ReaperEngine struct {
 	idleSeconds       int
 	domain            string
 	exemptProjects    map[string]bool
+	extraPortsFn      func() []PortMapping
+	capabilitiesFn    func() GuestCapabilities
 
 	mu       sync.Mutex
 	activity map[string]activitySample
@@ -745,7 +756,8 @@ func (e *ReaperEngine) collectLocked(now time.Time) (map[string]*ProjectStatus, 
 		if inspected != nil && (item.State == "running" || item.State == "paused") {
 			containerPorts := extractContainerPorts(inspected, project, service, name, ip, paused)
 			ports = append(ports, containerPorts...)
-			names, primaryPort := buildContainerDNSNames(name, service, project, e.domain, containerPorts)
+			extraLabel := item.Labels[machineNameLabel]
+			names, primaryPort := buildContainerDNSNames(name, service, project, e.domain, containerPorts, extraLabel)
 			if project != "" {
 				serviceGroups[project] = append(serviceGroups[project], name)
 			}
@@ -769,14 +781,20 @@ func (e *ReaperEngine) collectLocked(now time.Time) (map[string]*ProjectStatus, 
 		}
 	}
 
+	if e.extraPortsFn != nil {
+		ports = append(ports, e.extraPortsFn()...)
+	}
 	sort.Slice(ports, func(i, j int) bool { return ports[i].HostPort < ports[j].HostPort })
 	return projects, ports, dnsRecords, nil
 }
 
 func (e *ReaperEngine) Status(now time.Time) (StatusResponse, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	projectsMap, _, _, err := e.collectLocked(now)
+	capsFn := e.capabilitiesFn
+	domain := e.domain
+	idleSec := e.idleSeconds
+	e.mu.Unlock()
 	if err != nil {
 		return StatusResponse{}, err
 	}
@@ -786,11 +804,16 @@ func (e *ReaperEngine) Status(now time.Time) (StatusResponse, error) {
 		list = append(list, *item)
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Project < list[j].Project })
+	var caps GuestCapabilities
+	if capsFn != nil {
+		caps = capsFn()
+	}
 	return StatusResponse{
-		IdleSeconds: e.idleSeconds,
-		Domain:      e.domain,
-		VMMemory:    ParseMeminfo(e.meminfoPath),
-		Projects:    list,
+		IdleSeconds:  idleSec,
+		Domain:       domain,
+		VMMemory:     ParseMeminfo(e.meminfoPath),
+		Projects:     list,
+		Capabilities: caps,
 	}, nil
 }
 

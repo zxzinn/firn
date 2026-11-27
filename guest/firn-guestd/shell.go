@@ -28,12 +28,13 @@ const (
 )
 
 type shellStartRequest struct {
-	Argv []string `json:"argv"`
-	Cwd  string   `json:"cwd,omitempty"`
-	Rows uint16   `json:"rows,omitempty"`
-	Cols uint16   `json:"cols,omitempty"`
-	TTY  bool     `json:"tty"`
-	Env  []string `json:"env,omitempty"`
+	Argv    []string `json:"argv"`
+	Cwd     string   `json:"cwd,omitempty"`
+	Machine string   `json:"machine,omitempty"`
+	Rows    uint16   `json:"rows,omitempty"`
+	Cols    uint16   `json:"cols,omitempty"`
+	TTY     bool     `json:"tty"`
+	Env     []string `json:"env,omitempty"`
 }
 
 func writeShellFrame(mu *sync.Mutex, w io.Writer, kind byte, payload []byte) error {
@@ -72,7 +73,7 @@ func readShellFrame(r io.Reader) (byte, []byte, error) {
 	return hdr[0], payload, nil
 }
 
-func serveShellBridge(vsockPort uint32) error {
+func serveShellBridge(vsockPort uint32, defaultHostHome string) error {
 	ln, err := ListenVsock(vsockPort)
 	if err != nil {
 		return err
@@ -83,11 +84,11 @@ func serveShellBridge(vsockPort uint32) error {
 		if err != nil {
 			return err
 		}
-		go handleShellSession(vc)
+		go handleShellSession(vc, defaultHostHome)
 	}
 }
 
-func handleShellSession(conn net.Conn) {
+func handleShellSession(conn net.Conn, defaultHostHome string) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadBytes('\n')
@@ -108,17 +109,43 @@ func handleShellSession(conn net.Conn) {
 		req.Cols = 80
 	}
 
-	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
-	if req.Cwd != "" {
-		cmd.Dir = req.Cwd
+	var cmd *exec.Cmd
+	if req.Machine != "" {
+		cleanName, nerr := sanitizeMachineName(req.Machine)
+		if nerr != nil {
+			return
+		}
+		execArgs := []string{"exec", "-i"}
+		if req.TTY {
+			execArgs = append(execArgs, "-t")
+		}
+		workdir := req.Cwd
+		if workdir == "" {
+			workdir = defaultHostHome
+		}
+		if workdir != "" {
+			execArgs = append(execArgs, "-w", workdir)
+		}
+		execArgs = append(execArgs, "-e", "TERM=xterm-256color", "-e", "SSH_AUTH_SOCK="+guestSSHAgentSock)
+		for _, e := range req.Env {
+			execArgs = append(execArgs, "-e", e)
+		}
+		execArgs = append(execArgs, machineContainerName(cleanName))
+		execArgs = append(execArgs, req.Argv...)
+		cmd = exec.Command("docker", execArgs...)
+	} else {
+		cmd = exec.Command(req.Argv[0], req.Argv[1:]...)
+		if req.Cwd != "" {
+			cmd.Dir = req.Cwd
+		}
+		env := append(os.Environ(),
+			"TERM=xterm-256color",
+			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+			"SSH_AUTH_SOCK="+guestSSHAgentSock,
+		)
+		env = append(env, req.Env...)
+		cmd.Env = env
 	}
-	env := append(os.Environ(),
-		"TERM=xterm-256color",
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"SSH_AUTH_SOCK="+guestSSHAgentSock,
-	)
-	env = append(env, req.Env...)
-	cmd.Env = env
 
 	var writeMu sync.Mutex
 	sendExit := func(code int) {

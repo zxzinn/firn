@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: host/firn-hostnet/go.mod
+      - name: Build macOS binaries & Firn.app
+        run: |
+          make hostnet
+          make swift
+          mkdir -p dist
+          tar -C build -czf dist/firn-darwin-arm64.tar.gz firn firnd firn-hostnet Firn.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dist
+          path: dist/firn-darwin-arm64.tar.gz
+
+  build-linux-images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: guest/firn-guestd/go.mod
+      - name: Build Linux ARM64 kernel, initramfs & rootfs
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd e2fsprogs cpio gzip
+          bash guest/build-rootfs.sh
+          mkdir -p dist
+          zstd -19 -T0 -f ~/.firn/images/rootfs.ext4 -o dist/rootfs.ext4.zst
+          cp ~/.firn/images/vmlinux.Image dist/vmlinux.Image
+          cp ~/.firn/images/initramfs.img dist/initramfs.img
+          tar -C dist -czf dist/firn-linux-arm64-images.tar.gz vmlinux.Image initramfs.img rootfs.ext4.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-images-dist
+          path: dist/firn-linux-arm64-images.tar.gz
+
+  publish:
+    needs: [build-macos, build-linux-images]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Prepare checksums
+        run: |
+          mkdir -p release-files
+          mv artifacts/macos-dist/firn-darwin-arm64.tar.gz release-files/
+          mv artifacts/linux-images-dist/firn-linux-arm64-images.tar.gz release-files/
+          (cd release-files && sha256sum firn-darwin-arm64.tar.gz firn-linux-arm64-images.tar.gz > SHA256SUMS.txt)
+          cat release-files/SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-files/firn-darwin-arm64.tar.gz
+            release-files/firn-linux-arm64-images.tar.gz
+            release-files/SHA256SUMS.txt

@@ -38,7 +38,7 @@ public enum WireDNS {
         return (labels.joined(separator: "."), qtype, qclass, idx + 4)
     }
 
-    public static func buildLocalResponse(for query: Data, domain: String, knownNames: Set<String>) -> Data? {
+    public static func buildLocalResponse(for query: Data, domain: String, knownNames: Set<String>, directIPv4: String? = nil) -> Data? {
         guard let question = parseQuestion(query) else { return nil }
         let cleanDomain = domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
         let qname = question.name.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
@@ -56,17 +56,29 @@ public enum WireDNS {
         response[10] = 0x00
         response[11] = 0x00
 
-        if question.qtype == 1 { // A -> 127.0.0.1
+        var ipv4Octets: [UInt8] = [127, 0, 0, 1]
+        var usingDirectIP = false
+        if let directIPv4, !directIPv4.isEmpty {
+            var in4 = in_addr()
+            if inet_pton(AF_INET, directIPv4, &in4) == 1 {
+                let raw = withUnsafeBytes(of: &in4) { Array($0) }
+                if raw.count == 4 {
+                    ipv4Octets = raw
+                    usingDirectIP = true
+                }
+            }
+        }
+
+        if question.qtype == 1 { // A -> container IP (when utun active) or 127.0.0.1
             response[7] = 0x01
             response.append(contentsOf: [
                 0xC0, 0x0C,
                 0x00, 0x01,
                 0x00, 0x01,
                 0x00, 0x00, 0x00, 0x05,
-                0x00, 0x04,
-                127, 0, 0, 1
-            ])
-        } else if question.qtype == 28 { // AAAA -> ::1
+                0x00, 0x04
+            ] + ipv4Octets)
+        } else if question.qtype == 28 && !usingDirectIP { // AAAA -> ::1 (loopback proxy mode)
             response[7] = 0x01
             response.append(contentsOf: [
                 0xC0, 0x0C,
@@ -95,12 +107,26 @@ public final class LocalDNSServer {
     private let domain: String
     private let lock = NSLock()
     private var records: [DNSRecordEntry] = []
+    private var directRouteEnabled = false
     private var sockFD: Int32 = -1
     private var running = false
 
     public init(port: UInt16, domain: String) {
         self.port = port
         self.domain = domain
+    }
+
+    public func setDirectRouteEnabled(_ enabled: Bool) {
+        lock.lock()
+        directRouteEnabled = enabled
+        lock.unlock()
+    }
+
+    public func isDirectRouteEnabled() -> Bool {
+        lock.lock()
+        let v = directRouteEnabled
+        lock.unlock()
+        return v
     }
 
     public func updateRecords(_ items: [DNSRecordEntry]) {
@@ -175,8 +201,16 @@ public final class LocalDNSServer {
             let pkt = Data(buffer[0..<n])
             lock.lock()
             let known = Set(records.flatMap { $0.names.map { $0.lowercased() } })
+            var directIP: String?
+            if directRouteEnabled, let q = WireDNS.parseQuestion(pkt) {
+                let qn = q.name.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+                if let match = records.first(where: { rec in rec.names.contains { $0.lowercased() == qn } }),
+                   !match.ip.isEmpty {
+                    directIP = match.ip
+                }
+            }
             lock.unlock()
-            let reply = WireDNS.buildLocalResponse(for: pkt, domain: domain, knownNames: known)
+            let reply = WireDNS.buildLocalResponse(for: pkt, domain: domain, knownNames: known, directIPv4: directIP)
                 ?? WireDNS.buildNXDomain(for: pkt)
             guard !reply.isEmpty else { continue }
             _ = reply.withUnsafeBytes { rawBuf in

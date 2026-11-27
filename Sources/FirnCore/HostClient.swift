@@ -1,22 +1,27 @@
+import CommonCrypto
 import Darwin
 import Foundation
+import Metal
 
 public struct HostProcessMetrics: Codable, Sendable, Equatable {
     public var footprintBytes: UInt64
     public var rssBytes: UInt64
     public var daemonFootprintBytes: UInt64
     public var vmFootprintBytes: UInt64
+    public var cpuPercent: Double
 
     public init(
         footprintBytes: UInt64 = 0,
         rssBytes: UInt64 = 0,
         daemonFootprintBytes: UInt64 = 0,
-        vmFootprintBytes: UInt64 = 0
+        vmFootprintBytes: UInt64 = 0,
+        cpuPercent: Double = 0
     ) {
         self.footprintBytes = footprintBytes
         self.rssBytes = rssBytes
         self.daemonFootprintBytes = daemonFootprintBytes
         self.vmFootprintBytes = vmFootprintBytes
+        self.cpuPercent = cpuPercent
     }
 
     public static func samplePID(_ pid: Int32) -> (footprint: UInt64, rss: UInt64)? {
@@ -31,6 +36,53 @@ public struct HostProcessMetrics: Codable, Sendable, Equatable {
             return (info.ri_phys_footprint, info.ri_resident_size)
         }
         return nil
+    }
+
+    private static let cpuLock = NSLock()
+    private static var prevSampleAt: Date?
+    private static var prevCPUNanos: UInt64 = 0
+
+    private static func cpuNanos(for pid: Int32) -> UInt64? {
+        guard pid > 0 else { return nil }
+        var info = rusage_info_v4()
+        let rc = withUnsafeMutablePointer(to: &info) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rptr in
+                proc_pid_rusage(pid, RUSAGE_INFO_V4, rptr)
+            }
+        }
+        guard rc == 0 else { return nil }
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        let denom = UInt64(max(1, tb.denom))
+        let ticks = info.ri_user_time &+ info.ri_system_time
+        return (ticks / denom) &* UInt64(tb.numer)
+    }
+
+    private static func samplePsMetrics(pids: [Int32]) -> (rssBytes: UInt64, cpuPercent: Double) {
+        guard !pids.isEmpty else { return (0, 0) }
+        let pidList = pids.map(String.init).joined(separator: ",")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/ps")
+        proc.arguments = ["-p", pidList, "-o", "rss=,%cpu="]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        guard (try? proc.run()) != nil else { return (0, 0) }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard let text = String(data: data, encoding: .utf8) else { return (0, 0) }
+        var rss: UInt64 = 0
+        var cpu: Double = 0
+        for line in text.split(separator: "\n") {
+            let cols = line.split(whereSeparator: { $0.isWhitespace })
+            if let first = cols.first, let kb = UInt64(first) {
+                rss &+= kb * 1024
+            }
+            if cols.count >= 2, let c = Double(cols[1]) {
+                cpu += c
+            }
+        }
+        return (rss, cpu)
     }
 
     private static func pidPath(_ pid: Int32) -> String? {
@@ -53,62 +105,90 @@ public struct HostProcessMetrics: Codable, Sendable, Equatable {
         return Array(pids[0..<n]).filter { $0 > 0 }
     }
 
-    public static func current(daemonPID: Int32?) -> HostProcessMetrics {
+    public static func current(daemonPID: Int32?, extraPIDs: [Int32] = []) -> HostProcessMetrics {
         guard let daemonPID, daemonPID > 0 else { return HostProcessMetrics() }
         var daemonFootprint: UInt64 = 0
         var vmFootprint: UInt64 = 0
         var totalRSS: UInt64 = 0
+        var totalCPUNanos: UInt64 = 0
 
-        if let dSample = samplePID(daemonPID) {
-            daemonFootprint = dSample.footprint
-            totalRSS &+= dSample.rss
+        for p in [daemonPID] + extraPIDs where p > 0 {
+            if let s = samplePID(p) {
+                daemonFootprint &+= s.footprint
+                totalRSS &+= s.rss
+            }
+            if let c = cpuNanos(for: p) {
+                totalCPUNanos &+= c
+            }
         }
 
         var vmPIDs: [Int32] = []
+        var vmCPUFallbackNeeded = false
         for pid in listAllPIDs() where pid != daemonPID {
-            if let path = pidPath(pid), path.contains("com.apple.Virtualization.VirtualMachine") {
+            if let path = pidPath(pid), path.contains("com.apple.Virtualization.VirtualMachine") || path.hasSuffix("/krunkit") {
                 vmPIDs.append(pid)
                 if let sample = samplePID(pid) {
                     vmFootprint &+= sample.footprint
                     totalRSS &+= sample.rss
+                    if let c = cpuNanos(for: pid) {
+                        totalCPUNanos &+= c
+                    } else {
+                        vmCPUFallbackNeeded = true
+                    }
+                } else {
+                    vmCPUFallbackNeeded = true
                 }
             }
         }
 
-        // Fall back to `ps` RSS when `proc_pid_rusage` denies XPC child access.
-        if !vmPIDs.isEmpty && vmFootprint == 0 {
-            let pidList = vmPIDs.map(String.init).joined(separator: ",")
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: "/bin/ps")
-            proc.arguments = ["-p", pidList, "-o", "rss="]
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = FileHandle.nullDevice
-            if (try? proc.run()) != nil {
-                proc.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                if let text = String(data: data, encoding: .utf8) {
-                    for line in text.split(separator: "\n") {
-                        if let kb = UInt64(line.trimmingCharacters(in: .whitespaces)) {
-                            let bytes = kb * 1024
-                            vmFootprint &+= bytes
-                            totalRSS &+= bytes
-                        }
-                    }
-                }
+        var vmCPUFallback: Double = 0
+        if !vmPIDs.isEmpty && (vmFootprint == 0 || vmCPUFallbackNeeded) {
+            let psRes = samplePsMetrics(pids: vmPIDs)
+            if vmFootprint == 0 {
+                vmFootprint &+= psRes.rssBytes
+                totalRSS &+= psRes.rssBytes
+            }
+            vmCPUFallback = psRes.cpuPercent
+        }
+
+        let now = Date()
+        var cpuPct = vmCPUFallback
+        cpuLock.lock()
+        if let prevAt = prevSampleAt {
+            let dt = now.timeIntervalSince(prevAt)
+            if dt >= 0.05 && totalCPUNanos >= prevCPUNanos {
+                cpuPct += Double(totalCPUNanos - prevCPUNanos) / (dt * 1_000_000_000.0) * 100.0
             }
         }
+        prevSampleAt = now
+        prevCPUNanos = totalCPUNanos
+        cpuLock.unlock()
 
         return HostProcessMetrics(
             footprintBytes: daemonFootprint &+ vmFootprint,
             rssBytes: totalRSS,
             daemonFootprintBytes: daemonFootprint,
-            vmFootprintBytes: vmFootprint
+            vmFootprintBytes: vmFootprint,
+            cpuPercent: (cpuPct * 10.0).rounded() / 10.0
         )
     }
 }
 
 public enum FirnHostClient {
+    public static func metalGPUDeviceName() -> String? {
+        guard let dev = MTLCreateSystemDefaultDevice() else { return nil }
+        return dev.name
+    }
+
+    public static func sha256Hex(of fileURL: URL) throws -> String {
+        let data = try Data(contentsOf: fileURL)
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { ptr in
+            _ = CC_SHA256(ptr.baseAddress, CC_LONG(ptr.count), &digest)
+        }
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
     public static func formatBytes(_ numBytes: UInt64) -> String {
         let mib = Double(numBytes) / (1024.0 * 1024.0)
         if mib >= 1024.0 {

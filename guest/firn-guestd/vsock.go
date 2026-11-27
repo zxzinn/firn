@@ -12,10 +12,12 @@ import (
 )
 
 const (
-	afVsock        = 40
-	vmaddrCIDAny   = 0xFFFFFFFF
-	vmaddrCIDHost  = 2
-	vsockSockLen   = 16
+	afVsock                    = 40
+	vmaddrCIDAny               = 0xFFFFFFFF
+	vmaddrCIDHost              = 2
+	vsockSockLen               = 16
+	soVMSocketsBufferSize      = 0
+	soVMSocketsBufferMaxSize   = 2
 )
 
 type sockaddrVM struct {
@@ -50,7 +52,11 @@ type vsockConn struct {
 }
 
 func tuneVsockSocketBuffers(fd int) {
-	const bufBytes = 1 << 20
+	const bufBytes = 4 << 20
+	var maxVsockBuf uint64 = 8 << 20
+	var vsockBuf uint64 = 4 << 20
+	_, _, _ = syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferMaxSize, uintptr(unsafe.Pointer(&maxVsockBuf)), 8, 0)
+	_, _, _ = syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferSize, uintptr(unsafe.Pointer(&vsockBuf)), 8, 0)
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bufBytes)
 	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bufBytes)
 }
@@ -106,6 +112,7 @@ func ListenVsock(port uint32) (net.Listener, error) {
 		return nil, fmt.Errorf("vsock socket: %w", err)
 	}
 	syscall.CloseOnExec(fd)
+	tuneVsockSocketBuffers(fd)
 	sa := sockaddrVM{
 		Family: afVsock,
 		Port:   port,
@@ -187,7 +194,7 @@ func DialVsockHost(port uint32) (net.Conn, error) {
 
 var copyBufPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, 1024*1024)
 		return &buf
 	},
 }

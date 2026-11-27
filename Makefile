@@ -1,15 +1,22 @@
 SHELL := /bin/bash
-SWIFT_REL_BIN := $(shell swift build -c release --show-bin-path 2>/dev/null || echo .build/out/Products/Release)
+SWIFT_BUILD_FLAGS ?=
+SWIFT_REL_BIN := $(shell swift build $(SWIFT_BUILD_FLAGS) -c release --show-bin-path 2>/dev/null || echo .build/out/Products/Release)
+GO ?= $(shell if go version >/dev/null 2>&1; then echo go; else echo "mise exec go@1.27.4 -- go"; fi)
 
-.PHONY: all build swift rootfs test clean
+.PHONY: all build hostnet swift rootfs test clean
 
 all: build
 
 rootfs:
 	bash guest/build-rootfs.sh
 
+hostnet:
+	mkdir -p build build/Firn.app/Contents/MacOS
+	cd host/firn-hostnet && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -ldflags="-s -w" -o ../../build/firn-hostnet .
+	chmod 755 build/firn-hostnet
+
 swift:
-	swift build -c release
+	swift build $(SWIFT_BUILD_FLAGS) -c release
 	mkdir -p build build/Firn.app/Contents/MacOS
 	rm -f build/firn build/firnd build/Firn.app/Contents/MacOS/FirnBar
 	cp -f "$(SWIFT_REL_BIN)/firn" build/firn
@@ -28,20 +35,24 @@ swift:
 	  '    <string>dev.firn.app</string>' \
 	  '    <key>CFBundleName</key>' \
 	  '    <string>Firn</string>' \
+	  '    <key>CFBundleShortVersionString</key>' \
+	  '    <string>0.4.0</string>' \
 	  '    <key>CFBundleVersion</key>' \
-	  '    <string>0.3.0</string>' \
+	  '    <string>0.4.0</string>' \
 	  '    <key>LSUIElement</key>' \
 	  '    <true/>' \
 	  '</dict>' \
 	  '</plist>' > build/Firn.app/Contents/Info.plist
 
-build: rootfs swift
+build: rootfs hostnet swift
 	@echo "[firn] build complete."
 
 test:
-	cd guest/firn-guestd && mise exec go@1.27.4 -- go test -race -count=1 -v ./...
-	cd guest/firn-guestd && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 mise exec go@1.27.4 -- go vet ./...
-	swift run FirnCoreCheck
+	cd host/firn-hostnet && $(GO) test -race -count=1 -v ./...
+	cd host/firn-hostnet && $(GO) vet ./...
+	cd guest/firn-guestd && $(GO) test -race -count=1 -v ./...
+	cd guest/firn-guestd && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) vet ./...
+	swift run $(SWIFT_BUILD_FLAGS) FirnCoreCheck
 
 clean:
 	rm -rf .build build guest/firn-guestd-bin

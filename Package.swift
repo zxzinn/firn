@@ -17,7 +17,8 @@ let package = Package(
             name: "FirnCore",
             linkerSettings: [
                 .linkedFramework("SystemConfiguration"),
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("Metal")
             ]
         ),
         .executableTarget(
@@ -27,12 +28,17 @@ let package = Package(
                 .linkedFramework("Virtualization"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedFramework("Network"),
-                .linkedFramework("Security")
+                .linkedFramework("Security"),
+                .linkedFramework("CoreServices"),
+                .linkedFramework("Metal")
             ]
         ),
         .executableTarget(
             name: "firn",
-            dependencies: ["FirnCore"]
+            dependencies: ["FirnCore"],
+            linkerSettings: [
+                .linkedFramework("Virtualization")
+            ]
         ),
         .executableTarget(
             name: "FirnBar",

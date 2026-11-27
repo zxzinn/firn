@@ -268,7 +268,7 @@ func TestTopologyEmptyArraysAndHTTPLongPoll(t *testing.T) {
 	}
 
 	relay := NewProxyAndDNSRelay(eng)
-	srv := httptest.NewServer(buildControlMux(eng, relay))
+	srv := httptest.NewServer(buildControlMux(eng, relay, NewK3sManager("firn.local"), t.TempDir()))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/topology?since=1&wait=1")
