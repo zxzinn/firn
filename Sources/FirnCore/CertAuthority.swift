@@ -13,6 +13,52 @@ public enum CertAuthority {
     private static let openSSLPath = "/usr/bin/openssl"
     private static let securityPath = "/usr/bin/security"
     private static let pkcs12Password = "firn"
+    private static let keychainLock = NSLock()
+    private static var ephemeralKeychain: SecKeychain?
+    private static var identityCache: [String: SecIdentity] = [:]
+
+    private static func getOrCreateEphemeralKeychain() throws -> (keychain: SecKeychain, access: SecAccess?) {
+        keychainLock.lock()
+        defer { keychainLock.unlock() }
+        if let existing = ephemeralKeychain {
+            var selfApp: SecTrustedApplication?
+            var access: SecAccess?
+            if SecTrustedApplicationCreateFromPath(nil, &selfApp) == errSecSuccess, let selfApp {
+                _ = SecAccessCreate("FirnTLS" as CFString, [selfApp] as CFArray, &access)
+            }
+            return (existing, access)
+        }
+
+        // Remove stale per-process temporary keychains from previous exited runs.
+        let tmpDir = FileManager.default.temporaryDirectory
+        if let entries = try? FileManager.default.contentsOfDirectory(at: tmpDir, includingPropertiesForKeys: nil) {
+            for item in entries where item.lastPathComponent.hasPrefix("firn-tls-") && item.lastPathComponent.hasSuffix(".keychain-db") {
+                let parts = item.deletingPathExtension().lastPathComponent.split(separator: "-")
+                if parts.count >= 3, let pid = Int32(parts[2]), kill(pid, 0) != 0 && errno == ESRCH {
+                    try? FileManager.default.removeItem(at: item)
+                }
+            }
+        }
+
+        _ = SecKeychainSetUserInteractionAllowed(false)
+        let kcURL = tmpDir.appendingPathComponent("firn-tls-\(getpid())-\(UUID().uuidString).keychain-db")
+        try? FileManager.default.removeItem(at: kcURL)
+        let pass = UUID().uuidString
+        var kc: SecKeychain?
+        let createStatus = SecKeychainCreate(kcURL.path, UInt32(pass.utf8.count), pass, false, nil, &kc)
+        guard createStatus == errSecSuccess, let kc else {
+            throw NSError(domain: "FirnCA", code: Int(createStatus), userInfo: [NSLocalizedDescriptionKey: "SecKeychainCreate failed with status \(createStatus)"])
+        }
+        _ = SecKeychainUnlock(kc, UInt32(pass.utf8.count), pass, true)
+
+        var selfApp: SecTrustedApplication?
+        var access: SecAccess?
+        if SecTrustedApplicationCreateFromPath(nil, &selfApp) == errSecSuccess, let selfApp {
+            _ = SecAccessCreate("FirnTLS" as CFString, [selfApp] as CFArray, &access)
+        }
+        ephemeralKeychain = kc
+        return (kc, access)
+    }
 
     private static func runTool(_ executable: String, _ args: [String]) throws -> (code: Int32, stdout: String, stderr: String) {
         let proc = Process()
@@ -211,17 +257,54 @@ public enum CertAuthority {
             chmod(leafP12URL.path, 0o600)
         }
 
-        let p12Data = try Data(contentsOf: leafP12URL)
-        let options = [kSecImportExportPassphrase as String: pkcs12Password] as CFDictionary
-        var items: CFArray?
-        let status = SecPKCS12Import(p12Data as CFData, options, &items)
-        guard status == errSecSuccess,
-              let array = items as? [[String: Any]],
-              let first = array.first,
-              let identityAny = first[kSecImportItemIdentity as String] else {
-            throw NSError(domain: "FirnCA", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "SecPKCS12Import failed with status \(status)"])
+        keychainLock.lock()
+        if let cached = identityCache[leafP12URL.path] {
+            keychainLock.unlock()
+            return cached
         }
-        let identity = identityAny as! SecIdentity
+        keychainLock.unlock()
+
+        let p12Data = try Data(contentsOf: leafP12URL)
+        let (kc, access) = try getOrCreateEphemeralKeychain()
+        var inputFormat = SecExternalFormat.formatPKCS12
+        var itemType = SecExternalItemType.itemTypeAggregate
+        var params = SecItemImportExportKeyParameters()
+        params.version = UInt32(SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION)
+        params.passphrase = Unmanaged.passUnretained(pkcs12Password as CFString)
+        params.accessRef = access.map { Unmanaged.passUnretained($0) }
+
+        var outItems: CFArray?
+        let status = SecItemImport(p12Data as CFData, nil, &inputFormat, &itemType, [], &params, kc, &outItems)
+        guard status == errSecSuccess || status == errSecDuplicateItem else {
+            throw NSError(domain: "FirnCA", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "SecItemImport failed with status \(status)"])
+        }
+
+        var foundIdentity: SecIdentity?
+        if let arr = outItems as? [Any] {
+            for item in arr where CFGetTypeID(item as CFTypeRef) == SecIdentityGetTypeID() {
+                foundIdentity = (item as! SecIdentity)
+                break
+            }
+        }
+        if foundIdentity == nil {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassIdentity,
+                kSecMatchSearchList as String: [kc],
+                kSecReturnRef as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne,
+            ]
+            var ref: CFTypeRef?
+            let qStatus = SecItemCopyMatching(query as CFDictionary, &ref)
+            if qStatus == errSecSuccess, let ref {
+                foundIdentity = (ref as! SecIdentity)
+            }
+        }
+        guard let identity = foundIdentity else {
+            throw NSError(domain: "FirnCA", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed extracting SecIdentity from PKCS#12"])
+        }
+        keychainLock.lock()
+        identityCache[leafP12URL.path] = identity
+        keychainLock.unlock()
         return identity
     }
 

@@ -10,10 +10,11 @@ public final class HTTPSDomainProxy {
     private let dnsServer: LocalDNSServer
     private let domain: String
     private let httpsPort: UInt16
-    private let queue = DispatchQueue(label: "dev.firn.https-proxy", attributes: .concurrent)
+    private let queue = DispatchQueue(label: "dev.firn.https-proxy")
 
     private let lock = NSLock()
-    private var listeners: [NWListener] = []
+    private let reloadQueue = DispatchQueue(label: "dev.firn.https-proxy.reload")
+    private var listenerEntries: [(listener: NWListener, cancelGroup: DispatchGroup)] = []
     private var activeProjects: [String] = []
     private var running = false
 
@@ -25,21 +26,32 @@ public final class HTTPSDomainProxy {
     }
 
     public func start() throws {
+        lock.lock()
         running = true
-        try startListeners(projects: [])
+        lock.unlock()
+        try reloadQueue.sync {
+            try startListeners(projects: [])
+        }
     }
 
     public func reloadCertificates(projects: [String]) {
         let sorted = projects.sorted()
-        lock.lock()
-        let unchanged = (sorted == activeProjects) && running && !listeners.isEmpty
-        lock.unlock()
-        if unchanged { return }
-        try? startListeners(projects: sorted)
+        reloadQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let unchanged = (sorted == self.activeProjects) && self.running && !self.listenerEntries.isEmpty
+            self.lock.unlock()
+            if unchanged { return }
+            try? self.startListeners(projects: sorted)
+        }
     }
 
     private func startListeners(projects: [String]) throws {
-        guard running else { return }
+        lock.lock()
+        let isRunning = running
+        lock.unlock()
+        guard isRunning else { return }
+
         let identity = try CertAuthority.ensureServerIdentity(domain: domain, projects: projects)
         guard let secIdentity = sec_identity_create(identity) else {
             throw NSError(domain: "FirnHTTPS", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed wrapping SecIdentity"])
@@ -48,10 +60,21 @@ public final class HTTPSDomainProxy {
             throw NSError(domain: "FirnHTTPS", code: 2, userInfo: [NSLocalizedDescriptionKey: "Invalid HTTPS port \(httpsPort)"])
         }
 
+        // Cancel existing listeners first so loopback :8443 is released before rebinding.
+        lock.lock()
+        let oldEntries = listenerEntries
+        listenerEntries.removeAll()
+        lock.unlock()
+        for entry in oldEntries {
+            entry.listener.cancel()
+            _ = entry.cancelGroup.wait(timeout: .now() + 2.0)
+        }
+
         let makeParams: (NWEndpoint.Host) -> NWParameters = { host in
             let tls = NWProtocolTLS.Options()
             sec_protocol_options_set_local_identity(tls.securityProtocolOptions, secIdentity)
             sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
+            sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, "http/1.1")
             let tcp = NWProtocolTCP.Options()
             tcp.noDelay = true
             let params = NWParameters(tls: tls, tcp: tcp)
@@ -60,28 +83,70 @@ public final class HTTPSDomainProxy {
             return params
         }
 
-        var newListeners: [NWListener] = []
+        var newEntries: [(listener: NWListener, cancelGroup: DispatchGroup)] = []
         for host in [NWEndpoint.Host("127.0.0.1"), NWEndpoint.Host("::1")] {
             if let listener = try? NWListener(using: makeParams(host)) {
+                let cancelGroup = DispatchGroup()
+                cancelGroup.enter()
+                let readyGroup = DispatchGroup()
+                readyGroup.enter()
+                let stateLock = NSLock()
+                var readyDone = false
+                var cancelDone = false
+                var listenerReady = false
+
+                listener.stateUpdateHandler = { state in
+                    stateLock.lock()
+                    switch state {
+                    case .ready:
+                        listenerReady = true
+                        if !readyDone {
+                            readyDone = true
+                            readyGroup.leave()
+                        }
+                    case .failed:
+                        if !readyDone {
+                            readyDone = true
+                            readyGroup.leave()
+                        }
+                    case .cancelled:
+                        if !readyDone {
+                            readyDone = true
+                            readyGroup.leave()
+                        }
+                        if !cancelDone {
+                            cancelDone = true
+                            cancelGroup.leave()
+                        }
+                    default:
+                        break
+                    }
+                    stateLock.unlock()
+                }
                 listener.newConnectionHandler = { [weak self] conn in
                     self?.handleConnection(conn)
                 }
                 listener.start(queue: queue)
-                newListeners.append(listener)
+                _ = readyGroup.wait(timeout: .now() + 2.0)
+                stateLock.lock()
+                let ok = listenerReady
+                stateLock.unlock()
+                if ok {
+                    newEntries.append((listener: listener, cancelGroup: cancelGroup))
+                } else {
+                    listener.cancel()
+                    _ = cancelGroup.wait(timeout: .now() + 1.0)
+                }
             }
         }
-        guard !newListeners.isEmpty else {
+        guard !newEntries.isEmpty else {
             throw NSError(domain: "FirnHTTPS", code: 3, userInfo: [NSLocalizedDescriptionKey: "Cannot bind loopback HTTPS port \(httpsPort)"])
         }
 
         lock.lock()
-        let old = listeners
-        listeners = newListeners
+        listenerEntries = newEntries
         activeProjects = projects
         lock.unlock()
-        for item in old {
-            item.cancel()
-        }
     }
 
     private func handleConnection(_ conn: NWConnection) {
@@ -201,13 +266,13 @@ public final class HTTPSDomainProxy {
                 conn.send(content: chunk, completion: .contentProcessed { err in
                     sendGroup.leave()
                     if err != nil {
-                        close(vfd)
+                        shutdown(vfd, SHUT_RD)
                     }
                 })
                 sendGroup.wait()
             }
             sendGroup.enter()
-            conn.send(content: nil, isComplete: true, completion: .contentProcessed { _ in
+            conn.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
                 sendGroup.leave()
             })
             _ = sendGroup.wait(timeout: .now() + 2.0)
@@ -237,11 +302,12 @@ public final class HTTPSDomainProxy {
     public func stop() {
         lock.lock()
         running = false
-        let current = listeners
-        listeners.removeAll()
+        let current = listenerEntries
+        listenerEntries.removeAll()
         lock.unlock()
-        for item in current {
-            item.cancel()
+        for entry in current {
+            entry.listener.cancel()
+            _ = entry.cancelGroup.wait(timeout: .now() + 1.0)
         }
     }
 }
