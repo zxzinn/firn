@@ -79,9 +79,15 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
     }
 
     private static func tuneDgramPairFD(_ fd: Int32) {
-        for (rcv, snd) in [(4 << 20, 4 << 20), (4 << 20, 2 << 20), (4 << 20, 1 << 20), (2 << 20, 1 << 20)] {
-            var r = Int32(rcv)
-            var s = Int32(snd)
+        let attempts: [(Int32, Int32)] = [
+            (4_194_304, 4_194_304),
+            (4_194_304, 2_097_152),
+            (4_194_304, 1_048_576),
+            (2_097_152, 1_048_576),
+        ]
+        for (rcv, snd) in attempts {
+            var r = rcv
+            var s = snd
             _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &r, socklen_t(MemoryLayout<Int32>.size))
             if setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &s, socklen_t(MemoryLayout<Int32>.size)) == 0 {
                 break
