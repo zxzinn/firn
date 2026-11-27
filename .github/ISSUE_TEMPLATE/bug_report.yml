@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a bug or performance regression in Firn
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `firn up`
+        2. Run `docker --context firn ...`
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics (`firn doctor`, `firn status`, `firn logs --serial`)
+      render: shell
+  - type: input
+    id: environment
+    attributes:
+      label: macOS & hardware
+      placeholder: "e.g., macOS 15.x, Apple M3 Max"
+    validations:
+      required: true

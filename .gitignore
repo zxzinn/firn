@@ -1,0 +1,6 @@
+.build/
+build/
+guest/firn-guestd-bin
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  guestd:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: guest/firn-guestd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: guest/firn-guestd/go.mod
+      - run: go test -race -count=1 -v ./...
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go vet ./...
+      - run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /tmp/firn-guestd .
+
+  swift-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build -c release
+      - run: swift run FirnCoreCheck
+      - run: make swift
+      - run: codesign -d --entitlements :- build/firnd

@@ -1,0 +1,171 @@
+#!/bin/sh
+set -u
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mount -o remount,rw / 2>/dev/null || true
+mkdir -p /dev/pts /dev/shm /run /tmp /var/lib/firn /var/lib/docker /var/log/firn /run/firn /sys/fs/cgroup
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
+mount -t tmpfs tmpfs /run 2>/dev/null || true
+mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null || true
+
+for mod in \
+  virtio_pci virtio_mmio virtio_blk virtio_net virtio_balloon virtiofs \
+  vsock vmw_vsock_virtio_transport tun lz4 zram \
+  ext4 overlay fuse loop br_netfilter bridge veth \
+  nf_tables nft_compat ip_tables iptable_nat iptable_filter \
+  ip6_tables ip6table_nat ip6table_filter \
+  xt_MASQUERADE xt_conntrack xt_addrtype xt_tcpudp binfmt_misc
+do
+  modprobe -q "$mod" 2>/dev/null || true
+done
+
+mkdir -p /dev/net
+[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200 2>/dev/null || true
+chmod 666 /dev/net/tun 2>/dev/null || true
+
+hostname firn 2>/dev/null || true
+ip link set lo up 2>/dev/null || true
+printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
+
+# Fast in-memory zram swap (priority 100) absorbs freshly thawed/cold container pages first.
+if [ -e /sys/block/zram0 ]; then
+  echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+  echo 2G > /sys/block/zram0/disksize 2>/dev/null || true
+  if mkswap /dev/zram0 >/dev/null 2>&1; then
+    swapon -p 100 /dev/zram0 2>/dev/null || true
+  fi
+fi
+
+# Persistent data disk (/dev/vdb) holds Docker state and backing disk swapfile (priority 10).
+# Avoid synchronous discard on hot container create/unlink paths; run fstrim at shutdown or via `firn disk trim`.
+if [ -b /dev/vdb ]; then
+  if ! blkid /dev/vdb 2>/dev/null | grep -q 'TYPE='; then
+    echo "[firn-init] formatting /dev/vdb (ext4)..."
+    mkfs.ext4 -q -F -L firn-data /dev/vdb
+  fi
+  mount -t ext4 -o noatime,nodiratime /dev/vdb /var/lib/firn
+  mkdir -p /var/lib/firn/docker /var/lib/docker /var/lib/firn/log
+  mount --bind /var/lib/firn/docker /var/lib/docker
+
+  if [ ! -f /var/lib/firn/swapfile ]; then
+    echo "[firn-init] creating 4 GiB /var/lib/firn/swapfile..."
+    fallocate -l 4G /var/lib/firn/swapfile 2>/dev/null || \
+      dd if=/dev/zero of=/var/lib/firn/swapfile bs=1M count=4096 status=none
+    chmod 600 /var/lib/firn/swapfile
+    mkswap /var/lib/firn/swapfile >/dev/null
+  fi
+  swapon -p 10 /var/lib/firn/swapfile 2>/dev/null || true
+fi
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+sysctl -w vm.swappiness=80 >/dev/null 2>&1 || true
+sysctl -w fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true
+sysctl -w fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true
+
+# Mount host home directory via virtiofs at its exact macOS path.
+HOST_HOME=""
+for token in $(cat /proc/cmdline); do
+  case "$token" in
+    firn.home=*) HOST_HOME="${token#firn.home=}" ;;
+  esac
+done
+if [ -n "$HOST_HOME" ]; then
+  mkdir -p "$HOST_HOME"
+  mount -t virtiofs host-home "$HOST_HOME" 2>/dev/null || true
+fi
+
+# Register Rosetta x86_64 binfmt_misc if shared by Virtualization.framework.
+mkdir -p /mnt/rosetta
+if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null && [ -x /mnt/rosetta/rosetta ]; then
+  mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
+  if [ -w /proc/sys/fs/binfmt_misc/register ] && [ ! -e /proc/sys/fs/binfmt_misc/rosetta ]; then
+    printf '%s\n' ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/mnt/rosetta/rosetta:CF' \
+      > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+  fi
+fi
+
+# Point host.docker.internal/host.firn.internal to firn0 gateway (10.89.0.1 -> vsock:2380 -> host loopback).
+printf '127.0.0.1 localhost firn\n::1 localhost firn\n10.89.0.1 host.docker.internal host.firn.internal\n' >/etc/hosts
+
+# Bring up VZ NAT networking in parallel (netstack firn0 serves metric 50 default route regardless).
+if ip link show eth0 >/dev/null 2>&1; then
+  ip link set eth0 up
+  (
+    udhcpc -i eth0 -n -q -t 4 -T 1 >/dev/null 2>&1 || true
+    printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
+  ) &
+fi
+
+# Start firn-guestd before dockerd so 127.0.0.1:53 (vsock:2379 DNS relay) and
+# 127.0.0.1:3128 (vsock:2378 proxy relay) are ready when dockerd starts.
+/usr/local/bin/firn-guestd >/var/log/firn/guestd.log 2>&1 &
+GUESTD_PID=$!
+
+for _ in $(seq 1 50); do
+  [ -S /run/firn/reaper.sock ] && break
+  sleep 0.02
+done
+
+# Start containerd + dockerd.
+rm -f /var/run/docker.pid /var/run/containerd/containerd.pid
+containerd >/var/log/firn/containerd.log 2>&1 &
+CONTAINERD_PID=$!
+
+for _ in $(seq 1 100); do
+  [ -S /run/containerd/containerd.sock ] && break
+  sleep 0.02
+done
+
+DOCKERD_PROXY_ENV="HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128 NO_PROXY=localhost,127.0.0.1,::1,10.87.0.0/16,10.88.0.0/16,.local,.firn.local"
+env $DOCKERD_PROXY_ENV dockerd --config-file=/etc/docker/daemon.json >/var/log/firn/dockerd.log 2>&1 &
+DOCKERD_PID=$!
+
+for _ in $(seq 1 200); do
+  [ -S /var/run/docker.sock ] && docker info >/dev/null 2>&1 && break
+  sleep 0.05
+done
+
+echo "[firn-init] ready (uptime $(cat /proc/uptime | awk '{print $1}')s)"
+
+shutdown_clean() {
+  echo "[firn-init] shutting down..."
+  kill -TERM "$GUESTD_PID" 2>/dev/null || true
+  kill -TERM "$DOCKERD_PID" 2>/dev/null || true
+  wait "$DOCKERD_PID" 2>/dev/null || true
+  kill -TERM "$CONTAINERD_PID" 2>/dev/null || true
+  wait "$CONTAINERD_PID" 2>/dev/null || true
+  swapoff -a 2>/dev/null || true
+  sync
+  fstrim /var/lib/firn 2>/dev/null || true
+  umount /var/lib/docker 2>/dev/null || true
+  umount /var/lib/firn 2>/dev/null || true
+  umount -a -r 2>/dev/null || true
+  sync
+  mount -o remount,ro / 2>/dev/null || true
+  sync
+  poweroff -f
+}
+
+trap shutdown_clean TERM INT USR2
+
+while true; do
+  if ! kill -0 "$DOCKERD_PID" 2>/dev/null; then
+    env $DOCKERD_PROXY_ENV dockerd --config-file=/etc/docker/daemon.json >>/var/log/firn/dockerd.log 2>&1 &
+    DOCKERD_PID=$!
+  fi
+  if ! kill -0 "$GUESTD_PID" 2>/dev/null; then
+    /usr/local/bin/firn-guestd >>/var/log/firn/guestd.log 2>&1 &
+    GUESTD_PID=$!
+  fi
+  sleep 10 &
+  wait $! 2>/dev/null || true
+done

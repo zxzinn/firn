@@ -1,0 +1,16 @@
+name: Feature request
+description: Propose a performance optimization or product feature
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow gap
+      description: What workflow or performance bottleneck does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed design
+      description: Suggested CLI, daemon, or guest-agent behavior.

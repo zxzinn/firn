@@ -1,0 +1,794 @@
+import Darwin
+import Foundation
+import FirnCore
+import SystemConfiguration
+import Virtualization
+
+public func spawnIOThread(_ body: @escaping () -> Void) {
+    Thread.detachNewThread(body)
+}
+
+private func setNonBlocking(_ fd: Int32) {
+    let flags = fcntl(fd, F_GETFL, 0)
+    if flags >= 0 {
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    }
+}
+
+private func setBlocking(_ fd: Int32) {
+    let flags = fcntl(fd, F_GETFL, 0)
+    if flags >= 0 {
+        _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)
+    }
+}
+
+private func tuneStreamSocket(_ fd: Int32) {
+    var yes: Int32 = 1
+    var bufBytes: Int32 = 1 << 20
+    _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
+    _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufBytes, socklen_t(MemoryLayout<Int32>.size))
+    _ = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufBytes, socklen_t(MemoryLayout<Int32>.size))
+}
+
+public func configureClientSocket(_ fd: Int32) {
+    tuneStreamSocket(fd)
+    var yes: Int32 = 1
+    _ = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
+}
+
+private func flushNonBlockingBuffer(to dstFD: Int32, buf: [UInt8], off: inout Int, len: inout Int) -> Bool {
+    while off < len {
+        let w = buf.withUnsafeBytes { ptr -> Int in
+            guard let base = ptr.baseAddress else { return -1 }
+            return write(dstFD, base.advanced(by: off), len - off)
+        }
+        if w > 0 {
+            off += w
+            continue
+        }
+        if w < 0 && errno == EINTR { continue }
+        if w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
+        return false
+    }
+    if off >= len {
+        off = 0
+        len = 0
+    }
+    return true
+}
+
+public func spliceBidirectional(fd unixFD: Int32, vsockConn: VZVirtioSocketConnection) {
+    let aFD = unixFD
+    let bFD = vsockConn.fileDescriptor
+    setNonBlocking(aFD)
+    setNonBlocking(bFD)
+    tuneStreamSocket(aFD)
+    tuneStreamSocket(bFD)
+
+    var aToB = [UInt8](repeating: 0, count: 262144)
+    var bToA = [UInt8](repeating: 0, count: 262144)
+    var aToBOff = 0
+    var aToBLen = 0
+    var bToAOff = 0
+    var bToALen = 0
+    var aEOF = false
+    var bEOF = false
+    var aWriteClosed = false
+    var bWriteClosed = false
+
+    outer: while !(aEOF && aToBLen == 0 && bEOF && bToALen == 0) {
+        var aEvents: Int16 = 0
+        var bEvents: Int16 = 0
+        if !aEOF && aToBLen == 0 { aEvents |= Int16(POLLIN) }
+        if bToAOff < bToALen { aEvents |= Int16(POLLOUT) }
+        if !bEOF && bToALen == 0 { bEvents |= Int16(POLLIN) }
+        if aToBOff < aToBLen { bEvents |= Int16(POLLOUT) }
+        if aEvents == 0 && bEvents == 0 { break }
+
+        var fds = [
+            pollfd(fd: aEvents != 0 ? aFD : -1, events: aEvents, revents: 0),
+            pollfd(fd: bEvents != 0 ? bFD : -1, events: bEvents, revents: 0),
+        ]
+        let ready = poll(&fds, 2, -1)
+        if ready < 0 {
+            if errno == EINTR { continue }
+            break
+        }
+        if (fds[0].revents & Int16(POLLNVAL)) != 0 || (fds[1].revents & Int16(POLLNVAL)) != 0 {
+            break
+        }
+
+        if aToBOff < aToBLen && (fds[1].revents & Int16(POLLOUT | POLLERR | POLLHUP)) != 0 {
+            if !flushNonBlockingBuffer(to: bFD, buf: aToB, off: &aToBOff, len: &aToBLen) {
+                break outer
+            }
+            if aEOF && aToBLen == 0 && !bWriteClosed {
+                shutdown(bFD, SHUT_WR)
+                bWriteClosed = true
+            }
+        }
+
+        if bToAOff < bToALen && (fds[0].revents & Int16(POLLOUT | POLLERR | POLLHUP)) != 0 {
+            if !flushNonBlockingBuffer(to: aFD, buf: bToA, off: &bToAOff, len: &bToALen) {
+                break outer
+            }
+            if bEOF && bToALen == 0 && !aWriteClosed {
+                shutdown(aFD, SHUT_WR)
+                aWriteClosed = true
+            }
+        }
+
+        if !aEOF && aToBLen == 0 && (fds[0].revents & Int16(POLLIN | POLLHUP | POLLERR)) != 0 {
+            for _ in 0..<16 {
+                let n = aToB.withUnsafeMutableBytes { ptr in
+                    read(aFD, ptr.baseAddress, ptr.count)
+                }
+                if n > 0 {
+                    aToBOff = 0
+                    aToBLen = n
+                    if !flushNonBlockingBuffer(to: bFD, buf: aToB, off: &aToBOff, len: &aToBLen) {
+                        break outer
+                    }
+                    if aToBLen > 0 { break }
+                    continue
+                }
+                if n < 0 && errno == EINTR { continue }
+                if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
+                aEOF = true
+                if aToBLen == 0 && !bWriteClosed {
+                    shutdown(bFD, SHUT_WR)
+                    bWriteClosed = true
+                }
+                break
+            }
+        }
+
+        if !bEOF && bToALen == 0 && (fds[1].revents & Int16(POLLIN | POLLHUP | POLLERR)) != 0 {
+            for _ in 0..<16 {
+                let n = bToA.withUnsafeMutableBytes { ptr in
+                    read(bFD, ptr.baseAddress, ptr.count)
+                }
+                if n > 0 {
+                    bToAOff = 0
+                    bToALen = n
+                    if !flushNonBlockingBuffer(to: aFD, buf: bToA, off: &bToAOff, len: &bToALen) {
+                        break outer
+                    }
+                    if bToALen > 0 { break }
+                    continue
+                }
+                if n < 0 && errno == EINTR { continue }
+                if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { break }
+                bEOF = true
+                if bToALen == 0 && !aWriteClosed {
+                    shutdown(aFD, SHUT_WR)
+                    aWriteClosed = true
+                }
+                break
+            }
+        }
+    }
+
+    close(aFD)
+    // Retain vsockConn across poll loop so VZVirtioSocketConnection never closes early.
+    withExtendedLifetime(vsockConn) {
+        vsockConn.close()
+    }
+}
+
+public func bindUnixSocket(at url: URL) throws -> Int32 {
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    unlink(url.path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else {
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+    }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(url.path.utf8CString)
+    guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
+        close(fd)
+        throw NSError(domain: "Firn", code: 10, userInfo: [NSLocalizedDescriptionKey: "Socket path too long: \(url.path)"])
+    }
+    withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+        for (i, byte) in pathBytes.enumerated() {
+            raw[i] = UInt8(bitPattern: byte)
+        }
+    }
+    let len = socklen_t(MemoryLayout.offset(of: \sockaddr_un.sun_path)! + pathBytes.count)
+    let rc = withUnsafePointer(to: &addr) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.bind(fd, $0, len)
+        }
+    }
+    guard rc == 0, listen(fd, 128) == 0 else {
+        let err = errno
+        close(fd)
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(err))
+    }
+    chmod(url.path, 0o600)
+    return fd
+}
+
+public func connectHostTCP(host: String, port: UInt16, timeoutSeconds: Int = 5) -> Int32 {
+    var hints = addrinfo()
+    hints.ai_socktype = SOCK_STREAM
+    hints.ai_family = AF_UNSPEC
+    var res: UnsafeMutablePointer<addrinfo>?
+    guard getaddrinfo(host, String(port), &hints, &res) == 0, let first = res else {
+        return -1
+    }
+    defer { freeaddrinfo(first) }
+    var ipv4Nodes: [UnsafeMutablePointer<addrinfo>] = []
+    var otherNodes: [UnsafeMutablePointer<addrinfo>] = []
+    var cur: UnsafeMutablePointer<addrinfo>? = first
+    while let node = cur {
+        if node.pointee.ai_family == AF_INET {
+            ipv4Nodes.append(node)
+        } else {
+            otherNodes.append(node)
+        }
+        cur = node.pointee.ai_next
+    }
+    for node in ipv4Nodes + otherNodes {
+        let fd = socket(node.pointee.ai_family, node.pointee.ai_socktype, node.pointee.ai_protocol)
+        if fd < 0 { continue }
+        configureClientSocket(fd)
+        setNonBlocking(fd)
+        let rc = Darwin.connect(fd, node.pointee.ai_addr, node.pointee.ai_addrlen)
+        if rc == 0 {
+            setBlocking(fd)
+            return fd
+        }
+        if errno == EINPROGRESS {
+            var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+            let pr = poll(&pfd, 1, Int32(max(1, timeoutSeconds) * 1000))
+            if pr > 0 && (pfd.revents & Int16(POLLERR | POLLHUP | POLLNVAL)) == 0 {
+                var soErr: Int32 = 0
+                var len = socklen_t(MemoryLayout<Int32>.size)
+                if getsockopt(fd, SOL_SOCKET, SO_ERROR, &soErr, &len) == 0 && soErr == 0 {
+                    setBlocking(fd)
+                    return fd
+                }
+            }
+        }
+        close(fd)
+    }
+    return -1
+}
+
+public func writeAll(fd: Int32, data: Data) -> Bool {
+    data.withUnsafeBytes { raw in
+        guard let base = raw.baseAddress else { return true }
+        var offset = 0
+        while offset < raw.count {
+            let n = write(fd, base.advanced(by: offset), raw.count - offset)
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return false }
+            offset += n
+        }
+        return true
+    }
+}
+
+public final class VsockBridge {
+    private let runner: VZMachineRunner
+    private var dockerListenFD: Int32 = -1
+    private var shellListenFD: Int32 = -1
+    private var running = false
+
+    public init(runner: VZMachineRunner) {
+        self.runner = runner
+    }
+
+    public func startDockerSocketBridge() throws {
+        dockerListenFD = try bindUnixSocket(at: FirnPaths.dockerSockURL)
+        running = true
+        spawnIOThread { [weak self] in
+            guard let self else { return }
+            while self.running {
+                let clientFD = accept(self.dockerListenFD, nil, nil)
+                if clientFD < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                spawnIOThread {
+                    do {
+                        let vsockConn = try self.runner.connectVsock(port: 2375, timeoutSeconds: 5.0)
+                        spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+                    } catch {
+                        close(clientFD)
+                    }
+                }
+            }
+        }
+    }
+
+    public func startShellSocketBridge() throws {
+        shellListenFD = try bindUnixSocket(at: FirnPaths.shellSockURL)
+        running = true
+        spawnIOThread { [weak self] in
+            guard let self else { return }
+            while self.running {
+                let clientFD = accept(self.shellListenFD, nil, nil)
+                if clientFD < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
+                spawnIOThread {
+                    do {
+                        let vsockConn = try self.runner.connectVsock(port: 2382, timeoutSeconds: 5.0)
+                        spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+                    } catch {
+                        close(clientFD)
+                    }
+                }
+            }
+        }
+    }
+
+    public func startHostRelays() {
+        // Port 2378: guest outbound HTTP/CONNECT proxy -> macOS host VPN / corporate proxy.
+        runner.registerSocketListener(port: 2378) { conn in
+            spawnIOThread {
+                Self.handleGuestProxyConnection(conn)
+            }
+        }
+        // Port 2379: guest DNS relay -> macOS active DNS servers (including VPN split-DNS).
+        runner.registerSocketListener(port: 2379) { conn in
+            spawnIOThread {
+                Self.handleGuestDNSConnection(conn)
+            }
+        }
+        // Port 2380: guest netstack outbound TCP -> macOS host routing/VPN.
+        runner.registerSocketListener(port: 2380) { conn in
+            spawnIOThread {
+                Self.handleNetstackTCPConnection(conn)
+            }
+        }
+        // Port 2381: guest netstack outbound UDP -> macOS host UDP socket.
+        runner.registerSocketListener(port: 2381) { conn in
+            spawnIOThread {
+                Self.handleNetstackUDPConnection(conn)
+            }
+        }
+        // Port 2383: guest SSH agent relay -> host SSH_AUTH_SOCK.
+        runner.registerSocketListener(port: 2383) { conn in
+            spawnIOThread {
+                Self.handleSSHAgentConnection(conn)
+            }
+        }
+    }
+
+    public func guestHTTP(method: String, path: String, body: Data? = nil, timeoutSeconds: Double = 15.0) throws -> (status: Int, body: Data) {
+        let conn = try runner.connectVsock(port: 2376, timeoutSeconds: timeoutSeconds)
+        defer {
+            withExtendedLifetime(conn) { conn.close() }
+        }
+        let fd = conn.fileDescriptor
+        var req = "\(method) \(path) HTTP/1.1\r\nHost: firn-guest\r\nConnection: close\r\n"
+        if let body {
+            req += "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n"
+        }
+        req += "\r\n"
+        guard writeAll(fd: fd, data: Data(req.utf8)) else {
+            throw NSError(domain: "Firn", code: 20, userInfo: [NSLocalizedDescriptionKey: "Failed writing vsock HTTP request"])
+        }
+        if let body, !body.isEmpty, !writeAll(fd: fd, data: body) {
+            throw NSError(domain: "Firn", code: 21, userInfo: [NSLocalizedDescriptionKey: "Failed writing vsock HTTP body"])
+        }
+
+        var tv = timeval(tv_sec: max(5, Int(ceil(timeoutSeconds))), tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var raw = Data()
+        var buf = [UInt8](repeating: 0, count: 16384)
+        while true {
+            let n = read(fd, &buf, buf.count)
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { break }
+            raw.append(buf, count: n)
+        }
+        guard let headerEnd = raw.range(of: Data("\r\n\r\n".utf8)) else {
+            throw NSError(domain: "Firn", code: 22, userInfo: [NSLocalizedDescriptionKey: "Malformed HTTP response from firn-guestd"])
+        }
+        let headerStr = String(data: raw[..<headerEnd.lowerBound], encoding: .utf8) ?? ""
+        let firstLine = headerStr.split(separator: "\r\n", maxSplits: 1).first ?? ""
+        let statusParts = firstLine.split(separator: " ")
+        let statusCode = statusParts.count >= 2 ? (Int(statusParts[1]) ?? 500) : 500
+        let payload = raw[headerEnd.upperBound...]
+        if headerStr.lowercased().contains("transfer-encoding: chunked") {
+            return (statusCode, Self.decodeChunked(Data(payload)))
+        }
+        return (statusCode, Data(payload))
+    }
+
+    public func openTunnel(host: String, port: UInt16) throws -> VZVirtioSocketConnection {
+        let hostData = Data(host.utf8)
+        guard hostData.count > 0 && hostData.count <= 255 else {
+            throw NSError(domain: "Firn", code: 30, userInfo: [NSLocalizedDescriptionKey: "Invalid tunnel host"])
+        }
+        let conn = try runner.connectVsock(port: 2377, timeoutSeconds: 5.0)
+        var header = Data([0x01, UInt8(hostData.count)])
+        header.append(hostData)
+        var bePort = port.bigEndian
+        withUnsafeBytes(of: &bePort) { header.append(contentsOf: $0) }
+        guard writeAll(fd: conn.fileDescriptor, data: header) else {
+            conn.close()
+            throw NSError(domain: "Firn", code: 31, userInfo: [NSLocalizedDescriptionKey: "Failed sending tunnel header"])
+        }
+        var reply: UInt8 = 1
+        let n = read(conn.fileDescriptor, &reply, 1)
+        guard n == 1 && reply == 0x00 else {
+            conn.close()
+            throw NSError(domain: "Firn", code: 32, userInfo: [NSLocalizedDescriptionKey: "Guest refused tunnel to \(host):\(port)"])
+        }
+        return conn
+    }
+
+    public func stop() {
+        running = false
+        if dockerListenFD >= 0 {
+            close(dockerListenFD)
+            dockerListenFD = -1
+        }
+        if shellListenFD >= 0 {
+            close(shellListenFD)
+            shellListenFD = -1
+        }
+        unlink(FirnPaths.dockerSockURL.path)
+        unlink(FirnPaths.shellSockURL.path)
+    }
+
+    private static func readNetstackTunnelHeader(_ fd: Int32) -> (proto: UInt8, host: String, port: UInt16)? {
+        guard let head = readExact(fd: fd, count: 2) else { return nil }
+        let proto = head[0]
+        let hostLen = Int(head[1])
+        guard hostLen > 0,
+              let hostBytes = readExact(fd: fd, count: hostLen),
+              let portBytes = readExact(fd: fd, count: 2),
+              let host = String(data: hostBytes, encoding: .utf8) else {
+            return nil
+        }
+        let port = (UInt16(portBytes[0]) << 8) | UInt16(portBytes[1])
+        guard port > 0 else { return nil }
+        return (proto, host, port)
+    }
+
+    private static func handleNetstackTCPConnection(_ conn: VZVirtioSocketConnection) {
+        let fd = conn.fileDescriptor
+        guard let target = readNetstackTunnelHeader(fd), target.proto == 0x01 else {
+            _ = writeAll(fd: fd, data: Data([0x01]))
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        let upFD = connectHostTCP(host: target.host, port: target.port, timeoutSeconds: 8)
+        guard upFD >= 0 else {
+            _ = writeAll(fd: fd, data: Data([0x01]))
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        guard writeAll(fd: fd, data: Data([0x00])) else {
+            close(upFD)
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        spliceBidirectional(fd: upFD, vsockConn: conn)
+    }
+
+    private static func handleNetstackUDPConnection(_ conn: VZVirtioSocketConnection) {
+        let fd = conn.fileDescriptor
+        defer { withExtendedLifetime(conn) { conn.close() } }
+        guard let target = readNetstackTunnelHeader(fd), target.proto == 0x02 else {
+            _ = writeAll(fd: fd, data: Data([0x01]))
+            return
+        }
+
+        var hints = addrinfo()
+        hints.ai_socktype = SOCK_DGRAM
+        hints.ai_family = AF_INET
+        var res: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(target.host, String(target.port), &hints, &res) == 0, let first = res else {
+            _ = writeAll(fd: fd, data: Data([0x01]))
+            return
+        }
+        defer { freeaddrinfo(first) }
+
+        let udpFD = socket(first.pointee.ai_family, first.pointee.ai_socktype, first.pointee.ai_protocol)
+        guard udpFD >= 0 else {
+            _ = writeAll(fd: fd, data: Data([0x01]))
+            return
+        }
+        defer { close(udpFD) }
+
+        guard Darwin.connect(udpFD, first.pointee.ai_addr, first.pointee.ai_addrlen) == 0 else {
+            _ = writeAll(fd: fd, data: Data([0x01]))
+            return
+        }
+        guard writeAll(fd: fd, data: Data([0x00])) else {
+            return
+        }
+
+        var lenBuf = [UInt8](repeating: 0, count: 2)
+        var dgramBuf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            var fds = [
+                pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: udpFD, events: Int16(POLLIN), revents: 0),
+            ]
+            let ready = poll(&fds, 2, 30_000)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                break
+            }
+            if ready == 0 {
+                break
+            }
+            if (fds[0].revents & Int16(POLLIN)) != 0 {
+                guard let lh = readExact(fd: fd, count: 2) else { break }
+                let n = Int((UInt16(lh[0]) << 8) | UInt16(lh[1]))
+                guard n > 0 && n <= dgramBuf.count, let payload = readExact(fd: fd, count: n) else { break }
+                let sent = payload.withUnsafeBytes { raw in
+                    Darwin.send(udpFD, raw.baseAddress, payload.count, 0)
+                }
+                if sent < 0 { break }
+            }
+            if (fds[1].revents & Int16(POLLIN)) != 0 {
+                let n = dgramBuf.withUnsafeMutableBytes { raw in
+                    Darwin.recv(udpFD, raw.baseAddress, raw.count, 0)
+                }
+                if n <= 0 { break }
+                lenBuf[0] = UInt8((n >> 8) & 0xFF)
+                lenBuf[1] = UInt8(n & 0xFF)
+                var pkt = Data(lenBuf)
+                pkt.append(contentsOf: dgramBuf[0..<n])
+                if !writeAll(fd: fd, data: pkt) { break }
+            }
+            if ((fds[0].revents | fds[1].revents) & Int16(POLLERR | POLLHUP | POLLNVAL)) != 0 {
+                if (fds[0].revents & Int16(POLLIN)) == 0 && (fds[1].revents & Int16(POLLIN)) == 0 {
+                    break
+                }
+            }
+        }
+    }
+
+    private static func handleSSHAgentConnection(_ conn: VZVirtioSocketConnection) {
+        guard let sockPath = ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"], !sockPath.isEmpty else {
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        let agentFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard agentFD >= 0 else {
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(sockPath.utf8CString)
+        guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
+            close(agentFD)
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            for (i, b) in pathBytes.enumerated() {
+                raw[i] = UInt8(bitPattern: b)
+            }
+        }
+        let len = socklen_t(MemoryLayout.offset(of: \sockaddr_un.sun_path)! + pathBytes.count)
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(agentFD, $0, len)
+            }
+        }
+        guard rc == 0 else {
+            close(agentFD)
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        spliceBidirectional(fd: agentFD, vsockConn: conn)
+    }
+
+    private static func decodeChunked(_ data: Data) -> Data {
+        var out = Data()
+        var cursor = data.startIndex
+        let crlf = Data("\r\n".utf8)
+        while cursor < data.endIndex {
+            guard let lineEnd = data.range(of: crlf, in: cursor..<data.endIndex) else { break }
+            let sizeStr = String(data: data[cursor..<lineEnd.lowerBound], encoding: .utf8)?
+                .split(separator: ";").first.map(String.init) ?? ""
+            guard let size = Int(sizeStr.trimmingCharacters(in: .whitespaces), radix: 16), size > 0 else { break }
+            let chunkStart = lineEnd.upperBound
+            let chunkEnd = min(data.endIndex, chunkStart + size)
+            out.append(data[chunkStart..<chunkEnd])
+            cursor = min(data.endIndex, chunkEnd + 2)
+        }
+        return out
+    }
+
+    private static func handleGuestProxyConnection(_ conn: VZVirtioSocketConnection) {
+        let fd = conn.fileDescriptor
+        var headerBuf = Data()
+        var byteBuf = [UInt8](repeating: 0, count: 4096)
+        let delim = Data("\r\n\r\n".utf8)
+        var splitRange: Range<Data.Index>?
+        while headerBuf.count < 65536 {
+            let n = read(fd, &byteBuf, byteBuf.count)
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 {
+                withExtendedLifetime(conn) { conn.close() }
+                return
+            }
+            headerBuf.append(byteBuf, count: n)
+            if let found = headerBuf.range(of: delim) {
+                splitRange = found
+                break
+            }
+        }
+        guard let found = splitRange,
+              let headerStr = String(data: headerBuf[..<found.lowerBound], encoding: .utf8) else {
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        let remainder = Data(headerBuf[found.upperBound...])
+        let lines = headerStr.components(separatedBy: "\r\n")
+        guard let reqLine = lines.first else {
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        let parts = reqLine.split(separator: " ")
+        guard parts.count >= 3 else {
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        let method = String(parts[0])
+        let target = String(parts[1])
+        let proxyState = ProxyInspector.currentState()
+
+        // If host macOS defines an HTTP/HTTPS proxy, forward entire raw request to it directly.
+        if let upstreamURLString = (method == "CONNECT" ? (!proxyState.httpsProxy.isEmpty ? proxyState.httpsProxy : proxyState.httpProxy) : (!proxyState.httpProxy.isEmpty ? proxyState.httpProxy : nil)),
+           let upstreamURL = URL(string: upstreamURLString),
+           let proxyHost = upstreamURL.host {
+            let proxyPort = UInt16(upstreamURL.port ?? (upstreamURL.scheme == "https" ? 443 : 80))
+            let upFD = connectHostTCP(host: proxyHost, port: proxyPort)
+            guard upFD >= 0, writeAll(fd: upFD, data: headerBuf) else {
+                if upFD >= 0 { close(upFD) }
+                _ = writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\n\r\n".utf8))
+                withExtendedLifetime(conn) { conn.close() }
+                return
+            }
+            spliceBidirectional(fd: upFD, vsockConn: conn)
+            return
+        }
+
+        if method == "CONNECT" {
+            let hostPort = splitHostPort(target, defaultPort: 443)
+            let upFD = connectHostTCP(host: hostPort.host, port: hostPort.port)
+            guard upFD >= 0 else {
+                _ = writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\n\r\n".utf8))
+                withExtendedLifetime(conn) { conn.close() }
+                return
+            }
+            _ = writeAll(fd: fd, data: Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8))
+            if !remainder.isEmpty {
+                _ = writeAll(fd: upFD, data: remainder)
+            }
+            spliceBidirectional(fd: upFD, vsockConn: conn)
+            return
+        }
+
+        guard let targetURL = URL(string: target), let destHost = targetURL.host else {
+            _ = writeAll(fd: fd, data: Data("HTTP/1.1 400 Bad Request\r\n\r\n".utf8))
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        let destPort = UInt16(targetURL.port ?? (targetURL.scheme == "https" ? 443 : 80))
+        let upFD = connectHostTCP(host: destHost, port: destPort)
+        guard upFD >= 0 else {
+            _ = writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\n\r\n".utf8))
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        let pathAndQuery = (targetURL.path.isEmpty ? "/" : targetURL.path) + (targetURL.query.map { "?\($0)" } ?? "")
+        var rewritten = "\(method) \(pathAndQuery) \(parts[2])\r\n"
+        for line in lines.dropFirst() where !line.lowercased().hasPrefix("proxy-") {
+            rewritten += line + "\r\n"
+        }
+        rewritten += "\r\n"
+        var outbound = Data(rewritten.utf8)
+        outbound.append(remainder)
+        if !writeAll(fd: upFD, data: outbound) {
+            close(upFD)
+            withExtendedLifetime(conn) { conn.close() }
+            return
+        }
+        spliceBidirectional(fd: upFD, vsockConn: conn)
+    }
+
+    private static func splitHostPort(_ raw: String, defaultPort: UInt16) -> (host: String, port: UInt16) {
+        if raw.hasPrefix("["), let end = raw.firstIndex(of: "]") {
+            let host = String(raw[raw.index(after: raw.startIndex)..<end])
+            let rest = raw[raw.index(after: end)...]
+            if rest.hasPrefix(":"), let p = UInt16(rest.dropFirst()) {
+                return (host, p)
+            }
+            return (host, defaultPort)
+        }
+        if let colon = raw.lastIndex(of: ":"), let p = UInt16(raw[raw.index(after: colon)...]) {
+            return (String(raw[..<colon]), p)
+        }
+        return (raw, defaultPort)
+    }
+
+    private static func handleGuestDNSConnection(_ conn: VZVirtioSocketConnection) {
+        defer { withExtendedLifetime(conn) { conn.close() } }
+        let fd = conn.fileDescriptor
+        guard let lenData = readExact(fd: fd, count: 2) else { return }
+        let qlen = Int((UInt16(lenData[0]) << 8) | UInt16(lenData[1]))
+        guard qlen > 0 && qlen <= 4096, let query = readExact(fd: fd, count: qlen) else { return }
+
+        for serverIP in currentMacOSDNSServers() {
+            if let resp = forwardUDPQuery(query, serverIP: serverIP) {
+                var framed = Data([UInt8((resp.count >> 8) & 0xFF), UInt8(resp.count & 0xFF)])
+                framed.append(resp)
+                _ = writeAll(fd: fd, data: framed)
+                return
+            }
+        }
+    }
+
+    private static func readExact(fd: Int32, count: Int) -> Data? {
+        var out = Data(count: count)
+        var readTotal = 0
+        while readTotal < count {
+            let n = out.withUnsafeMutableBytes { ptr in
+                read(fd, ptr.baseAddress!.advanced(by: readTotal), count - readTotal)
+            }
+            if n < 0 && errno == EINTR { continue }
+            if n <= 0 { return nil }
+            readTotal += n
+        }
+        return out
+    }
+
+    private static func currentMacOSDNSServers() -> [String] {
+        var result: [String] = []
+        if let store = SCDynamicStoreCreate(nil, "firn-dns" as CFString, nil, nil),
+           let dnsDict = SCDynamicStoreCopyValue(store, "State:/Network/Global/DNS" as CFString) as? [String: Any],
+           let addrs = dnsDict["ServerAddresses"] as? [String] {
+            for addr in addrs where addr.contains(".") && !addr.hasPrefix("127.") {
+                result.append(addr)
+            }
+        }
+        if !result.contains("1.1.1.1") { result.append("1.1.1.1") }
+        if !result.contains("8.8.8.8") { result.append("8.8.8.8") }
+        return result
+    }
+
+    private static func forwardUDPQuery(_ query: Data, serverIP: String) -> Data? {
+        let udpFD = socket(AF_INET, SOCK_DGRAM, 0)
+        guard udpFD >= 0 else { return nil }
+        defer { close(udpFD) }
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(udpFD, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(53).bigEndian
+        guard inet_pton(AF_INET, serverIP, &addr.sin_addr) == 1 else { return nil }
+
+        let sent = query.withUnsafeBytes { raw in
+            withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(udpFD, raw.baseAddress, query.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        guard sent == query.count else { return nil }
+        var respBuf = [UInt8](repeating: 0, count: 4096)
+        let n = recv(udpFD, &respBuf, respBuf.count, 0)
+        guard n > 0 else { return nil }
+        return Data(respBuf[0..<n])
+    }
+}
