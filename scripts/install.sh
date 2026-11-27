@@ -13,11 +13,7 @@ if [ "$OS" != "Darwin" ] || [ "$ARCH" != "arm64" ]; then
   exit 1
 fi
 
-CURL_AUTH=()
 TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-if [ -n "$TOKEN" ]; then
-  CURL_AUTH=(-H "Authorization: Bearer $TOKEN")
-fi
 
 if [ -n "$FIRN_VERSION" ]; then
   case "$FIRN_VERSION" in
@@ -30,7 +26,11 @@ else
 fi
 
 echo "[firn-install] Fetching release metadata from ${API_URL}..."
-RELEASE_JSON="$(/usr/bin/curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: FirnInstaller" "${CURL_AUTH[@]}" "$API_URL")"
+if [ -n "$TOKEN" ]; then
+  RELEASE_JSON="$(/usr/bin/curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: FirnInstaller" -H "Authorization: Bearer $TOKEN" "$API_URL")"
+else
+  RELEASE_JSON="$(/usr/bin/curl -fsSL -H "Accept: application/vnd.github+json" -H "User-Agent: FirnInstaller" "$API_URL")"
+fi
 
 PARSED="$(/usr/bin/python3 -c '
 import json, sys
