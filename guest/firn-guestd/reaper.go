@@ -152,11 +152,98 @@ func (d *DockerClient) UnpauseContainer(cid string) error {
 	return nil
 }
 
+type DockerDFSummary struct {
+	ImagesBytes      uint64 `json:"imagesBytes"`
+	ContainersBytes  uint64 `json:"containersBytes"`
+	VolumesBytes     uint64 `json:"volumesBytes"`
+	BuildCacheBytes  uint64 `json:"buildCacheBytes"`
+	ReclaimableBytes uint64 `json:"reclaimableBytes"`
+}
+
+func (d *DockerClient) SystemDF() (DockerDFSummary, error) {
+	var raw struct {
+		LayersSize int64 `json:"LayersSize"`
+		Images     []struct {
+			Size       int64 `json:"Size"`
+			SharedSize int64 `json:"SharedSize"`
+			Containers int   `json:"Containers"`
+		} `json:"Images"`
+		Containers []struct {
+			SizeRw int64 `json:"SizeRw"`
+		} `json:"Containers"`
+		Volumes []struct {
+			UsageData struct {
+				Size     int64 `json:"Size"`
+				RefCount int   `json:"RefCount"`
+			} `json:"UsageData"`
+		} `json:"Volumes"`
+		BuildCache []struct {
+			Size  int64 `json:"Size"`
+			InUse bool  `json:"InUse"`
+		} `json:"BuildCache"`
+	}
+	status, body, err := d.doJSON(http.MethodGet, "/system/df", &raw)
+	if err != nil {
+		return DockerDFSummary{}, err
+	}
+	if status != http.StatusOK {
+		return DockerDFSummary{}, fmt.Errorf("docker system/df failed (%d): %s", status, strings.TrimSpace(string(body)))
+	}
+	var out DockerDFSummary
+	var reclaimable int64
+	if raw.LayersSize > 0 {
+		out.ImagesBytes = uint64(raw.LayersSize)
+	} else {
+		for _, img := range raw.Images {
+			if img.Size > 0 {
+				out.ImagesBytes += uint64(img.Size)
+			}
+		}
+	}
+	for _, img := range raw.Images {
+		if img.Containers <= 0 {
+			unique := img.Size
+			if img.SharedSize > 0 && img.SharedSize < unique {
+				unique -= img.SharedSize
+			}
+			if unique > 0 {
+				reclaimable += unique
+			}
+		}
+	}
+	for _, c := range raw.Containers {
+		if c.SizeRw > 0 {
+			out.ContainersBytes += uint64(c.SizeRw)
+		}
+	}
+	for _, v := range raw.Volumes {
+		if v.UsageData.Size > 0 {
+			out.VolumesBytes += uint64(v.UsageData.Size)
+			if v.UsageData.RefCount <= 0 {
+				reclaimable += v.UsageData.Size
+			}
+		}
+	}
+	for _, bc := range raw.BuildCache {
+		if bc.Size > 0 {
+			out.BuildCacheBytes += uint64(bc.Size)
+			if !bc.InUse {
+				reclaimable += bc.Size
+			}
+		}
+	}
+	if reclaimable > 0 {
+		out.ReclaimableBytes = uint64(reclaimable)
+	}
+	return out, nil
+}
+
 type DockerAPI interface {
 	ListContainers() ([]dockerContainerSummary, error)
 	InspectContainer(cid string) (*dockerContainerInspect, error)
 	PauseContainer(cid string) error
 	UnpauseContainer(cid string) error
+	SystemDF() (DockerDFSummary, error)
 }
 
 type DockerEventStreamer interface {
@@ -240,13 +327,18 @@ type ProjectStatus struct {
 }
 
 type DiskUsageInfo struct {
-	TotalBytes     uint64 `json:"totalBytes"`
-	FreeBytes      uint64 `json:"freeBytes"`
-	AvailableBytes uint64 `json:"availableBytes"`
-	UsedBytes      uint64 `json:"usedBytes"`
-	SwapFileBytes  uint64 `json:"swapFileBytes"`
-	ZramDiskBytes  uint64 `json:"zramDiskBytes"`
-	ZramUsedBytes  uint64 `json:"zramUsedBytes"`
+	TotalBytes             uint64 `json:"totalBytes"`
+	FreeBytes              uint64 `json:"freeBytes"`
+	AvailableBytes         uint64 `json:"availableBytes"`
+	UsedBytes              uint64 `json:"usedBytes"`
+	SwapFileBytes          uint64 `json:"swapFileBytes"`
+	ZramDiskBytes          uint64 `json:"zramDiskBytes"`
+	ZramUsedBytes          uint64 `json:"zramUsedBytes"`
+	DockerImagesBytes      uint64 `json:"dockerImagesBytes"`
+	DockerContainersBytes  uint64 `json:"dockerContainersBytes"`
+	DockerVolumesBytes     uint64 `json:"dockerVolumesBytes"`
+	DockerBuildCacheBytes  uint64 `json:"dockerBuildCacheBytes"`
+	DockerReclaimableBytes uint64 `json:"dockerReclaimableBytes"`
 }
 
 type GuestCapabilities struct {
@@ -320,6 +412,8 @@ type ReaperEngine struct {
 	domain            string
 	exemptProjects    map[string]bool
 	extraPortsFn      func() []PortMapping
+	extraDNSFn        func(domain string) []DNSRecord
+	k3sRunningFn      func() bool
 	capabilitiesFn    func() GuestCapabilities
 
 	mu       sync.Mutex
@@ -784,6 +878,9 @@ func (e *ReaperEngine) collectLocked(now time.Time) (map[string]*ProjectStatus, 
 	if e.extraPortsFn != nil {
 		ports = append(ports, e.extraPortsFn()...)
 	}
+	if e.extraDNSFn != nil {
+		dnsRecords = append(dnsRecords, e.extraDNSFn(e.domain)...)
+	}
 	sort.Slice(ports, func(i, j int) bool { return ports[i].HostPort < ports[j].HostPort })
 	return projects, ports, dnsRecords, nil
 }
@@ -1088,12 +1185,58 @@ func (e *ReaperEngine) DiskUsage() DiskUsageInfo {
 			out.ZramUsedBytes, _ = strconv.ParseUint(cols[2], 10, 64)
 		}
 	}
+	if e.docker != nil {
+		if df, err := e.docker.SystemDF(); err == nil {
+			out.DockerImagesBytes = df.ImagesBytes
+			out.DockerContainersBytes = df.ContainersBytes
+			out.DockerVolumesBytes = df.VolumesBytes
+			out.DockerBuildCacheBytes = df.BuildCacheBytes
+			out.DockerReclaimableBytes = df.ReclaimableBytes
+		}
+	}
 	return out
 }
 
 func (e *ReaperEngine) TrimDisk() (string, error) {
 	out, err := exec.Command("fstrim", "-v", "/var/lib/firn").CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+func (e *ReaperEngine) PruneDisk(all bool) (map[string]any, error) {
+	var summaries []string
+	builderArgs := []string{"builder", "prune", "-f"}
+	imageArgs := []string{"image", "prune", "-f"}
+	if all {
+		builderArgs = append(builderArgs, "-a")
+		imageArgs = append(imageArgs, "-a")
+	}
+	if out, err := exec.Command("docker", builderArgs...).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("docker builder prune failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	} else if s := strings.TrimSpace(string(out)); s != "" {
+		summaries = append(summaries, s)
+	}
+	if out, err := exec.Command("docker", imageArgs...).CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("docker image prune failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	} else if s := strings.TrimSpace(string(out)); s != "" {
+		summaries = append(summaries, s)
+	}
+	if all {
+		if out, err := exec.Command("docker", "container", "prune", "-f").CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("docker container prune failed: %w (%s)", err, strings.TrimSpace(string(out)))
+		} else if s := strings.TrimSpace(string(out)); s != "" {
+			summaries = append(summaries, s)
+		}
+	}
+	if trimOut, err := e.TrimDisk(); err == nil && trimOut != "" {
+		summaries = append(summaries, trimOut)
+	}
+	_, _ = e.RefreshTopology(time.Now())
+	return map[string]any{
+		"ok":      true,
+		"all":     all,
+		"summary": strings.Join(summaries, "\n"),
+		"disk":    e.DiskUsage(),
+	}, nil
 }
 
 func clonePorts(src []PortMapping) []PortMapping {
@@ -1214,18 +1357,24 @@ func (e *ReaperEngine) WatchDockerEvents(ctx context.Context) {
 	trigger := make(chan struct{}, 1)
 	go func() {
 		safety := time.NewTicker(30 * time.Second)
+		k8sTick := time.NewTicker(2 * time.Second)
 		defer safety.Stop()
+		defer k8sTick.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-trigger:
-				time.Sleep(15 * time.Millisecond)
+				time.Sleep(40 * time.Millisecond)
 				select {
 				case <-trigger:
 				default:
 				}
 				_, _ = e.RefreshTopology(time.Now())
+			case <-k8sTick.C:
+				if e.k3sRunningFn != nil && e.k3sRunningFn() {
+					_, _ = e.RefreshTopology(time.Now())
+				}
 			case <-safety.C:
 				_, _ = e.RefreshTopology(time.Now())
 			}

@@ -2,18 +2,17 @@
 
 [English](./README.md)
 
-**Firn** 是一套開源、輕量級的 macOS Docker、Kubernetes 與 Linux VM 執行環境，以 Swift 與 Go 原生建構於 Apple `Virtualization.framework`（`VZVirtualMachine`）、`virtio-vsock`、Jumbo `virtio-net`（`MTU 16384`）、混合式 `firnfs` v2 與 Rosetta（`x86_64`）之上。
+**Firn** 是一套開源、輕量級的 macOS Docker、Kubernetes 與 Linux VM 執行環境，以 Swift 與 Go 原生建構於 Apple `Virtualization.framework`（`VZVirtualMachine`）、`virtio-vsock`、Jumbo `virtio-net`（`MTU 16384`）、混合式 `firnfs` v3 與 Rosetta（`x86_64`）之上。
 
-它提供免額外依賴的一鍵安裝與自動映像檔初始化（無需安裝 `zstd` 或 `e2fsprogs`，首次執行 `firn up` 即自動拉取 Guest 映像檔並建立 `120 GiB` APFS 稀疏磁碟），具備 **約 1.5–2.0 秒 Guest 開機／2.0–2.5 秒冷啟動**、**約 0.4–5.6% 閒置宿主 CPU**、**`6,950 req/s` HTTP/1.1 Keep-Alive**、**`2.51 ms` 本機 `:8443` HTTPS（`3,679 req/s`）**、**`0.132 ms` PostgreSQL `SELECT 1` RTT**、**透過 Depth-2 非同步預抓 `firnfs`＋150ms `FSEvents` 自迴響抑制將冷目錄走訪壓縮至 `365–423 ms`／千檔讀取 `98 ms`**、**APFS 休眠快照（宿主記憶體 `759.6 MiB → 20.3 MiB`，VM XPC `0 MiB`，`1.47 秒`喚醒）**、**內建單節點 `k3s` Kubernetes（`firn k8s`）**、**多發行版持久化 Linux Machines（`firn machine`）**、**選用 `utun` 容器直連路由**、**可選配開啟 `--nested-kvm`（`/dev/kvm`）**、**`krunkit` Metal／Vulkan GPU 加速**，以及附帶 **CoreGraphics 折線圖、即時日誌串流與版本更新檢查的原生選單列 App（`Firn.app`）**。
+它提供免額外依賴的一鍵安裝與自動映像檔初始化（無需安裝 `zstd` 或 `e2fsprogs`，首次執行 `firn up` 即自動拉取 Guest 映像檔並建立 `120 GiB` APFS 稀疏磁碟），具備 **約 1.9–2.9 秒冷啟動**、**`6,194–6,950 req/s` HTTP/1.1 Keep-Alive**、**`2.51 ms` 本機 `:8443` HTTPS**、**`0.132–0.133 ms` PostgreSQL `SELECT 1` RTT**、**`firnfs` v3 原生 Linux `inotify` 熱重載（千檔讀取 `73–77 ms`）**、**APFS 休眠快照（宿主記憶體 `760–861 MiB → 20–24 MiB`，VM XPC `0 MiB`，`1.32–1.47 秒`喚醒）**、**零設定單節點 `k3s` Kubernetes 開發閉環（`firn k8s` ＋ `https://*.k8s.firn.local:8443`）**、**可複製快照的多發行版 Linux Machines（`firn machine clone`）**、**Docker Buildx Rosetta 多架構建置（`firn buildx`）**、**額外宿主目錄掛載（`firn mount`）**、**`utun` 直連路由**、**`--nested-kvm`**、**Metal／Vulkan GPU 加速**，以及升級版 **選單列控制中心 App（`Firn.app`）**。
 
 ## 為什麼選擇 Firn？
 
-- **休眠零 VM 記憶體佔用與連線安全的自動休眠**：透過 Docker `/events` 長輪詢事件驅動，無負載待機 CPU 極低（低負載機況為 `0.4%`）；執行 `firn hibernate`（或設定 `firn up --hibernate-seconds N`／`FIRN_HIBERNATE_SECONDS`）時會確認所有 `vsock`／Auto-Thaw 活躍連線歸零後再儲存 APFS 狀態快照（`saveMachineStateTo`）並卸載 `VZVirtualMachine` XPC 行程，使宿主總佔用由 **`759.6 MiB` 驟降至 `20.3 MiB`（VM 佔用 `0 MiB`）**，下次收到 `docker` 或 `*.firn.local` 流量時於約 **`1.47 秒`**內無縫自動喚醒。
-- **`firnfs` v2 Depth-2 串流預抓與即時 macOS 同步**：結合非同步 Depth-2 子目錄串流預抓（`fsOpPushPrefetch = 0x81`，自動略過 `.git`／`node_modules`／`.cache`）、`FOPEN_CACHE_DIR`、`FOPEN_NOFLUSH`、負向查找快取（negative lookup）、**64 MiB LRU 快取**，以及含 `150ms` 本機寫入自迴響過濾的 macOS **`FSEvents`** 推送失效——將 1,000 檔冷走訪較 v0.4.0 提速 **`2.0–2.3×`（`365–423 ms`）**、千檔讀取維持 **`<100 ms`（`78–98.5 ms`）**，同時透過 `/mnt/virtiofs-home` 直通將 `500 × 4 KiB` 建寫刪縮短至 **`266.7 ms`（總牆上耗時 `570.1 ms`）**。
-- **零配置 `1 MiB` 緩衝池全雙工 `AF_VSOCK` 轉發**：`StreamBufferPool` 重複使用頁對齊 `1 MiB` 緩衝區，搭配 Guest 端 `16 MiB` 上限／`8 MiB` 目標 `SO_VM_SOCKETS_BUFFER` 視窗，在高負載下實測仍達 **`6,950.3 req/s`** HTTP/1.1 Keep-Alive（`p50 2.03 ms`）、**`4,454.2 req/s`** 逐次建連、**`0.132 ms`** PostgreSQL `SELECT 1` RTT、**`398 MiB/s`** PG 批次查詢，以及 **`921–969 MiB/s`** 原始 TCP。
-- **獨立 Go `firn-hostnet` L2/L3 網路引擎（不耗盡 `vmenet*`）**：以 connected `AF_UNIX SOCK_DGRAM` `socketpair`（`MTU 16384`）串接 gVisor L2/L3 堆疊與記憶體動態簽發 TLS Leaf 憑證池，將 `https://*.firn.local:8443` 壓縮至 **`2.51 ms`（`3,678.9 req/s`）**，即使宿主已存在 `251` 個 `vmenet*` 介面也能穩定對外 HTTPS 連線。
-- **零外部依賴分發與高可靠性自我更新**：提供單行 `curl | bash` 安裝腳本與 Homebrew Formula；`firn up` 會自動下載經 SHA-256 校驗的 Guest 映像檔並建立 APFS 稀疏磁碟；`firn images status|pull` 管理映像檔版本；`firn upgrade` 先比對 semver 與 Homebrew 來源、在停用 `firnd` 前先驗證 macOS 與 Linux 雙封裝 SHA-256、檢查並保留 `com.apple.security.virtualization` 權限簽章、以 `.bak` 原子替換並於失敗時自動回滾、保留 `data.ext4` 並自動重啟背景服務；`FirnBar` 亦內建非阻塞更新檢查通知。
-- **開箱即用的內建 Kubernetes、Linux Machines、Nested KVM、`utun` 與 Metal GPU**：單指令 `firn k8s enable`（`k3s v1.31.6+k3s1`，安全合併 `~/.kube/config` 並保留原有 `current-context`）、多發行版 `firn machine`（`ubuntu`/`debian`/`alpine`/`arch`/`fedora`）、選配開啟 `--nested-kvm`（`/dev/kvm`）、免 `-p` 衝突 `firn route` 容器子網直連，以及選用 `krunkit` VirtIO-GPU Venus 加速。
+- **休眠零 VM 記憶體佔用、自動回復收斂與自動化防禦**：透過 Docker `/events` 長輪詢與 `40ms` 突發合併保持極低待機 CPU（閒置僅 `2.9%` CPU，同機高負載下的 OrbStack Helper 為 `149.3%` CPU）；`firn hibernate` 會在零活躍連線時儲存 APFS 狀態快照（`saveMachineStateTo`）並釋放 `VZVirtualMachine` XPC 行程（**`861 MiB → 23 MiB`**，VM XPC `0 MiB`），喚醒後自動呼叫 `convergeAfterResume()` 壓縮 Balloon 並透過 `scheduleReconnect()` 恢復 `firnfs` 連線。
+- **`firnfs` v3 原生 Linux Kernel `inotify` 熱重載＋Depth-2 預抓**：結合非同步 Depth-2 子目錄預抓（`fsOpPushPrefetch = 0x81`）、**64 MiB LRU 快取**、直接查詢宿主 APFS 的 `fsOpLookup` 一致性校驗，以及綁定獨立 OS 執行緒的 `FUSE` 合成 VFS 通知引擎（`FOPEN_DIRECT_IO` ＋ `syscall.Gettid()`），在 macOS 改檔時零毀損觸發容器內原生 Linux `IN_CREATE`、`IN_MODIFY`、`IN_CLOSE_WRITE`、`IN_DELETE` 與 `IN_ISDIR` 事件（支援 Vite / Next.js / Chokidar / Turbo 熱重載）。
+- **調優 `AF_VSOCK` ＋ `firn-hostnet` Jumbo-16K 網路引擎**：`32/16 MiB` `SO_VM_SOCKETS_BUFFER` 窗口搭配 `1–2 MiB` 緩衝池提供 **`878.6 / 833.1 MiB/s`** 原始 128 MiB TCP 吞吐、`6,193.9 req/s` HTTP Keep-Alive、`0.133 ms` PG `SELECT 1` RTT 與 `365.8 MiB/s` PG 批次查詢；搭配獨立 Go `firn-hostnet`（`MTU 16384` `socketpair`、`CapabilityRXChecksumOffload`、零 `vmenet*` 佔用）、`host.docker.internal` / `host.firn.internal`（`10.89.0.1`）解析與 `:8443` 動態憑證 HTTPS 代理。
+- **零設定 Kubernetes 閉環、Machine Clone、Buildx Rosetta 與磁碟維運**：`firn k8s enable` ＋ `firn k8s load` 自動探索 ClusterIP Service 與 Ingress 並透過 NAT 對應開放 `https://<svc>.<ns>.k8s.firn.local:8443`；`firn machine clone` 複製系統映像檔與 `-home` 資料卷；`firn buildx setup` 建立支援 `linux/arm64,linux/amd64`（Rosetta）的多架構建置器；`firn mount` 管理額外 VirtioFS 共享目錄；`firn disk` 整合 Docker `/system/df` 用量分析、`prune [--all]`、`fstrim` 與背景定時自動裁剪（`autoTrimMinutes`）。
+- **零依賴分發與完整端對端回歸護城河**：單行 `curl | bash` 或 Homebrew 安裝，支援 `firn upgrade` 安全原地升級、`Firn.app` 全功能選單列控制中心（Compose 停止／重啟／單一容器 Shell 與日誌、k8s 服務直開、Machine 建立／複製、磁碟清理、Context 與開機啟動切換），以及自動化 `make e2e` 驗證套件。
 
 ## 安裝與快速開始
 
@@ -53,58 +52,57 @@ build/firn k8s enable && kubectl --context firn get nodes
 build/firn context use
 ```
 
-## 實測數據（v0.5.0，Apple Silicon Mac）
+## 實測數據（v0.6.0，Apple Silicon Mac）
 
-在同台工作站（**Apple M5 Max**、18 核心 CPU、36.0 GiB 記憶體、macOS 27.2.1、Docker `29.8.2`、Compose `5.5.0`，宿主存在 `251` 個 `vmenet*` 介面）以 [scripts/benchmark.py](./scripts/benchmark.py) 進行可重現實測：
+在同台工作站（**Apple M5 Max**、18 核心 CPU、36.0 GiB 記憶體、macOS 27.2.1、Docker `29.8.2`、Compose `5.5.0`）以 [scripts/benchmark.py](./scripts/benchmark.py) 進行可重現實測：
 
 ```sh
-python3 scripts/benchmark.py --contexts firn        # 執行 Firn v0.5.0 全項基準測試
+python3 scripts/benchmark.py --contexts firn        # 執行 Firn 基準測試
 python3 scripts/benchmark.py --compare              # Firn 與 OrbStack 並排對照
 python3 scripts/benchmark.py --json                 # 輸出結構化 JSON 報告
+make e2e                                            # 完整 E2E 驗證（inotify、k8s、Rosetta、clone、disk）
 ```
 
-> **實測環境說明**：`Firn v0.5.0` 是在工作站高負載背景競爭（`load average: 19.0–32.6`，同時執行外部 `node`／`Keynote`／Spotlight 以及承載 9 組專案共 62 個容器、佔用 `89.6–293.2%` CPU 的 OrbStack）下進行現場量測。下表 `v0.5.0` 第 3–4 類數據取自專項調校實測（負載 `30.2–32.6`），第 1–2 與 5–7 類取自完整套件實測（負載 `21.9–27.4`），並與當時同機並跑的 OrbStack 第 3–4 類結果以及先前低負載 `v0.4.0`／`OrbStack` 紀錄並列對照。
+> **實測環境說明**：`Firn v0.6.0` 包含乾淨環境的第 3–5 類與休眠喚醒實測（`v0.6.0 乾淨 / Cat 1–7`），以及在背景同時跑著高 CPU OrbStack 負載（`OrbStack Helper 149.3% CPU / 1,867.4 MiB RSS`）下完成的完整第 1–7 類套件實測，並附上先前的 `v0.5.0` 與 `OrbStack` 基準對照。
 
 ### 第 1–6 類：跨版本與跨執行環境實測對照
 
-| 類別 | 測試指標 | Firn v0.5.0（M5 Max 高負載實測） | Firn v0.4.0（低負載基準） | OrbStack（同時段 / 同機基準） |
+| 類別 | 測試指標 | Firn v0.6.0（乾淨 / Cat 1–7 並行） | Firn v0.5.0 | OrbStack（基準） |
 | --- | --- | --- | --- | --- |
-| **1. 生命週期與 CLI** | `docker version`（5 次中位數） | `44.87 ms` | **`21.26 ms`** | `22.5 ms` |
-| | `docker run --rm alpine:3.21 true`（5 次中位數） | `454.42 ms` | **`379.75 ms`** | `477.6 ms` |
-| | `docker run --rm --entrypoint true postgres:18-alpine`（5 次中位數） | `700.35 ms` | `460.64 ms` | **`408.4 ms`** |
-| | 3 服務 Compose 熱啟動 `up -d --wait`（`postgres` + `valkey` + `mailpit`） | `2,289.48 ms` | `2,391.66 ms` | **`2,072.9 ms`** |
-| | 3 服務 Compose 卸除 `down -v --remove-orphans` | `1,823.49 ms` | `1,582.06 ms` | **`825.5 ms`** |
-| **2. 具名 Volume I/O** | 循序寫入 256 MiB（`dd ... bs=1M count=256 conv=fsync`） | `1,100.9 MiB/s`（`232.54 ms`） | **`1,814.6 MiB/s`**（`141.1 ms`） | `1,724.3 MiB/s`（`148.5 ms`） |
-| | 循序讀取 256 MiB（`dd`，寫後 page-cache 命中） | **`5,169.9 MiB/s`**（`49.52 ms`） | `3,728.4 MiB/s`（`68.7 ms`） | `4,913.7 MiB/s`（`52.1 ms`） |
-| | 小檔突發讀寫（`1,000 × 4 KiB` 建立 + 寫入 + `fsync` + 刪除） | `1,393.5 ms`（`717.6 ops/s`） | **`836.4 ms`（`1,195.6 ops/s`）** | `1,654.9 ms`（`604.3 ops/s`） |
-| **3. 宿主共享檔案系統** | 1,000 檔目錄走訪（`find /work -type f`，冷 / 3 次中位數） | **`365.21 ms` 冷 / `368.89 ms` 中位數** | `849.5 ms` 冷 / `441.1 ms` 中位數 | `3,020.8 ms` 冷 / `1,181.6 ms` 中位數（同時段） |
-| | 讀取全部 1,000 個檔案（容器內耗時 / 總耗時） | `98.51 ms`（總計 `498.26 ms`） | `78.0 ms`（總計 `409.7 ms`） | **`61.13 ms`**（總計 `983.8 ms`，同時段） |
-| | 建立 + 寫入 + 刪除 `500 × 4 KiB` 檔案（容器內耗時 / 總耗時） | **`266.72 ms`**（總計 **`570.06 ms`**） | `383.6 ms`（總計 `759.6 ms`） | `283.22 ms`（總計 `1,067.0 ms`，同時段） |
-| **4. 宿主 ↔ 容器網路** | 原始 TCP 128 MiB 宿主 → 容器 | `908.9 MiB/s`（`140.83 ms`） | `921.4 MiB/s`（`138.9 ms`） | **`2,360.3 MiB/s`**（`54.2 ms` 基準） |
-| | 原始 TCP 128 MiB 容器 → 宿主 | `726.8 MiB/s`（`176.12 ms`） | `969.0 MiB/s`（`132.1 ms`） | **`4,172.3 MiB/s`**（`30.7 ms` 基準） |
-| | HTTP/1.1 Keep-Alive（500 次請求，並行 16，Mailpit `/api/v1/info`） | **`6,950.3 req/s`**（`p50 2.032 ms`） | `5,197.8 req/s`（`p50 2.63 ms`） | `2,180.7 req/s`（同時段） |
-| | HTTP/1.1 逐次新建連線（500 次請求，並行 16，Mailpit `/api/v1/info`） | **`4,454.2 req/s`**（`p50 3.376 ms`） | `4,061.7 req/s`（`p50 3.65 ms`） | `1,458.4 req/s`（同時段） |
-| | 本機 HTTPS `https://mailpit.<stack>.firn.local:8443/api/v1/info` | **`HTTP 200`（`2.51 ms`**, **`3,678.9 req/s`** `c=16`） | `HTTP 200`（`3.05 ms`, `2,981.8 req/s`） | — |
-| | PostgreSQL `200x SELECT 1` RTT（平均 / p50 / p95） | **`0.132 / 0.129 / 0.159 ms`** | `0.136 / 0.132 / 0.166 ms` | `1.141 / 0.903 / 2.698 ms`（同時段） |
-| | PostgreSQL `19.25 MiB` 批次查詢（`20,185 × 1,000 B`，3 次中位數） | `397.6 MiB/s`（`48.41 ms`） | **`398.3 MiB/s`**（`48.34 ms`） | `206.3 MiB/s`（同時段） |
-| **5. 對外 HTTPS 出網** | `alpine:3.21` 無代理 HTTPS 下載（宿主存在 `251` 個 `vmenet*`） | `HTTP 200`（`1.41 MiB/s`, `0.329s`） | **`HTTP 200`**（`1.81 MiB/s`, `0.258s`） | **`HTTP 200`**（`1.83 MiB/s`, `0.25s` 基準） |
-| **6. 映像檔建置** | `docker build --no-cache`（`FROM alpine:3.21`，500 個小檔） | `756.96 ms` | **`338.07 ms`** | `2,180.0 ms`（基準） |
+| **1. 生命週期與 CLI** | `docker version`（5 次中位數） | `91.11 ms` | `44.87 ms` | `22.5 ms` |
+| | `docker run --rm alpine:3.21 true`（5 次中位數） | `452.91 ms` | `454.42 ms` | `477.6 ms` |
+| | `docker run --rm --entrypoint true postgres:18-alpine`（5 次中位數） | `834.8 ms` | `700.35 ms` | **`408.4 ms`** |
+| | 3 服務 Compose 熱啟動 `up -d --wait`（`postgres` + `valkey` + `mailpit`） | `6,237.17 ms` | `2,289.48 ms` | **`2,072.9 ms`** |
+| | 3 服務 Compose 卸除 `down -v --remove-orphans` | `1,690.78 ms` | `1,823.49 ms` | **`825.5 ms`** |
+| **2. 具名 Volume I/O** | 循序寫入 256 MiB（`dd ... bs=1M count=256 conv=fsync`） | `962.4 MiB/s`（`265.99 ms`） | `1,100.9 MiB/s` | **`1,724.3 MiB/s`** |
+| | 循序讀取 256 MiB（`dd`，寫後 page-cache 命中） | `3,760.7 MiB/s`（`68.07 ms`） | **`5,169.9 MiB/s`** | `4,913.7 MiB/s` |
+| | 小檔突發讀寫（`1,000 × 4 KiB` 建立 + 寫入 + `fsync` + 刪除） | **`1,263.9 ms`（`791.2 ops/s`）** | `1,393.5 ms` | `1,654.9 ms` |
+| **3. 宿主共享檔案系統** | 1,000 檔目錄走訪（`find /work -type f`，冷 / 3 次中位數） | `385.52 ms` / `414.17 ms` | **`365.21 ms` / `368.89 ms`** | `3,020.8 ms` / `1,181.6 ms` |
+| | 讀取全部 1,000 個檔案（容器內耗時） | `77.01 ms`（乾淨）/ `350.27 ms` | `98.51 ms` | **`61.13 ms`** |
+| | 建立 + 寫入 + 刪除 `500 × 4 KiB` 檔案（容器內耗時） | `274.34 ms`（乾淨）/ `1,263.26 ms` | **`266.72 ms`** | `283.22 ms` |
+| **4. 宿主 ↔ 容器網路** | 原始 TCP 128 MiB 宿主 → 容器 | `878.6 MiB/s`（乾淨）/ `435.2 MiB/s` | `908.9 MiB/s` | **`2,360.3 MiB/s`** |
+| | 原始 TCP 128 MiB 容器 → 宿主 | `833.1 MiB/s`（乾淨）/ `94.8 MiB/s` | `726.8 MiB/s` | **`4,172.3 MiB/s`** |
+| | HTTP/1.1 Keep-Alive（500 次請求，並行 16） | `6,193.9 req/s`（`p50 2.38 ms`，乾淨） | **`6,950.3 req/s`** | `2,180.7 req/s` |
+| | HTTP/1.1 逐次新建連線（500 次請求，並行 16） | `4,407.5 req/s`（`p50 3.42 ms`，乾淨） | **`4,454.2 req/s`** | `1,458.4 req/s` |
+| | PostgreSQL `200x SELECT 1` RTT（平均 / p50） | `0.139 / 0.133 ms`（乾淨） | **`0.132 / 0.129 ms`** | `1.141 / 0.903 ms` |
+| | PostgreSQL `19.25 MiB` 批次查詢（`20,185 × 1,000 B`） | `365.8 MiB/s`（`52.62 ms`，乾淨） | **`397.6 MiB/s`** | `206.3 MiB/s` |
+| **5. 對外 HTTPS 出網** | `alpine:3.21` 無代理 HTTPS 下載 | `HTTP 200`（`0.85–1.51 MiB/s`, `0.308–0.55s`） | `HTTP 200`（`1.41 MiB/s`, `0.329s`） | **`HTTP 200`**（`1.83 MiB/s`, `0.25s`） |
+| **6. 映像檔建置** | `docker build --no-cache`（`FROM alpine:3.21`，500 個小檔） | `1,653.72 ms` | **`756.96 ms`** | `2,180.0 ms` |
 
-### 第 7 類與核心生命週期實測（v0.5.0）
+### 第 7 類與 E2E 功能實測（v0.6.0）
 
-| 測試指標 | 實測結果（v0.5.0） |
+| 測試指標 | 實測結果（v0.6.0） |
 | --- | --- |
-| 乾淨關機（`firn down`） | `1,710.67 ms`（v0.4.0 低負載為 `835.82 ms`） |
-| 冷啟動（自動休眠測試 / Cat 7 完整套件） | `1,689.4 ms`（自動休眠實測 `2.25s`）/ `2,653.32 ms` 總耗時（負載 `21.9–27.4` 下 Guest 開機 `2.03s`） |
-| 閒置宿主佔用（`top`，0 容器待機、高負載環境） | `5.6%` CPU、**`769.2 MiB`**（`firnd 32.6 + vm 736.6`，對照 OrbStack Helper `89.6%` CPU / `2,675.3 MiB` RSS） |
-| 休眠與喚醒（`firn hibernate` → `firn resume`） | **`759.6 MiB → 20.3 MiB`**（狀態檔 `169.0 MiB`，VM XPC `0 MiB`）；**喚醒僅 `1,467.3 ms`** |
-| 喚醒後 `firnfs` Cat 3 一致性與效能 | `423.28 ms` 冷 / `399.41 ms` 中位數走訪、**`98.37 ms`** 讀取、**`403.62 ms`** 建寫刪 |
-| 連線安全自動休眠（`--hibernate-seconds 15`） | 活躍連線時自動略過、閒置觸發無快照競態錯誤（0 筆失敗） |
-| 同時執行 3 組雙容器專案冷凍回收 | `99.62 MiB → 18.77 MiB`（**釋放 `81.2%`**，`4.8 MiB` 壓縮於 `zram0`） |
-| 目標優先 Auto-Thaw（冷凍狀態 Valkey `PING` / HTTPS `:8443`） | **`29.68 ms` TCP** / **`27.71 ms` HTTPS**（`pausedCount = 0`；`guestThaw 13.94 ms`、`hostThaw 14.46 ms`） |
-| 內建 Kubernetes（`firn k8s enable`） | `k3s v1.31.6+k3s1` 於 `127.0.0.1:6443` 就緒（`Ready`），安全合併 kubeconfig 並保留原 `current-context` |
-| 多發行版 Linux Machines（`firn machine create testbox --distro alpine`） | 自動分配 `10.87.0.2` 與 `testbox.firn.local`、互動 PTY Shell、共享宿主 `$HOME` |
-| 選配 Nested KVM（`firn up --nested-kvm`） | Guest 內開放 `/dev/kvm`（`crw-rw-rw- 1 root kvm`） |
+| 乾淨關機（`firn down`） | `1,822.78 ms` |
+| 冷啟動（`firn up` 熱快取 / Cat 7 高併發） | `1,939.9–2,937.2 ms` / `5,050.87 ms`（Guest `4.07s`） |
+| 閒置宿主佔用（`top`，0 容器待機） | `2.9%` CPU、**`761.2–776.0 MiB`**（`RSS 195.9–232.7 MiB`，對照同機並跑 OrbStack Helper `149.3%` CPU / `1,867.4 MiB` RSS） |
+| 休眠與喚醒（`firn hibernate` → `firn resume`） | **`1.11 GiB → 24.7 MiB`**（`1,420.8 ms`）／**`851 MiB → 24.1 MiB`**（VM XPC `0 MiB`）；**喚醒 `1,321.3 ms`**（`convergeAfterResume` 縮放氣球至 `1.22–2.33 GiB` 且 `firnfsClients=1` 自動恢復） |
+| 同時執行 3 組雙容器專案冷凍回收 | `95.38 MiB → 16.3 MiB`（**釋放 `82.9%`**，`5.0 MiB` 壓縮於 `zram0`） |
+| Auto-Thaw 解凍（冷凍狀態 Valkey `PING` / HTTPS `:8443`，高併發實測） | `233.4 ms` TCP / `269.37 ms` HTTPS（`paused = 0`） |
+| `firnfs` v3 原生 `inotify` 熱重載（`make e2e`） | 容器內即時收到 `IN_MODIFY`、`IN_CREATE`、`IN_CLOSE_WRITE`、`IN_DELETE`、`IN_ISDIR`，宿主與容器端檔案 SHA-256 100% 一致 |
+| `host.docker.internal` 與 `host.firn.internal` | 容器內自動解析為 `10.89.0.1` 並連通宿主本地 HTTP 服務 |
+| 零設定 Kubernetes 閉環（`firn k8s enable`, `load`, `services`） | `k3s v1.31.6+k3s1` 就緒並透過 `https://<svc>.<ns>.k8s.firn.local:8443` 直連叢集 Pod |
+| Linux Machine Clone 與 Buildx Rosetta（`make e2e`） | `firn machine clone` 保留根目錄與 `-home` 資料卷；`firn buildx setup` 支援 `linux/amd64` 建置與 Rosetta 執行（`uname -m == x86_64`） |
 
 ## 系統架構
 
@@ -112,27 +110,27 @@ python3 scripts/benchmark.py --json                 # 輸出結構化 JSON 報�
 flowchart LR
   subgraph macOS["macOS 主機"]
     CLI["firn CLI / Docker CLI / kubectl"]
-    Bar["Firn.app (FirnBar: 折線圖、即時日誌與版本檢查)"]
+    Bar["Firn.app (FirnBar: 控制中心、即時日誌與版本檢查)"]
     UTUN["firn-hostnet utun (10.87/10.88)"]
     subgraph Daemon["firnd (VZVirtualMachine / KrunMachineRunner)"]
       FSW["FSEventsWatcher (150ms 自迴響過濾)"]
       D["docker.sock <-> vsock:2375"]
       C["控制 API <-> vsock:2376"]
-      T["AutoThawProxy + VsockBridge (StreamBufferPool 1M)"]
+      T["AutoThawProxy + VsockBridge"]
       DNS["分流 DNS (:53535 *.firn.local)"]
       SH["shell.sock <-> vsock:2382 + SSH Agent :2383"]
     end
     subgraph HN["firn-hostnet (Go)"]
-      GV["gVisor L2/L3 (MTU 16384 socketpair)"]
-      TLS[":8088 HTTP / :8443 HTTPS + 動態 Leaf 憑證池"]
+      GV["gVisor L2/L3 (MTU 16384, 4M sock)"]
+      TLS[":8088 HTTP / :8443 HTTPS + 動態 Leaf 憑證池 + k8s Ingress"]
       FSRV["FirnFSServer (Depth-2 推送預抓 + firnfs.sock)"]
     end
   end
   subgraph Linux["Alpine Linux VM (arm64 6.12.x + Rosetta x86_64 + /dev/kvm)"]
-    GD["firn-guestd (Go + firnfs v2 FUSE + cgroup v2 + k3s + machines)"]
+    GD["firn-guestd (Go + firnfs v3 FUSE/inotify + 40ms 合併 + k3s)"]
     ETH["eth0 (10.89.0.2/24 MTU 16384)"]
-    DK["dockerd (overlay2) + k3s (containerd) + Linux Machines"]
-    VFS["/mnt/virtiofs-home (寫入直通層)"]
+    DK["dockerd (overlay2 + Buildx) + k3s + Linux Machines"]
+    VFS["/mnt/virtiofs-home + extraMounts"]
     SW["分層 Swap: 2 GiB zram0 (pri 100) + 4 GiB swapfile (pri 10)"]
   end
   CLI --> D
@@ -141,7 +139,7 @@ flowchart LR
   UTUN <--> GV
   Bar --> C
   FSW --> FSRV
-  T <-->|"AF_VSOCK (16M max / 8M buf)"| GD
+  T <-->|"AF_VSOCK (32M/16M + 2M pool)"| GD
   D <-->|"AF_VSOCK"| GD
   C <-->|"AF_VSOCK"| GD
   SH <-->|"AF_VSOCK"| GD
@@ -164,14 +162,17 @@ flowchart LR
 | `firn resume [--json]` | 立即還原休眠中的 VM（收到流量時亦會自動喚醒） |
 | `firn status [--json]` | 查看 VM／主機記憶體、CPU%、能力旗標、APFS 稀疏磁碟、DNS／HTTPS、路由與各專案狀態 |
 | `firn shell [-- COMMAND...]` | 經由 `vsock:2382` 開啟互動式 PTY Shell（內建 `SSH_AUTH_SOCK` 轉發） |
-| `firn k8s <status\|enable [--no-kubeconfig] [--use]\|disable\|reset\|freeze\|thaw\|kubeconfig>` | 管理內建 `k3s` 單節點 Kubernetes 叢集並安全合併 kubeconfig |
-| `firn machine <list\|create <name> [--distro D]\|shell <name>\|start\|stop\|delete>` | 管理共享宿主 `$HOME` 的 Ubuntu/Debian/Alpine/Arch/Fedora 持久環境 |
+| `firn k8s <status\|enable\|disable\|reset\|freeze\|thaw\|services\|load <img...>\|kubeconfig>` | 管理內建 `k3s` 叢集、檢視自動探索的 `*.k8s.<domain>` 服務，或匯入本地映像檔至 `k8s.io` |
+| `firn machine <list\|create <name> [--distro D]\|clone <src> <dst>\|shell\|start\|stop\|delete>` | 管理共享 `$HOME` 的持久化 Linux Machines，並支援完整系統與資料卷複製 |
+| `firn mount <list\|add <hostPath> [--guest PATH] [--read-only]\|remove <hostPath>>` | 管理額外 VirtioFS 宿主共享目錄掛載點 |
+| `firn buildx <status\|setup\|remove>` | 管理多架構 `firn-builder`（原生 `linux/arm64` ＋ Rosetta `linux/amd64`） |
+| `firn socket <status\|link\|unlink>` | 檢視或設定 `/var/run/docker.sock` 相容性軟連結 |
 | `firn route <status\|up\|install [--dns]\|uninstall\|dns <status\|on\|off>>` | 管理宿主 `utun` 容器子網直連路由（`10.87.0.0/24`、`10.88.0.0/16`） |
 | `firn freeze <project> [--reclaim]` | 使用 `cgroup.freeze` 暫停專案並回收記憶體與釋放快取 |
 | `firn thaw <project>` | 手動解凍指定專案（連線進入時也會自動解凍） |
 | `firn reclaim [project]` | 回收閒置記憶體頁面而不強制暫停容器 |
 | `firn balloon <shrink\|reset>` | 將 VZ Balloon 縮放至 guest 需求量或恢復上限 |
-| `firn disk <usage\|trim> [--json]` | 查看 APFS 稀疏碟／`zram0` 用量，或線上執行 `fstrim` 回收空間 |
+| `firn disk <usage\|trim\|prune [--all]> [--json]` | 查看 APFS／Docker `/system/df`／`zram0` 用量，線上執行 `fstrim` 或一鍵清理快取並縮容 |
 | `firn dns <status\|install\|uninstall>` | 檢視本機 DNS 紀錄或管理 `/etc/resolver/<domain>`（`sudo`） |
 | `firn ca <status\|install\|uninstall>` | 檢視 Firn 本機 Root CA 或寫入 macOS System Keychain（`sudo`） |
 | `firn https <status\|install\|uninstall>` | 檢視 `:8443` HTTPS 代理或安裝 `:80`/`:443` `pf` 轉向規則（`sudo`） |
@@ -213,6 +214,7 @@ services:
 - `FIRN_BACKEND`（預設 `vz`，可設 `krun`）、`FIRN_GPU`（預設 `false`）、`FIRN_NESTED_VIRT`（預設 `false`）
 - `FIRN_HIBERNATE_SECONDS`（預設 `0` 停用自動休眠）、`FIRN_IDLE_SECONDS`（預設 `900`）、`FIRN_EXEMPT_PROJECTS`
 - `FIRN_DOMAIN`（`firn.local`）、`FIRN_DNS_PORT`（`53535`）、`FIRN_HTTP_PROXY_PORT`（`8088`）、`FIRN_HTTPS_PROXY_PORT`（`8443`）、`FIRN_DIRECT_ROUTE_DNS`（`false`）
+- `FIRN_AUTO_TRIM_MINUTES`（預設 `60`，閒置定時執行 `fstrim`，設 `0` 停用）、另可透過 `firn mount` 設定 `extraMounts`
 - `FIRN_INSTALL_DIR`（`scripts/install.sh` 安裝目標目錄）、`FIRN_IMAGE_VERSION` / `BUILD_DOCKER_CONTEXT`（`make build`／`guest/build-rootfs.sh` 使用）
 
 ## 套件分發與 Homebrew

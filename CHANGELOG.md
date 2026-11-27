@@ -2,6 +2,24 @@
 
 All notable changes to Firn are documented in this file.
 
+## v0.6.0
+
+- **`firnfs` v3 Kernel `inotify` HMR Forwarding, Gateway Compatibility & Extra Host Mounts**:
+  - Upgraded `firnfs` (`guest/firn-guestd/firnfs_linux.go`) with a single-OS-thread (`runtime.LockOSThread` + `syscall.Gettid()`) synthetic VFS notification worker fed by host `FSEvents` and direct host APFS `fsOpLookup` verification: container processes watching bind mounts receive native Linux kernel `IN_CREATE`, `IN_MODIFY`, `IN_CLOSE_WRITE`, `IN_DELETE`, and `IN_ISDIR` events (verified end-to-end with byte-for-byte host/container SHA-256 integrity and zero host file mutation via `FOPEN_DIRECT_IO`), enabling out-of-the-box HMR for Vite, Next.js, Chokidar, and Turbo.
+  - Added automatic `firnFSClient` background reconnection (`scheduleReconnect`) across `firn hibernate` / `firn resume` so live `FSEvents` invalidations recover automatically (`firnfsClients >= 1`).
+  - Resolved `host.docker.internal`, `host.firn.internal`, and `gateway.docker.internal` to `10.89.0.1` in both `/etc/hosts` and guest DNS (`proxy_relay.go`), plus set `"host-gateway-ip": "10.89.0.1"` in `/etc/docker/daemon.json`.
+  - Added configurable additional VirtioFS host shares (`extraMounts` / `firn.mounts=` kernel cmdline / `firn mount <list|add|remove>`).
+- **Zero-Config Kubernetes (`firn k8s`) Local Dev Loop**:
+  - Added automatic ClusterIP Service & Ingress discovery (`<svc>.<ns>.k8s.<domain>`, `<svc>.k8s.<domain>`, and Ingress hosts under `.k8s.<domain>`) into `ReaperEngine` topology and `ProxyManager`, with `iptables` `FORWARD` + `POSTROUTING MASQUERADE` rules for `10.89.0.1 -> 10.42.0.0/16 & 10.43.0.0/16` so `https://*.k8s.firn.local:8443` reaches k3s pods cleanly while keeping `*.k8s.*` loopback-proxied when `directRouteDNS` is active.
+  - Fixed `extraDNSFn` re-entrant `ReaperEngine.mu` deadlock on k3s startup and separated host UI vs guest `/topology?since=` version tracking in `AutoThawProxy`.
+  - Added `firn k8s services` and `firn k8s load <image...>` (`docker save | k3s ctr -n k8s.io images import -`).
+- **Buildx Rosetta, Machine Clone, Disk Ops & Lifecycle Tuning**:
+  - Added `firn buildx <status|setup|remove>` configuring `firn-builder` (`docker-container` driver for `linux/arm64,linux/amd64` using Apple Rosetta), `firn machine clone <src> <dst>` (commits container image and copies `-home` volume), `firn socket <status|link|unlink>`, `/system/df` Docker breakdown (`images`/`containers`/`volumes`/`buildCache`/`reclaimable`), and `POST /disk/prune` (`firn disk prune [--all]`).
+  - Enabled `CapabilityRXChecksumOffload` + `4 MiB` socket/TCP buffers (`1 MiB` pool) in `firn-hostnet`, `32/16 MiB` `SO_VM_SOCKETS_BUFFER` attempts (`2 MiB` pool) in `firn-guestd`, `40ms` Docker event burst coalescing (`1,690.78 ms` 3-service Compose `down -v`), `BalloonController.convergeAfterResume()` (`+0.35s` & `+2.5s`), and background idle `fstrim` (`autoTrimMinutes`, default `60`).
+- **Control Center (`FirnBar`) & Automated E2E Regression Suite (`make e2e`)**:
+  - Upgraded `Firn.app` (`FirnBar`) with per-stack Stop/Restart & per-container Shell/Logs, Kubernetes `*.k8s.<domain>` service links + cluster Reset confirmation, Linux Machine Quick Create & Clone dialogs, and Disk & Maintenance breakdown/Prune/Trim/Docker-Context/Auto-Start controls.
+  - Added [`scripts/e2e.sh`](./scripts/e2e.sh) (`make e2e`) verifying boot capabilities, `host.docker.internal`, live `firnfs` v3 `inotify` + SHA-256 integrity, `hibernate`/`resume` + `firnfsClients` recovery, `k8s enable` + `load` + `https://*.k8s.firn.local:8443`, `machine clone`, `buildx` Rosetta `linux/amd64`, and `disk usage/prune/trim`.
+
 ## v0.5.0
 
 - **`firnfs` v2 (Depth-2 Streaming Prefetch, `FOPEN_CACHE_DIR` & 150ms Self-Echo Filter)**:

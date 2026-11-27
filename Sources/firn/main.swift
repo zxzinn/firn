@@ -891,6 +891,7 @@ private func cmdHTTPS(_ action: String) throws -> Int32 {
 private func cmdDisk(_ args: [String]) throws -> Int32 {
     let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "usage"
     let jsonMode = args.contains("--json")
+    let allMode = args.contains("--all")
     switch sub {
     case "usage":
         if FirnHostClient.isDaemonAlive() {
@@ -902,6 +903,14 @@ private func cmdDisk(_ args: [String]) throws -> Int32 {
             print("APFS sparse disk (\(FirnPaths.dataDiskURL.path)): \(FirnHostClient.formatBytes(u64(res, "hostAllocatedBytes"))) allocated / \(FirnHostClient.formatBytes(u64(res, "hostLogicalBytes"))) logical")
             if let guest = res["guest"] as? [String: Any] {
                 print("Guest /var/lib/firn: used=\(FirnHostClient.formatBytes(u64(guest, "usedBytes"))), available=\(FirnHostClient.formatBytes(u64(guest, "availableBytes"))), swapfile=\(FirnHostClient.formatBytes(u64(guest, "swapFileBytes"))), zram=\(FirnHostClient.formatBytes(u64(guest, "zramUsedBytes")))/\(FirnHostClient.formatBytes(u64(guest, "zramDiskBytes")))")
+                let imgB = u64(guest, "dockerImagesBytes")
+                let cntB = u64(guest, "dockerContainersBytes")
+                let volB = u64(guest, "dockerVolumesBytes")
+                let bcB = u64(guest, "dockerBuildCacheBytes")
+                let recB = u64(guest, "dockerReclaimableBytes")
+                if imgB + cntB + volB + bcB > 0 {
+                    print("Docker storage: images=\(FirnHostClient.formatBytes(imgB)), containers=\(FirnHostClient.formatBytes(cntB)), volumes=\(FirnHostClient.formatBytes(volB)), buildCache=\(FirnHostClient.formatBytes(bcB)), reclaimable=\(FirnHostClient.formatBytes(recB))")
+                }
             }
             return 0
         }
@@ -920,8 +929,22 @@ private func cmdDisk(_ args: [String]) throws -> Int32 {
         let res = try FirnHostClient.requestJSON(method: "POST", path: "/disk/trim", timeoutSeconds: 60)
         printPrettyJSON(res)
         return 0
+    case "prune":
+        let path = allMode ? "/disk/prune?all=1" : "/disk/prune"
+        let res = try FirnHostClient.requestJSON(method: "POST", path: path, timeoutSeconds: 120)
+        if jsonMode {
+            printPrettyJSON(res)
+            return 0
+        }
+        let before = FirnHostClient.formatBytes(u64(res, "hostAllocatedBeforeBytes"))
+        let after = FirnHostClient.formatBytes(u64(res, "hostAllocatedAfterBytes"))
+        print("[firn] Pruned Docker cache/images\(allMode ? " (--all)" : "") & trimmed sparse disk: \(before) -> \(after) APFS allocated")
+        if let summary = res["summary"] as? String, !summary.isEmpty {
+            print(summary)
+        }
+        return 0
     default:
-        throw NSError(domain: "Firn", code: 24, userInfo: [NSLocalizedDescriptionKey: "Usage: firn disk <usage|trim> [--json]"])
+        throw NSError(domain: "Firn", code: 24, userInfo: [NSLocalizedDescriptionKey: "Usage: firn disk <usage|trim|prune [--all]> [--json]"])
     }
 }
 
@@ -1323,8 +1346,47 @@ private func cmdK8s(_ args: [String]) throws -> Int32 {
         }
         return 0
 
+    case "services", "svc":
+        let res = try FirnHostClient.requestJSON(method: "GET", path: "/k8s/services", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        let svcs = (res["services"] as? [[String: Any]]) ?? []
+        if svcs.isEmpty {
+            print("No Kubernetes ClusterIP services exposed.")
+            return 0
+        }
+        print("\(padRight("NAMESPACE", 14)) \(padRight("NAME", 20)) \(padRight("CLUSTER-IP", 16)) \(padRight("PORTS", 14)) \(padRight("LOCAL DNS", 32))")
+        for s in svcs {
+            let ns = (s["namespace"] as? String) ?? ""
+            let name = (s["name"] as? String) ?? ""
+            let cip = (s["clusterIp"] as? String) ?? ""
+            let ports = ((s["ports"] as? [Int]) ?? []).map(String.init).joined(separator: ",")
+            let dns = ((s["dnsNames"] as? [String]) ?? []).first ?? ""
+            print("\(padRight(ns, 14)) \(padRight(name, 20)) \(padRight(cip, 16)) \(padRight(ports, 14)) \(padRight(dns, 32))")
+        }
+        return 0
+
+    case "load":
+        let images = rest.filter { !$0.hasPrefix("-") }
+        guard !images.isEmpty else {
+            throw NSError(domain: "Firn", code: 89, userInfo: [NSLocalizedDescriptionKey: "Usage: firn k8s load <image...> [--json]"])
+        }
+        let body = try JSONSerialization.data(withJSONObject: ["images": images])
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/k8s/load", body: body, timeoutSeconds: 180)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Loaded \(images.joined(separator: ", ")) into k3s containerd (k8s.io).")
+        if let output = res["output"] as? String, !output.isEmpty {
+            print(output)
+        }
+        return 0
+
     default:
-        throw NSError(domain: "Firn", code: 83, userInfo: [NSLocalizedDescriptionKey: "Usage: firn k8s <status|enable [--no-kubeconfig] [--use]|disable|reset [--purge-binary]|freeze|thaw|kubeconfig [--write] [--use]>"])
+        throw NSError(domain: "Firn", code: 83, userInfo: [NSLocalizedDescriptionKey: "Usage: firn k8s <status|enable [--no-kubeconfig] [--use]|disable|reset [--purge-binary]|freeze|thaw|services|load <image...>|kubeconfig [--write] [--use]>"])
     }
 }
 
@@ -1408,8 +1470,204 @@ private func cmdMachine(_ args: [String]) throws -> Int32 {
         print("[firn] Machine '\(machineName)': \(mappedAction) ok.")
         return 0
 
+    case "clone":
+        let positional = rest.filter { !$0.hasPrefix("-") }
+        guard positional.count >= 2 else {
+            throw NSError(domain: "Firn", code: 89, userInfo: [NSLocalizedDescriptionKey: "Usage: firn machine clone <source> <target> [--json]"])
+        }
+        let src = positional[0]
+        let dst = positional[1]
+        let body = try JSONSerialization.data(withJSONObject: ["target": dst])
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/machines/\(urlEncoded(src))/clone", body: body, timeoutSeconds: 180)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Cloned machine '\(src)' -> '\(res["name"] ?? dst)' (ip=\(res["ip"] ?? "-"), dns=\(res["dnsName"] ?? "-"))")
+        return 0
+
     default:
-        throw NSError(domain: "Firn", code: 88, userInfo: [NSLocalizedDescriptionKey: "Usage: firn machine <list|create|shell|start|stop|delete>"])
+        throw NSError(domain: "Firn", code: 88, userInfo: [NSLocalizedDescriptionKey: "Usage: firn machine <list|create|clone|shell|start|stop|delete>"])
+    }
+}
+
+private func cmdMount(_ args: [String]) throws -> Int32 {
+    let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "list"
+    let rest = Array(args.dropFirst())
+    let jsonMode = args.contains("--json")
+    var cfg = FirnConfig.load()
+
+    func saveMounts(_ nextCfg: FirnConfig) throws {
+        if FirnHostClient.isDaemonAlive() {
+            let mountsJSON = nextCfg.extraMounts.map { ["hostPath": $0.hostPath, "guestPath": $0.guestPath, "readOnly": $0.readOnly] as [String: Any] }
+            let body = try JSONSerialization.data(withJSONObject: ["extraMounts": mountsJSON])
+            _ = try FirnHostClient.requestJSON(method: "POST", path: "/config", body: body, timeoutSeconds: 10)
+        } else {
+            try nextCfg.save()
+        }
+    }
+
+    switch sub {
+    case "list", "ls":
+        if jsonMode {
+            let data = try JSONEncoder().encode(["extraMounts": cfg.extraMounts])
+            if let str = String(data: data, encoding: .utf8) { print(str) }
+            return 0
+        }
+        let homePath = FileManager.default.homeDirectoryForCurrentUser.path
+        print("\(homePath) -> \(homePath) (default, firnfs)")
+        for m in cfg.extraMounts {
+            let mode = m.readOnly ? "ro" : "rw"
+            print("\(m.hostPath) -> \(m.guestPath) (\(mode), virtiofs)")
+        }
+        return 0
+
+    case "add":
+        var hostPath: String?
+        var guestPath = ""
+        var readOnly = false
+        var idx = 0
+        while idx < rest.count {
+            let a = rest[idx]
+            if a == "--guest", idx + 1 < rest.count { guestPath = rest[idx + 1]; idx += 2; continue }
+            if a == "--read-only" || a == "--ro" { readOnly = true; idx += 1; continue }
+            if a == "--json" { idx += 1; continue }
+            if !a.hasPrefix("-"), hostPath == nil { hostPath = a; idx += 1; continue }
+            throw NSError(domain: "Firn", code: 90, userInfo: [NSLocalizedDescriptionKey: "Unknown option for `mount add`: \(a)"])
+        }
+        guard let rawHost = hostPath else {
+            throw NSError(domain: "Firn", code: 91, userInfo: [NSLocalizedDescriptionKey: "Usage: firn mount add <hostPath> [--guest PATH] [--read-only]"])
+        }
+        let resolvedHost = (rawHost as NSString).standardizingPath
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolvedHost, isDirectory: &isDir), isDir.boolValue else {
+            throw NSError(domain: "Firn", code: 92, userInfo: [NSLocalizedDescriptionKey: "Host directory does not exist: \(resolvedHost)"])
+        }
+        let resolvedGuest = guestPath.isEmpty ? resolvedHost : guestPath
+        cfg.extraMounts.removeAll { $0.hostPath == resolvedHost }
+        cfg.extraMounts.append(FirnExtraMount(hostPath: resolvedHost, guestPath: resolvedGuest, readOnly: readOnly))
+        try saveMounts(cfg)
+        print("[firn] Configured mount \(resolvedHost) -> \(resolvedGuest) (\(readOnly ? "ro" : "rw")).")
+        if FirnHostClient.isDaemonAlive() {
+            print("[firn] Run `firn down && firn up` to attach the updated VirtioFS share.")
+        }
+        return 0
+
+    case "remove", "rm":
+        guard let rawTarget = rest.first(where: { !$0.hasPrefix("-") }) else {
+            throw NSError(domain: "Firn", code: 93, userInfo: [NSLocalizedDescriptionKey: "Usage: firn mount remove <hostPath>"])
+        }
+        let resolved = (rawTarget as NSString).standardizingPath
+        let beforeCount = cfg.extraMounts.count
+        cfg.extraMounts.removeAll { $0.hostPath == resolved || $0.guestPath == resolved }
+        if cfg.extraMounts.count == beforeCount {
+            throw NSError(domain: "Firn", code: 94, userInfo: [NSLocalizedDescriptionKey: "No configured extra mount matched '\(rawTarget)'."])
+        }
+        try saveMounts(cfg)
+        print("[firn] Removed extra mount '\(resolved)'.")
+        if FirnHostClient.isDaemonAlive() {
+            print("[firn] Run `firn down && firn up` to apply mount changes.")
+        }
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 95, userInfo: [NSLocalizedDescriptionKey: "Usage: firn mount <list|add <hostPath> [--guest PATH] [--read-only]|remove <hostPath>>"])
+    }
+}
+
+private func cmdBuildx(_ args: [String]) throws -> Int32 {
+    let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "status"
+    let ctx = FirnConfig.defaultDockerContext
+    let builderName = "firn-builder"
+    switch sub {
+    case "status":
+        let res = try runDocker(["--context", ctx, "buildx", "ls"])
+        print(res.stdout, terminator: "")
+        if !res.stderr.isEmpty { fputs(res.stderr, stderr) }
+        return res.code
+    case "setup", "enable":
+        try ensureDockerContext(ctx, dockerSock: FirnPaths.dockerSockURL)
+        _ = try? runDocker(["--context", ctx, "buildx", "rm", builderName])
+        let create = try runDocker([
+            "--context", ctx, "buildx", "create",
+            "--name", builderName,
+            "--driver", "docker-container",
+            "--platform", "linux/arm64,linux/amd64",
+            "--use",
+        ])
+        if create.code != 0 {
+            throw NSError(domain: "Firn", code: 96, userInfo: [NSLocalizedDescriptionKey: create.stderr.isEmpty ? create.stdout : create.stderr])
+        }
+        let insp = try runDocker(["--context", ctx, "buildx", "inspect", builderName, "--bootstrap"])
+        print(insp.stdout, terminator: "")
+        if insp.code != 0 {
+            if !insp.stderr.isEmpty { fputs(insp.stderr, stderr) }
+            return insp.code
+        }
+        print("[firn] Buildx builder '\(builderName)' ready for linux/arm64 + linux/amd64 (Rosetta).")
+        return 0
+    case "remove", "rm":
+        let res = try runDocker(["--context", ctx, "buildx", "rm", builderName])
+        print(res.stdout, terminator: "")
+        if !res.stderr.isEmpty { fputs(res.stderr, stderr) }
+        return res.code
+    default:
+        throw NSError(domain: "Firn", code: 97, userInfo: [NSLocalizedDescriptionKey: "Usage: firn buildx <status|setup|remove>"])
+    }
+}
+
+private func cmdSocket(_ args: [String]) throws -> Int32 {
+    let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "status"
+    let linkPath = "/var/run/docker.sock"
+    let targetPath = FirnPaths.dockerSockURL.path
+    let fm = FileManager.default
+    let currentDest = try? fm.destinationOfSymbolicLink(atPath: linkPath)
+
+    switch sub {
+    case "status":
+        if let currentDest {
+            print("\(linkPath) -> \(currentDest)")
+        } else if fm.fileExists(atPath: linkPath) {
+            print("\(linkPath) (non-symlink socket/file)")
+        } else {
+            print("\(linkPath) (not present)")
+        }
+        return 0
+
+    case "link":
+        if geteuid() == 0 {
+            if fm.fileExists(atPath: linkPath) || currentDest != nil {
+                try? fm.removeItem(atPath: linkPath)
+            }
+            try fm.createSymbolicLink(atPath: linkPath, withDestinationPath: targetPath)
+            print("[firn] Linked \(linkPath) -> \(targetPath)")
+            return 0
+        }
+        if currentDest == targetPath {
+            print("[firn] \(linkPath) already points to \(targetPath)")
+            return 0
+        }
+        print("Current /var/run/docker.sock -> \(currentDest ?? "(none/non-symlink)")")
+        print("Root privilege is required to modify /var/run. Run:")
+        print("  sudo ln -sfn \"\(targetPath)\" \"\(linkPath)\"")
+        return 1
+
+    case "unlink":
+        guard currentDest == targetPath else {
+            print("[firn] \(linkPath) does not point to \(targetPath) (current: \(currentDest ?? "none")).")
+            return 0
+        }
+        if geteuid() == 0 {
+            try fm.removeItem(atPath: linkPath)
+            print("[firn] Removed \(linkPath)")
+            return 0
+        }
+        print("Root privilege is required to remove \(linkPath). Run:")
+        print("  sudo rm -f \"\(linkPath)\"")
+        return 1
+
+    default:
+        throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "Usage: firn socket <status|link|unlink>"])
     }
 }
 
@@ -1888,14 +2146,17 @@ private func printHelp() {
       firn hibernate [--json]
       firn resume [--json]
       firn shell [-- COMMAND...]
-      firn k8s <status|enable [--no-kubeconfig] [--use]|disable|reset [--purge-binary]|freeze|thaw|kubeconfig [--write] [--use]>
-      firn machine <list|create <name> [--distro D]|shell <name> [-- CMD]|start|stop|delete>
+      firn k8s <status|enable [--no-kubeconfig] [--use]|disable|reset [--purge-binary]|freeze|thaw|services|load <image...>|kubeconfig [--write] [--use]>
+      firn machine <list|create <name> [--distro D]|clone <src> <dst>|shell <name> [-- CMD]|start|stop|delete>
+      firn mount <list|add <hostPath> [--guest PATH] [--read-only]|remove <hostPath>>
+      firn buildx <status|setup|remove>
+      firn socket <status|link|unlink>
       firn route <status|up|install [--dns]|uninstall|dns <status|on|off>>
       firn freeze <project> [--reclaim]
       firn thaw <project>
       firn reclaim [project]
       firn balloon <shrink|reset>
-      firn disk <usage|trim> [--json]
+      firn disk <usage|trim|prune [--all]> [--json]
       firn dns <status|install|uninstall>
       firn ca <status|install|uninstall>
       firn https <status|install|uninstall>
@@ -1943,6 +2204,12 @@ private func runCLI() throws -> Int32 {
         return try cmdK8s(rest)
     case "machine":
         return try cmdMachine(rest)
+    case "mount":
+        return try cmdMount(rest)
+    case "buildx":
+        return try cmdBuildx(rest)
+    case "socket":
+        return try cmdSocket(rest)
     case "route":
         return try cmdRoute(rest)
     case "freeze":

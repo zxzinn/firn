@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,12 +44,27 @@ type K3sStatus struct {
 	KubeconfigAvailable bool   `json:"kubeconfigAvailable"`
 }
 
+type K8sServiceInfo struct {
+	Name        string   `json:"name"`
+	Namespace   string   `json:"namespace"`
+	ClusterIP   string   `json:"clusterIp"`
+	Type        string   `json:"type"`
+	Ports       []int    `json:"ports"`
+	PrimaryPort int      `json:"primaryPort"`
+	DNSNames    []string `json:"dnsNames"`
+}
+
 type K3sManager struct {
 	mu      sync.Mutex
 	domain  string
 	cmd     *exec.Cmd
 	pid     int
 	version string
+
+	svcMu       sync.Mutex
+	svcCachedAt time.Time
+	svcCache    []K8sServiceInfo
+	dnsCache    []DNSRecord
 }
 
 func NewK3sManager(domain string) *K3sManager {
@@ -260,10 +277,13 @@ func (m *K3sManager) Enable() (K3sStatus, error) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+	ensureK3sNatRules()
+	m.invalidateServiceCache()
 	return m.Status(), nil
 }
 
 func (m *K3sManager) Disable() (K3sStatus, error) {
+	m.invalidateServiceCache()
 	_ = os.Remove(k3sEnabledMarker)
 	m.mu.Lock()
 	pid := m.pid
@@ -393,4 +413,381 @@ func probeK3sAPIReady(timeout time.Duration) bool {
 func (s K3sStatus) ToJSON() []byte {
 	b, _ := json.Marshal(s)
 	return b
+}
+
+func (m *K3sManager) invalidateServiceCache() {
+	m.svcMu.Lock()
+	m.svcCachedAt = time.Time{}
+	m.svcCache = nil
+	m.dnsCache = nil
+	m.svcMu.Unlock()
+}
+
+func ensureK3sNatRules() {
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return
+	}
+	rules := [][]string{
+		{"-t", "nat", "POSTROUTING", "-s", "10.89.0.1/32", "-d", "10.42.0.0/16", "-j", "MASQUERADE"},
+		{"-t", "nat", "POSTROUTING", "-s", "10.89.0.1/32", "-d", "10.43.0.0/16", "-j", "MASQUERADE"},
+		{"FORWARD", "-s", "10.89.0.1/32", "-d", "10.42.0.0/16", "-j", "ACCEPT"},
+		{"FORWARD", "-s", "10.89.0.1/32", "-d", "10.43.0.0/16", "-j", "ACCEPT"},
+		{"FORWARD", "-d", "10.89.0.1/32", "-s", "10.42.0.0/16", "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+	}
+	for _, spec := range rules {
+		var tableArgs, chainAndRule []string
+		if spec[0] == "-t" {
+			tableArgs = spec[:2]
+			chainAndRule = spec[2:]
+		} else {
+			chainAndRule = spec
+		}
+		checkArgs := append(append([]string{}, tableArgs...), append([]string{"-C"}, chainAndRule...)...)
+		if exec.Command("iptables", checkArgs...).Run() == nil {
+			continue
+		}
+		verb := "-A"
+		if len(tableArgs) == 0 {
+			verb = "-I"
+			chainAndRule = append([]string{chainAndRule[0], "1"}, chainAndRule[1:]...)
+		}
+		addArgs := append(append([]string{}, tableArgs...), append([]string{verb}, chainAndRule...)...)
+		_ = exec.Command("iptables", addArgs...).Run()
+	}
+}
+
+type rawK8sServiceList struct {
+	Items []struct {
+		Metadata struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec struct {
+			ClusterIP string `json:"clusterIP"`
+			Type      string `json:"type"`
+			Ports     []struct {
+				Name     string `json:"name"`
+				Port     int    `json:"port"`
+				Protocol string `json:"protocol"`
+			} `json:"ports"`
+		} `json:"spec"`
+	} `json:"items"`
+}
+
+type rawK8sIngressList struct {
+	Items []struct {
+		Metadata struct {
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+		Spec struct {
+			Rules []struct {
+				Host string `json:"host"`
+				HTTP *struct {
+					Paths []struct {
+						Backend struct {
+							Service *struct {
+								Name string `json:"name"`
+								Port struct {
+									Name   string `json:"name"`
+									Number int    `json:"number"`
+								} `json:"port"`
+							} `json:"service"`
+						} `json:"backend"`
+					} `json:"paths"`
+				} `json:"http"`
+			} `json:"rules"`
+		} `json:"spec"`
+	} `json:"items"`
+}
+
+func k3sHTTPClient(timeout time.Duration) *http.Client {
+	cert, ok := loadKubeconfigClientCert(k3sKubeconfigPath)
+	if !ok {
+		return nil
+	}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				Certificates:       []tls.Certificate{cert},
+			},
+		},
+	}
+}
+
+func pickK8sPrimaryPort(ports []int) int {
+	for _, pref := range []int{80, 8080, 3000, 8000, 443, 8443} {
+		for _, p := range ports {
+			if p == pref {
+				return p
+			}
+		}
+	}
+	if len(ports) > 0 {
+		return ports[0]
+	}
+	return 0
+}
+
+func buildK8sDiscovery(svcRaw, ingRaw []byte, domain string) ([]K8sServiceInfo, []DNSRecord) {
+	domain = strings.TrimSuffix(strings.ToLower(domain), ".")
+	if domain == "" {
+		domain = "firn.local"
+	}
+	var sl rawK8sServiceList
+	if len(svcRaw) > 0 {
+		_ = json.Unmarshal(svcRaw, &sl)
+	}
+	var il rawK8sIngressList
+	if len(ingRaw) > 0 {
+		_ = json.Unmarshal(ingRaw, &il)
+	}
+
+	type svcLookupKey struct{ ns, name string }
+	type svcPortMeta struct {
+		info     *K8sServiceInfo
+		byName   map[string]int
+		byNumber map[int]bool
+	}
+	byKey := make(map[svcLookupKey]*svcPortMeta)
+	services := make([]K8sServiceInfo, 0, len(sl.Items))
+
+	for _, item := range sl.Items {
+		ns := strings.TrimSpace(item.Metadata.Namespace)
+		name := strings.TrimSpace(item.Metadata.Name)
+		cip := strings.TrimSpace(item.Spec.ClusterIP)
+		if ns == "" || name == "" || cip == "" || strings.EqualFold(cip, "None") {
+			continue
+		}
+		if ns == "default" && name == "kubernetes" {
+			continue
+		}
+		var tcpPorts []int
+		byName := make(map[string]int)
+		byNum := make(map[int]bool)
+		for _, p := range item.Spec.Ports {
+			if p.Port <= 0 || (p.Protocol != "" && strings.ToUpper(p.Protocol) != "TCP") {
+				continue
+			}
+			if !byNum[p.Port] {
+				tcpPorts = append(tcpPorts, p.Port)
+				byNum[p.Port] = true
+			}
+			if p.Name != "" {
+				byName[p.Name] = p.Port
+			}
+		}
+		if len(tcpPorts) == 0 {
+			continue
+		}
+		dnsNames := []string{
+			sanitizeDNSLabel(name) + "." + sanitizeDNSLabel(ns) + ".k8s." + domain,
+		}
+		if ns == "default" {
+			dnsNames = append(dnsNames, sanitizeDNSLabel(name)+".k8s."+domain)
+		}
+		info := K8sServiceInfo{
+			Name:        name,
+			Namespace:   ns,
+			ClusterIP:   cip,
+			Type:        item.Spec.Type,
+			Ports:       tcpPorts,
+			PrimaryPort: pickK8sPrimaryPort(tcpPorts),
+			DNSNames:    dnsNames,
+		}
+		services = append(services, info)
+		idx := len(services) - 1
+		byKey[svcLookupKey{ns: ns, name: name}] = &svcPortMeta{
+			info:     &services[idx],
+			byName:   byName,
+			byNumber: byNum,
+		}
+	}
+
+	// Merge Kubernetes Ingress host rules pointing into ClusterIP services.
+	var records []DNSRecord
+	ingMatched := make(map[svcLookupKey]bool)
+	for _, ing := range il.Items {
+		ns := strings.TrimSpace(ing.Metadata.Namespace)
+		for _, rule := range ing.Spec.Rules {
+			host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(rule.Host)), ".")
+			if host == "" || rule.HTTP == nil {
+				continue
+			}
+			for _, p := range rule.HTTP.Paths {
+				if p.Backend.Service == nil {
+					continue
+				}
+				meta := byKey[svcLookupKey{ns: ns, name: p.Backend.Service.Name}]
+				if meta == nil {
+					continue
+				}
+				targetPort := meta.info.PrimaryPort
+				if p.Backend.Service.Port.Number > 0 {
+					targetPort = p.Backend.Service.Port.Number
+				} else if p.Backend.Service.Port.Name != "" {
+					if named, ok := meta.byName[p.Backend.Service.Port.Name]; ok {
+						targetPort = named
+					}
+				}
+				dup := false
+				for _, ex := range meta.info.DNSNames {
+					if ex == host {
+						dup = true
+						break
+					}
+				}
+				if !dup && (host == domain || strings.HasSuffix(host, "."+domain)) {
+					meta.info.DNSNames = append(meta.info.DNSNames, host)
+					if targetPort != meta.info.PrimaryPort && targetPort > 0 {
+						records = append(records, DNSRecord{
+							Names:         []string{host},
+							ContainerName: "k8s-" + ns + "-" + meta.info.Name,
+							Project:       "k8s",
+							Service:       meta.info.Name,
+							IP:            meta.info.ClusterIP,
+							HTTPPort:      targetPort,
+						})
+						ingMatched[svcLookupKey{ns: ns, name: meta.info.Name}] = true
+					}
+				}
+			}
+		}
+	}
+
+	sort.Slice(services, func(i, j int) bool {
+		if services[i].Namespace != services[j].Namespace {
+			return services[i].Namespace < services[j].Namespace
+		}
+		return services[i].Name < services[j].Name
+	})
+
+	for _, svc := range services {
+		_ = ingMatched
+		if len(svc.DNSNames) == 0 || svc.PrimaryPort <= 0 {
+			continue
+		}
+		records = append(records, DNSRecord{
+			Names:         svc.DNSNames,
+			ContainerName: "k8s-" + svc.Namespace + "-" + svc.Name,
+			Project:       "k8s",
+			Service:       svc.Name,
+			IP:            svc.ClusterIP,
+			HTTPPort:      svc.PrimaryPort,
+		})
+	}
+	return services, records
+}
+
+func (m *K3sManager) discover(domain string) ([]K8sServiceInfo, []DNSRecord) {
+	if !m.IsRunning() {
+		return nil, nil
+	}
+	if domain == "" {
+		m.mu.Lock()
+		domain = m.domain
+		m.mu.Unlock()
+	}
+	m.svcMu.Lock()
+	if !m.svcCachedAt.IsZero() && time.Since(m.svcCachedAt) < 1500*time.Millisecond {
+		svcs := append([]K8sServiceInfo(nil), m.svcCache...)
+		recs := append([]DNSRecord(nil), m.dnsCache...)
+		m.svcMu.Unlock()
+		return svcs, recs
+	}
+	m.svcMu.Unlock()
+
+	client := k3sHTTPClient(2 * time.Second)
+	if client == nil {
+		return nil, nil
+	}
+	readEndpoint := func(path string) []byte {
+		resp, err := client.Get(fmt.Sprintf("https://127.0.0.1:%d%s", k3sDefaultAPIPort, path))
+		if err != nil {
+			return nil
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		return raw
+	}
+	svcRaw := readEndpoint("/api/v1/services")
+	ingRaw := readEndpoint("/apis/networking.k8s.io/v1/ingresses")
+	svcs, recs := buildK8sDiscovery(svcRaw, ingRaw, domain)
+
+	m.svcMu.Lock()
+	m.svcCachedAt = time.Now()
+	m.svcCache = append([]K8sServiceInfo(nil), svcs...)
+	m.dnsCache = append([]DNSRecord(nil), recs...)
+	m.svcMu.Unlock()
+	return svcs, recs
+}
+
+func (m *K3sManager) DiscoverServices(domain string) []K8sServiceInfo {
+	svcs, _ := m.discover(domain)
+	return svcs
+}
+
+func (m *K3sManager) DiscoverDNSRecords(domain string) []DNSRecord {
+	_, recs := m.discover(domain)
+	return recs
+}
+
+func (m *K3sManager) LoadImages(images []string) (string, error) {
+	cleaned := make([]string, 0, len(images))
+	for _, img := range images {
+		trimmed := strings.TrimSpace(img)
+		if trimmed != "" {
+			cleaned = append(cleaned, trimmed)
+		}
+	}
+	if len(cleaned) == 0 {
+		return "", fmt.Errorf("at least one image reference is required")
+	}
+	if !m.IsRunning() {
+		return "", fmt.Errorf("k3s is not running; run `firn k8s enable` first")
+	}
+
+	saveArgs := append([]string{"save"}, cleaned...)
+	saveCmd := exec.Command("docker", saveArgs...)
+	importCmd := exec.Command(k3sBinPath, "ctr", "-n", "k8s.io", "images", "import", "-")
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return "", err
+	}
+	var saveErrBuf, importOutBuf bytes.Buffer
+	saveCmd.Stdout = pw
+	saveCmd.Stderr = &saveErrBuf
+	importCmd.Stdin = pr
+	importCmd.Stdout = &importOutBuf
+	importCmd.Stderr = &importOutBuf
+
+	if err := saveCmd.Start(); err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return "", fmt.Errorf("start docker save: %w", err)
+	}
+	_ = pw.Close()
+	if err := importCmd.Start(); err != nil {
+		_ = pr.Close()
+		_ = saveCmd.Wait()
+		return "", fmt.Errorf("start k3s ctr import: %w", err)
+	}
+	_ = pr.Close()
+
+	saveErr := saveCmd.Wait()
+	importErr := importCmd.Wait()
+	out := strings.TrimSpace(importOutBuf.String())
+	if saveErr != nil {
+		return out, fmt.Errorf("docker save failed: %w (%s)", saveErr, strings.TrimSpace(saveErrBuf.String()))
+	}
+	if importErr != nil {
+		return out, fmt.Errorf("k3s image import failed: %w (%s)", importErr, out)
+	}
+	m.invalidateServiceCache()
+	return out, nil
 }

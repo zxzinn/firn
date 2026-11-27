@@ -52,16 +52,20 @@ type vsockConn struct {
 }
 
 func tuneVsockSocketBuffers(fd int) {
-	var maxVsockBuf uint64 = 16 << 20
-	var vsockBuf uint64 = 8 << 20
-	_, _, _ = syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferMaxSize, uintptr(unsafe.Pointer(&maxVsockBuf)), 8, 0)
-	_, _, _ = syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferSize, uintptr(unsafe.Pointer(&vsockBuf)), 8, 0)
-	for _, bufBytes := range []int{8 << 20, 4 << 20} {
+	for _, pair := range [][2]uint64{{32 << 20, 16 << 20}, {16 << 20, 8 << 20}} {
+		maxVsockBuf, vsockBuf := pair[0], pair[1]
+		_, _, e1 := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferMaxSize, uintptr(unsafe.Pointer(&maxVsockBuf)), 8, 0)
+		_, _, e2 := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferSize, uintptr(unsafe.Pointer(&vsockBuf)), 8, 0)
+		if e1 == 0 && e2 == 0 {
+			break
+		}
+	}
+	for _, bufBytes := range []int{16 << 20, 8 << 20, 4 << 20} {
 		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bufBytes); err == nil {
 			break
 		}
 	}
-	for _, bufBytes := range []int{8 << 20, 4 << 20} {
+	for _, bufBytes := range []int{16 << 20, 8 << 20, 4 << 20} {
 		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bufBytes); err == nil {
 			break
 		}
@@ -202,7 +206,7 @@ func DialVsockHost(port uint32) (net.Conn, error) {
 
 var copyBufPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, 1024*1024)
+		buf := make([]byte, 2*1024*1024)
 		return &buf
 	},
 }

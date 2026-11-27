@@ -12,6 +12,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,13 +24,37 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
+type firnSyntheticKind uint8
+
+const (
+	syntheticModify firnSyntheticKind = 1 + iota
+	syntheticCreate
+	syntheticMkdir
+	syntheticDelete
+	syntheticRmdir
+)
+
+type firnSyntheticEvent struct {
+	rel string
+}
+
 type firnFSMount struct {
 	server      *fuse.Server
 	client      *firnFSClient
 	root        *firnFSNode
 	cache       *firnFSCache
 	backingDir  string
+	mountPoint  string
+	synthTID    atomic.Uint32
 	renameEpoch atomic.Uint64
+
+	synthMu         sync.RWMutex
+	syntheticNotify map[string]firnSyntheticKind
+	knownDirs       map[string]struct{}
+	recentDel       map[string]time.Time
+	notifyCh        chan firnSyntheticEvent
+	stopCh          chan struct{}
+	stopOnce        sync.Once
 }
 
 func detectVirtioFSBacking() string {
@@ -58,6 +84,109 @@ func (m *firnFSMount) backingPath(rel string) string {
 	return filepath.Join(m.backingDir, filepath.FromSlash(rel))
 }
 
+func (m *firnFSMount) mountFilePath(rel string) string {
+	if rel == "" {
+		return m.mountPoint
+	}
+	return filepath.Join(m.mountPoint, filepath.FromSlash(rel))
+}
+
+func (m *firnFSMount) setSynthetic(rel string, kind firnSyntheticKind) {
+	m.synthMu.Lock()
+	m.syntheticNotify[rel] = kind
+	m.synthMu.Unlock()
+}
+
+func (m *firnFSMount) clearSynthetic(rel string, kind firnSyntheticKind) {
+	m.synthMu.Lock()
+	if cur, ok := m.syntheticNotify[rel]; ok && cur == kind {
+		delete(m.syntheticNotify, rel)
+	}
+	m.synthMu.Unlock()
+}
+
+func (m *firnFSMount) syntheticKindFor(ctx context.Context, rel string) (firnSyntheticKind, bool) {
+	caller, ok := fuse.FromContext(ctx)
+	tid := m.synthTID.Load()
+	if !ok || tid == 0 || caller.Pid != tid {
+		return 0, false
+	}
+	m.synthMu.RLock()
+	kind, exists := m.syntheticNotify[rel]
+	m.synthMu.RUnlock()
+	return kind, exists
+}
+
+func (m *firnFSMount) isSyntheticCallerKind(ctx context.Context, rel string, want firnSyntheticKind) bool {
+	kind, ok := m.syntheticKindFor(ctx, rel)
+	return ok && kind == want
+}
+
+func (m *firnFSMount) markDir(rel string) {
+	if rel == "" {
+		return
+	}
+	m.synthMu.Lock()
+	if m.knownDirs != nil {
+		m.knownDirs[rel] = struct{}{}
+	}
+	if m.recentDel != nil {
+		delete(m.recentDel, rel)
+	}
+	m.synthMu.Unlock()
+}
+
+func (m *firnFSMount) clearRecentDel(rel string) {
+	if rel == "" {
+		return
+	}
+	m.synthMu.Lock()
+	if m.recentDel != nil {
+		delete(m.recentDel, rel)
+	}
+	m.synthMu.Unlock()
+}
+
+func (m *firnFSMount) isKnownDir(rel string) bool {
+	m.synthMu.RLock()
+	_, ok := m.knownDirs[rel]
+	m.synthMu.RUnlock()
+	return ok
+}
+
+func (m *firnFSMount) markDeletedRecently(rel string) bool {
+	now := time.Now()
+	m.synthMu.Lock()
+	defer m.synthMu.Unlock()
+	if m.recentDel == nil {
+		m.recentDel = make(map[string]time.Time)
+	}
+	if prev, ok := m.recentDel[rel]; ok && now.Sub(prev) < 400*time.Millisecond {
+		return false
+	}
+	if len(m.recentDel) > 512 {
+		for k, t := range m.recentDel {
+			if now.Sub(t) >= time.Second {
+				delete(m.recentDel, k)
+			}
+		}
+	}
+	m.recentDel[rel] = now
+	if m.knownDirs != nil {
+		delete(m.knownDirs, rel)
+	}
+	return true
+}
+
+func syntheticStubIno(rel string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(rel); i++ {
+		h ^= uint64(rel[i])
+		h *= 1099511628211
+	}
+	return (h & 0x7fffffffffffffff) | (1 << 62)
+}
+
 func startFirnFS(mountPoint, hostAddr string) (*firnFSMount, error) {
 	_ = syscall.Unmount(mountPoint, syscall.MNT_DETACH)
 	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
@@ -66,8 +195,14 @@ func startFirnFS(mountPoint, hostAddr string) (*firnFSMount, error) {
 	cache := newFirnFSCache(firnFSCacheMaxBytes, firnFSCacheMaxEntries)
 	backing := detectVirtioFSBacking()
 	mountObj := &firnFSMount{
-		cache:      cache,
-		backingDir: backing,
+		cache:           cache,
+		backingDir:      backing,
+		mountPoint:      mountPoint,
+		syntheticNotify: make(map[string]firnSyntheticKind),
+		knownDirs:       make(map[string]struct{}),
+		recentDel:       make(map[string]time.Time),
+		notifyCh:        make(chan firnSyntheticEvent, 4096),
+		stopCh:          make(chan struct{}),
 	}
 
 	var rootNode *firnFSNode
@@ -136,11 +271,17 @@ func startFirnFS(mountPoint, hostAddr string) (*firnFSMount, error) {
 		return nil, err
 	}
 	mountObj.server = srv
-	log.Printf("[firn-guestd] firnfs mounted at %s -> vsock:2385/%s (backing=%q, cache 64MiB + FSEvents)", mountPoint, hostAddr, backing)
+	go mountObj.runSyntheticWorker()
+	log.Printf("[firn-guestd] firnfs mounted at %s -> vsock:2385/%s (backing=%q, cache 64MiB + FSEvents + inotify v3)", mountPoint, hostAddr, backing)
 	return mountObj, nil
 }
 
 func (m *firnFSMount) Unmount() {
+	m.stopOnce.Do(func() {
+		if m.stopCh != nil {
+			close(m.stopCh)
+		}
+	})
 	if m.server != nil {
 		_ = m.server.Unmount()
 	}
@@ -150,9 +291,217 @@ func (m *firnFSMount) Unmount() {
 }
 
 func (m *firnFSMount) notifyKernelInvalidateBatch(rawPaths []string) {
-	seenParents := make(map[*fs.Inode]struct{})
 	for _, raw := range rawPaths {
 		rel := cleanFirnFSRelPath(raw)
+		if m.notifyCh == nil {
+			m.notifyKernelInvalidate(rel)
+			continue
+		}
+		select {
+		case m.notifyCh <- firnSyntheticEvent{rel: rel}:
+		default:
+			m.notifyKernelInvalidate(rel)
+		}
+	}
+}
+
+func (m *firnFSMount) runSyntheticWorker() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	m.synthTID.Store(uint32(syscall.Gettid()))
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case first := <-m.notifyCh:
+			batch := []string{first.rel}
+			seen := map[string]struct{}{first.rel: {}}
+		drainLoop:
+			for len(batch) < 512 {
+				select {
+				case ev := <-m.notifyCh:
+					if _, ok := seen[ev.rel]; !ok {
+						seen[ev.rel] = struct{}{}
+						batch = append(batch, ev.rel)
+					}
+				default:
+					break drainLoop
+				}
+			}
+			m.applySyntheticBatch(batch)
+		}
+	}
+}
+
+func (m *firnFSMount) hostLookup(rel string) (fsAttrWire, bool) {
+	if m.client != nil {
+		var req bytes.Buffer
+		writeShortStr(&req, rel)
+		if resp, err := m.client.call(fsOpLookup, req.Bytes()); err == nil {
+			ec, attr := decodeErrnoAndAttr(resp)
+			return attr, ec == 0
+		}
+	}
+	if full := m.backingPath(rel); full != "" {
+		if attr, ec := lstatLinuxAttr(full); ec == 0 {
+			return attr, true
+		}
+	}
+	return fsAttrWire{}, false
+}
+
+func (m *firnFSMount) applySyntheticBatch(batch []string) {
+	if m.root == nil {
+		return
+	}
+	type pathState struct {
+		rel    string
+		depth  int
+		exists bool
+		attr   fsAttrWire
+	}
+	var deletes, upserts []pathState
+	seenParents := make(map[*fs.Inode]struct{})
+	for _, rel := range batch {
+		if rel == "" {
+			m.notifyKernelInvalidateWithSeen("", seenParents)
+			continue
+		}
+		attr, exists := m.hostLookup(rel)
+		if exists && m.cache != nil {
+			m.cache.PutEntry(rel, attr, nil, false)
+		}
+		ps := pathState{
+			rel:    rel,
+			depth:  strings.Count(rel, "/"),
+			exists: exists,
+			attr:   attr,
+		}
+		if exists {
+			upserts = append(upserts, ps)
+		} else {
+			deletes = append(deletes, ps)
+		}
+	}
+	sort.Slice(deletes, func(i, j int) bool {
+		if deletes[i].depth != deletes[j].depth {
+			return deletes[i].depth > deletes[j].depth
+		}
+		return deletes[i].rel < deletes[j].rel
+	})
+	sort.Slice(upserts, func(i, j int) bool {
+		if upserts[i].depth != upserts[j].depth {
+			return upserts[i].depth < upserts[j].depth
+		}
+		return upserts[i].rel < upserts[j].rel
+	})
+	for _, item := range deletes {
+		m.applySyntheticOne(item.rel, false, fsAttrWire{}, seenParents)
+	}
+	for _, item := range upserts {
+		m.applySyntheticOne(item.rel, true, item.attr, seenParents)
+	}
+}
+
+func (m *firnFSMount) walkParentInode(rel string) (*fs.Inode, string) {
+	if m.root == nil || rel == "" {
+		return nil, ""
+	}
+	parts := strings.Split(rel, "/")
+	parent := &m.root.Inode
+	for i := 0; i < len(parts)-1 && parent != nil; i++ {
+		if parts[i] == "" {
+			continue
+		}
+		parent = parent.GetChild(parts[i])
+	}
+	if parent == nil {
+		return nil, ""
+	}
+	return parent, parts[len(parts)-1]
+}
+
+func (m *firnFSMount) applySyntheticOne(rel string, hostExists bool, attr fsAttrWire, seenParents map[*fs.Inode]struct{}) {
+	select {
+	case <-m.stopCh:
+		return
+	default:
+	}
+	parent, name := m.walkParentInode(rel)
+	if parent == nil || name == "" {
+		return
+	}
+	child := parent.GetChild(name)
+	mountTarget := m.mountFilePath(rel)
+
+	switch {
+	case hostExists && child == nil:
+		m.clearRecentDel(rel)
+		mode := attr.Mode & syscall.S_IFMT
+		if mode == syscall.S_IFDIR {
+			m.markDir(rel)
+			m.setSynthetic(rel, syntheticMkdir)
+			err := os.Mkdir(mountTarget, 0o755)
+			m.clearSynthetic(rel, syntheticMkdir)
+			if err == nil {
+				_ = parent.NotifyContent(0, 0)
+				return
+			}
+		} else if mode == syscall.S_IFREG {
+			m.setSynthetic(rel, syntheticCreate)
+			f, err := os.OpenFile(mountTarget, os.O_CREATE|os.O_WRONLY, 0o644)
+			if err == nil {
+				if attr.Size > 0 {
+					_, _ = f.Write([]byte{0})
+				}
+				_ = f.Close()
+			}
+			m.clearSynthetic(rel, syntheticCreate)
+			if err == nil {
+				_ = parent.NotifyContent(0, 0)
+				return
+			}
+		}
+		m.notifyKernelInvalidateWithSeen(rel, seenParents)
+
+	case hostExists && child != nil:
+		m.clearRecentDel(rel)
+		mode := attr.Mode & syscall.S_IFMT
+		if mode == syscall.S_IFDIR {
+			m.markDir(rel)
+		}
+		if mode == syscall.S_IFREG && !child.IsDir() {
+			m.setSynthetic(rel, syntheticModify)
+			f, err := os.OpenFile(mountTarget, os.O_WRONLY, 0)
+			if err == nil {
+				_, _ = f.Write([]byte{0})
+				_ = f.Close()
+			}
+			m.clearSynthetic(rel, syntheticModify)
+		}
+		m.notifyKernelInvalidateWithSeen(rel, seenParents)
+
+	default:
+		if !m.markDeletedRecently(rel) {
+			return
+		}
+		wasDir := (child != nil && child.IsDir()) || m.isKnownDir(rel)
+		kind := syntheticDelete
+		if wasDir {
+			kind = syntheticRmdir
+		}
+		m.setSynthetic(rel, kind)
+		var delErr error
+		if wasDir {
+			delErr = syscall.Rmdir(mountTarget)
+		} else {
+			delErr = syscall.Unlink(mountTarget)
+		}
+		m.clearSynthetic(rel, kind)
+		if delErr == nil {
+			_ = parent.NotifyContent(0, 0)
+			return
+		}
 		m.notifyKernelInvalidateWithSeen(rel, seenParents)
 	}
 }
@@ -234,10 +583,11 @@ func fstatLinuxAttr(fd int) (fsAttrWire, syscall.Errno) {
 }
 
 type firnFSFileHandle struct {
-	mu   sync.Mutex
-	file *os.File
-	rel  string
-	fsys *firnFSMount
+	mu        sync.Mutex
+	file      *os.File
+	rel       string
+	fsys      *firnFSMount
+	synthetic bool
 }
 
 var (
@@ -248,6 +598,9 @@ var (
 )
 
 func (h *firnFSFileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	if h.synthetic {
+		return fuse.ReadResultData(nil), 0
+	}
 	h.mu.Lock()
 	f := h.file
 	h.mu.Unlock()
@@ -262,6 +615,9 @@ func (h *firnFSFileHandle) Read(ctx context.Context, dest []byte, off int64) (fu
 }
 
 func (h *firnFSFileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	if h.synthetic {
+		return uint32(len(data)), 0
+	}
 	h.mu.Lock()
 	f := h.file
 	h.mu.Unlock()
@@ -281,6 +637,9 @@ func (h *firnFSFileHandle) Write(ctx context.Context, data []byte, off int64) (u
 }
 
 func (h *firnFSFileHandle) Fsync(ctx context.Context, flags uint32) syscall.Errno {
+	if h.synthetic {
+		return 0
+	}
 	h.mu.Lock()
 	f := h.file
 	h.mu.Unlock()
@@ -469,13 +828,37 @@ func (n *firnFSNode) fetchAttr(rel string) (fsAttrWire, syscall.Errno) {
 
 func (n *firnFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	parentRel := n.relPath()
+	childRel := joinFirnFSRel(parentRel, name)
+	if kind, ok := n.fsys.syntheticKindFor(ctx, childRel); ok {
+		switch kind {
+		case syntheticCreate, syntheticMkdir:
+			return nil, syscall.ENOENT
+		case syntheticDelete, syntheticRmdir:
+			mode := uint32(syscall.S_IFREG | 0o644)
+			if kind == syntheticRmdir {
+				mode = uint32(syscall.S_IFDIR | 0o755)
+			}
+			attr := fsAttrWire{
+				Ino:   syntheticStubIno(childRel),
+				Mode:  mode,
+				Nlink: 1,
+			}
+			fillFuseAttr(attr, &out.Attr)
+			out.SetEntryTimeout(time.Second)
+			out.SetAttrTimeout(time.Second)
+			child := n.newChildNode(childRel)
+			return n.NewInode(ctx, child, stableFromWire(attr)), 0
+		}
+	}
 	if n.fsys.cache.IsKnownAbsent(parentRel, name) {
 		return nil, syscall.ENOENT
 	}
-	childRel := joinFirnFSRel(parentRel, name)
 	attr, ec := n.fetchAttr(childRel)
 	if ec != 0 {
 		return nil, ec
+	}
+	if attr.Mode&syscall.S_IFMT == syscall.S_IFDIR {
+		n.fsys.markDir(childRel)
 	}
 	fillFuseAttr(attr, &out.Attr)
 	out.SetEntryTimeout(60 * time.Second)
@@ -506,6 +889,16 @@ func (n *firnFSNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Att
 
 func (n *firnFSNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	rel := n.relPath()
+	if n.fsys.isSyntheticCallerKind(ctx, rel, syntheticModify) || n.fsys.isSyntheticCallerKind(ctx, rel, syntheticCreate) {
+		if full := n.fsys.backingPath(rel); full != "" {
+			if curAttr, ec := lstatLinuxAttr(full); ec == 0 {
+				fillFuseAttr(curAttr, &out.Attr)
+				out.SetTimeout(time.Second)
+				return 0
+			}
+		}
+		return 0
+	}
 	valid := in.Valid
 	atimeNs := int64(in.Atime)*1e9 + int64(in.Atimensec)
 	mtimeNs := int64(in.Mtime)*1e9 + int64(in.Mtimensec)
@@ -643,10 +1036,13 @@ func (n *firnFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 }
 
 func (n *firnFSNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	rel := n.relPath()
+	if n.fsys.isSyntheticCallerKind(ctx, rel, syntheticModify) {
+		return &firnFSFileHandle{rel: rel, fsys: n.fsys, synthetic: true}, fuse.FOPEN_DIRECT_IO, 0
+	}
 	if (flags & (syscall.O_WRONLY | syscall.O_RDWR | syscall.O_TRUNC | syscall.O_APPEND)) == 0 {
 		return nil, fuse.FOPEN_KEEP_CACHE | fuse.FOPEN_NOFLUSH, 0
 	}
-	rel := n.relPath()
 	if full := n.fsys.backingPath(rel); full != "" {
 		oflags := int(flags) &^ (syscall.O_CREAT | syscall.O_EXCL)
 		f, err := os.OpenFile(full, oflags, 0)
@@ -759,6 +1155,28 @@ func (n *firnFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, of
 func (n *firnFSNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	parentRel := n.relPath()
 	childRel := joinFirnFSRel(parentRel, name)
+	if n.fsys.isSyntheticCallerKind(ctx, childRel, syntheticCreate) {
+		var attr fsAttrWire
+		var ec syscall.Errno
+		if cachedAttr, _, _, ok := n.fsys.cache.GetEntry(childRel); ok {
+			attr, ec = cachedAttr, 0
+		} else if childFull := n.fsys.backingPath(childRel); childFull != "" {
+			attr, ec = lstatLinuxAttr(childFull)
+		} else {
+			attr, ec = n.fetchAttr(childRel)
+		}
+		if ec != 0 {
+			return nil, nil, 0, ec
+		}
+		n.fsys.cache.InvalidatePath(childRel)
+		n.fsys.cache.PutEntry(childRel, attr, nil, false)
+		fillFuseAttr(attr, &out.Attr)
+		out.SetEntryTimeout(60 * time.Second)
+		out.SetAttrTimeout(60 * time.Second)
+		child := n.newChildNode(childRel)
+		fh := &firnFSFileHandle{rel: childRel, fsys: n.fsys, synthetic: true}
+		return n.NewInode(ctx, child, stableFromWire(attr)), fh, fuse.FOPEN_DIRECT_IO, 0
+	}
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		oflags := os.O_CREATE | os.O_RDWR | (int(flags) & (syscall.O_EXCL | syscall.O_TRUNC | syscall.O_APPEND))
 		if (flags & syscall.O_WRONLY) != 0 {
@@ -812,6 +1230,29 @@ func (n *firnFSNode) Create(ctx context.Context, name string, flags uint32, mode
 func (n *firnFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	parentRel := n.relPath()
 	childRel := joinFirnFSRel(parentRel, name)
+	if n.fsys.isSyntheticCallerKind(ctx, childRel, syntheticMkdir) {
+		var attr fsAttrWire
+		var ec syscall.Errno
+		if cachedAttr, _, _, ok := n.fsys.cache.GetEntry(childRel); ok {
+			attr, ec = cachedAttr, 0
+		} else if childFull := n.fsys.backingPath(childRel); childFull != "" {
+			attr, ec = lstatLinuxAttr(childFull)
+		} else {
+			attr, ec = n.fetchAttr(childRel)
+		}
+		if ec != 0 {
+			return nil, ec
+		}
+		n.fsys.markDir(childRel)
+		n.fsys.cache.InvalidatePath(childRel)
+		n.fsys.cache.PutEntry(childRel, attr, nil, false)
+		n.fsys.cache.PutDirPrefetch(childRel, nil)
+		fillFuseAttr(attr, &out.Attr)
+		out.SetEntryTimeout(60 * time.Second)
+		out.SetAttrTimeout(60 * time.Second)
+		child := n.newChildNode(childRel)
+		return n.NewInode(ctx, child, stableFromWire(attr)), 0
+	}
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		perm := os.FileMode(mode & 0o7777)
 		if perm == 0 {
@@ -824,6 +1265,7 @@ func (n *firnFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *f
 		if ec != 0 {
 			return nil, ec
 		}
+		n.fsys.markDir(childRel)
 		n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 		n.fsys.cache.PutDirPrefetch(childRel, nil)
 		fillFuseAttr(attr, &out.Attr)
@@ -849,6 +1291,9 @@ func (n *firnFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *f
 	}
 	n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 	n.fsys.cache.PutDirPrefetch(childRel, nil)
+	if attr.Mode&syscall.S_IFMT == syscall.S_IFDIR {
+		n.fsys.markDir(childRel)
+	}
 	fillFuseAttr(attr, &out.Attr)
 	out.SetEntryTimeout(60 * time.Second)
 	out.SetAttrTimeout(60 * time.Second)
@@ -859,6 +1304,10 @@ func (n *firnFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *f
 func (n *firnFSNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	parentRel := n.relPath()
 	childRel := joinFirnFSRel(parentRel, name)
+	if n.fsys.isSyntheticCallerKind(ctx, childRel, syntheticDelete) {
+		n.fsys.cache.InvalidatePath(childRel)
+		return 0
+	}
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		if err := syscall.Unlink(childFull); err != nil {
 			return errToErrno(err)
@@ -883,6 +1332,10 @@ func (n *firnFSNode) Unlink(ctx context.Context, name string) syscall.Errno {
 func (n *firnFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	parentRel := n.relPath()
 	childRel := joinFirnFSRel(parentRel, name)
+	if n.fsys.isSyntheticCallerKind(ctx, childRel, syntheticRmdir) {
+		n.fsys.cache.InvalidatePath(childRel)
+		return 0
+	}
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		if err := syscall.Rmdir(childFull); err != nil {
 			return errToErrno(err)
@@ -975,6 +1428,9 @@ func (n *firnFSNode) Symlink(ctx context.Context, target, name string, out *fuse
 		return nil, ec
 	}
 	n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
+	if attr.Mode&syscall.S_IFMT == syscall.S_IFDIR {
+		n.fsys.markDir(childRel)
+	}
 	fillFuseAttr(attr, &out.Attr)
 	out.SetEntryTimeout(60 * time.Second)
 	out.SetAttrTimeout(60 * time.Second)

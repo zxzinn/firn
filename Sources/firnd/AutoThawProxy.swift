@@ -37,6 +37,7 @@ public final class AutoThawProxy {
     private var lastRecords: [DNSRecordEntry] = []
     private var lastDomain: String = "firn.local"
     private var topologyVersion: UInt64 = 0
+    private var guestTopologyVersion: UInt64 = 0
     private let topoCond = NSCondition()
     private let thawCond = NSCondition()
     private var thawingProjects: Set<String> = []
@@ -152,7 +153,7 @@ public final class AutoThawProxy {
             return false
         }
         topoCond.lock()
-        let since = topologyVersion
+        let since = guestTopologyVersion
         topoCond.unlock()
 
         let path = longPoll ? "/topology?since=\(since)&wait=10" : "/topology"
@@ -164,9 +165,10 @@ public final class AutoThawProxy {
         }
 
         topoCond.lock()
-        let changed = payload.version != topologyVersion
-        if payload.version > topologyVersion {
-            topologyVersion = payload.version
+        let changed = payload.version != guestTopologyVersion
+        if changed {
+            guestTopologyVersion = payload.version
+            topologyVersion &+= 1
             topoCond.broadcast()
         }
         topoCond.unlock()

@@ -274,6 +274,33 @@ func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay, k3sMgr *K3sM
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"kubeconfig": kc, "context": "firn"})
 	})
+	mux.HandleFunc("/k8s/services", func(w http.ResponseWriter, r *http.Request) {
+		svcs := k3sMgr.DiscoverServices(engine.Domain())
+		if svcs == nil {
+			svcs = []K8sServiceInfo{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"services": svcs, "running": k3sMgr.IsRunning()})
+	})
+	mux.HandleFunc("/k8s/load", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		var req struct {
+			Images []string `json:"images"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		out, err := k3sMgr.LoadImages(req.Images)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "output": out})
+			return
+		}
+		_, _ = engine.RefreshTopology(time.Now())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "images": req.Images, "output": out})
+	})
 
 	mux.HandleFunc("/machines", func(w http.ResponseWriter, r *http.Request) {
 		list, err := ListLinuxMachines(engine, engine.Domain())
@@ -309,7 +336,23 @@ func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay, k3sMgr *K3sM
 		name, action, ok := strings.Cut(rest, "/")
 		name, _ = url.PathUnescape(name)
 		if !ok || name == "" || action == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected /machines/<name>/<start|stop|delete>"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected /machines/<name>/<start|stop|delete|clone>"})
+			return
+		}
+		if action == "clone" {
+			var req struct {
+				Target string `json:"target"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if req.Target == "" {
+				req.Target = r.URL.Query().Get("target")
+			}
+			m, err := CloneLinuxMachine(engine, name, req.Target, hostHome)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, m)
 			return
 		}
 		if err := ControlLinuxMachine(engine, name, action); err != nil {
@@ -334,6 +377,20 @@ func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay, k3sMgr *K3sM
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": summary, "disk": engine.DiskUsage()})
+	})
+
+	mux.HandleFunc("/disk/prune", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+		res, err := engine.PruneDisk(all)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
 	})
 
 	mux.HandleFunc("/poweroff", func(w http.ResponseWriter, r *http.Request) {
@@ -434,6 +491,13 @@ func main() {
 		}
 		return nil
 	}
+	engine.extraDNSFn = func(domain string) []DNSRecord {
+		if !k3sMgr.IsRunning() {
+			return nil
+		}
+		return k3sMgr.DiscoverDNSRecords(domain)
+	}
+	engine.k3sRunningFn = k3sMgr.IsRunning
 	engine.capabilitiesFn = func() GuestCapabilities {
 		_, kvmErr := os.Stat("/dev/kvm")
 		_, driErr := os.Stat("/dev/dri")

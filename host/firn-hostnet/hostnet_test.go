@@ -399,4 +399,7 @@ func TestFullStackTCPAndFirnFSRPC(t *testing.T) {
 	if gotSz := binary.BigEndian.Uint64(respBody[12:20]); gotSz != uint64(len("firn-jumbo-payload")) {
 		t.Fatalf("expected sample.bin size %d, got %d", len("firn-jumbo-payload"), gotSz)
 	}
+	if eng.rawEP.Capabilities()&stack.CapabilityRXChecksumOffload == 0 {
+		t.Fatal("expected dgramL2Endpoint to enable CapabilityRXChecksumOffload")
+	}
 }

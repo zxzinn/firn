@@ -3,7 +3,7 @@ SWIFT_BUILD_FLAGS ?=
 SWIFT_REL_BIN := $(shell swift build $(SWIFT_BUILD_FLAGS) -c release --show-bin-path 2>/dev/null || echo .build/out/Products/Release)
 GO ?= $(shell if go version >/dev/null 2>&1; then echo go; else echo "mise exec go@1.27.4 -- go"; fi)
 
-.PHONY: all build hostnet swift rootfs test clean
+.PHONY: all build hostnet swift rootfs test e2e clean
 
 all: build
 
@@ -37,9 +37,9 @@ swift:
 	  '    <key>CFBundleName</key>' \
 	  '    <string>Firn</string>' \
 	  '    <key>CFBundleShortVersionString</key>' \
-	  '    <string>0.5.0</string>' \
+	  '    <string>0.6.0</string>' \
 	  '    <key>CFBundleVersion</key>' \
-	  '    <string>0.5.0</string>' \
+	  '    <string>0.6.0</string>' \
 	  '    <key>LSUIElement</key>' \
 	  '    <true/>' \
 	  '</dict>' \
@@ -54,6 +54,9 @@ test:
 	cd guest/firn-guestd && $(GO) test -race -count=1 -v ./...
 	cd guest/firn-guestd && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) vet ./...
 	swift run $(SWIFT_BUILD_FLAGS) FirnCoreCheck
+
+e2e:
+	bash scripts/e2e.sh
 
 clean:
 	rm -rf .build build guest/firn-guestd-bin

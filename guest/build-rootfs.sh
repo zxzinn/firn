@@ -33,7 +33,7 @@ else
 fi
 
 echo "[firn-rootfs] building Alpine 3.21 rootfs, kernel Image, and initramfs via Docker (${DOCKER_ARGS[*]:-default})..."
-docker "${DOCKER_ARGS[@]}" run --rm --platform linux/arm64 -i \
+docker ${DOCKER_ARGS[@]+"${DOCKER_ARGS[@]}"} run --rm --platform linux/arm64 -i \
   -v "$SCRIPT_DIR:/work:ro" \
   -v "$OUT_DIR:/out" \
   alpine:3.21 sh -euxo pipefail -c '
@@ -80,6 +80,7 @@ EOF
   "storage-driver": "overlay2",
   "userland-proxy": false,
   "bip": "10.87.0.1/24",
+  "host-gateway-ip": "10.89.0.1",
   "dns": ["10.87.0.1"],
   "exec-opts": ["native.cgroupdriver=cgroupfs"],
   "log-driver": "json-file",

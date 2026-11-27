@@ -79,7 +79,7 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
     }
 
     private static func tuneDgramPairFD(_ fd: Int32) {
-        for (rcv, snd) in [(4 << 20, 1 << 20), (2 << 20, 512 << 10), (1 << 20, 256 << 10)] {
+        for (rcv, snd) in [(4 << 20, 4 << 20), (4 << 20, 2 << 20), (4 << 20, 1 << 20), (2 << 20, 1 << 20)] {
             var r = Int32(rcv)
             var s = Int32(snd)
             _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &r, socklen_t(MemoryLayout<Int32>.size))
@@ -87,6 +87,12 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
                 break
             }
         }
+    }
+
+    private static func encodeMountKernelParam(_ guestPath: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "/._-")
+        return guestPath.addingPercentEncoding(withAllowedCharacters: allowed) ?? guestPath
     }
 
     private func buildConfiguration(truncateSerial: Bool) throws -> (vzConfig: VZVirtualMachineConfiguration, hostSocketpairFD: Int32?) {
@@ -104,10 +110,25 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
         vzConfig.memorySize = max(VZVirtualMachineConfiguration.minimumAllowedMemorySize, min(config.maxMemoryBytes, VZVirtualMachineConfiguration.maximumAllowedMemorySize))
 
         let homePath = fm.homeDirectoryForCurrentUser.path
+        var activeExtraMounts: [(idx: Int, hostPath: String, guestPath: String, readOnly: Bool)] = []
+        for (idx, mount) in config.extraMounts.enumerated() {
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: mount.hostPath, isDirectory: &isDir), isDir.boolValue {
+                let targetGuest = mount.guestPath.isEmpty ? mount.hostPath : mount.guestPath
+                activeExtraMounts.append((idx: idx, hostPath: mount.hostPath, guestPath: targetGuest, readOnly: mount.readOnly))
+            }
+        }
         let netMode = (useFastNet && onVMNetSocketPairReady != nil) ? "jumbo" : "nat"
         let bootLoader = VZLinuxBootLoader(kernelURL: FirnPaths.kernelURL)
         bootLoader.initialRamdiskURL = FirnPaths.initramfsURL
-        bootLoader.commandLine = "console=hvc0 root=/dev/vda rootfstype=ext4 rw init=/sbin/init firn.home=\(homePath) firn.fs=\(config.fsMode) firn.net=\(netMode) quiet"
+        var cmdLine = "console=hvc0 root=/dev/vda rootfstype=ext4 rw init=/sbin/init firn.home=\(homePath) firn.fs=\(config.fsMode) firn.net=\(netMode)"
+        if !activeExtraMounts.isEmpty {
+            let encodedSpecs = activeExtraMounts.map { item in
+                "\(item.idx):\(Self.encodeMountKernelParam(item.guestPath)):\(item.readOnly ? "ro" : "rw")"
+            }.joined(separator: ",")
+            cmdLine += " firn.mounts=\(encodedSpecs)"
+        }
+        bootLoader.commandLine = "\(cmdLine) quiet"
         vzConfig.bootLoader = bootLoader
 
         let platform = VZGenericPlatformConfiguration()
@@ -194,6 +215,12 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
             }
         }
         #endif
+        for item in activeExtraMounts {
+            let shared = VZSharedDirectory(url: URL(fileURLWithPath: item.hostPath), readOnly: item.readOnly)
+            let mountCfg = VZVirtioFileSystemDeviceConfiguration(tag: "firn-mount-\(item.idx)")
+            mountCfg.share = VZSingleDirectoryShare(directory: shared)
+            fsDevices.append(mountCfg)
+        }
         vzConfig.directorySharingDevices = fsDevices
 
         try vzConfig.validate()

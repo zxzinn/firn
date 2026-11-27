@@ -83,17 +83,40 @@ sysctl -w fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true
 HOST_HOME=""
 FS_MODE="firnfs"
 NET_MODE="jumbo"
+EXTRA_MOUNTS=""
 for token in $(cat /proc/cmdline); do
   case "$token" in
     firn.home=*) HOST_HOME="${token#firn.home=}" ;;
     firn.fs=*) FS_MODE="${token#firn.fs=}" ;;
     firn.net=*) NET_MODE="${token#firn.net=}" ;;
+    firn.mounts=*) EXTRA_MOUNTS="${token#firn.mounts=}" ;;
   esac
 done
 
 # Always keep VirtioFS mounted as fallback backing at /mnt/virtiofs-home.
 mkdir -p /mnt/virtiofs-home
 mount -t virtiofs -o noatime,nodiratime host-home /mnt/virtiofs-home 2>/dev/null || true
+
+# Mount any optional user-configured extra host directories via VirtioFS tags firn-mount-<idx>.
+if [ -n "$EXTRA_MOUNTS" ]; then
+  OLD_IFS="$IFS"
+  IFS=','
+  for spec in $EXTRA_MOUNTS; do
+    [ -z "$spec" ] && continue
+    tag_idx="${spec%%:*}"
+    rest="${spec#*:}"
+    enc_path="${rest%%:*}"
+    mode_flag="${rest##*:}"
+    guest_path="$(printf '%b' "$(printf '%s' "$enc_path" | sed 's/%/\\x/g')")"
+    if [ -n "$guest_path" ]; then
+      mkdir -p "$guest_path" 2>/dev/null || true
+      mnt_opts="noatime,nodiratime"
+      [ "$mode_flag" = "ro" ] && mnt_opts="ro,$mnt_opts"
+      mount -t virtiofs -o "$mnt_opts" "firn-mount-$tag_idx" "$guest_path" 2>/dev/null || true
+    fi
+  done
+  IFS="$OLD_IFS"
+fi
 
 # Register Rosetta x86_64 binfmt_misc if shared by Virtualization.framework.
 mkdir -p /mnt/rosetta

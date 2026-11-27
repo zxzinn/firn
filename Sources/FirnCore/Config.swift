@@ -1,5 +1,17 @@
 import Foundation
 
+public struct FirnExtraMount: Codable, Sendable, Equatable {
+    public var hostPath: String
+    public var guestPath: String
+    public var readOnly: Bool
+
+    public init(hostPath: String, guestPath: String = "", readOnly: Bool = false) {
+        self.hostPath = hostPath
+        self.guestPath = guestPath.isEmpty ? hostPath : guestPath
+        self.readOnly = readOnly
+    }
+}
+
 public struct FirnConfig: Codable, Sendable, Equatable {
     public var cpus: Int
     public var memoryGiB: Int
@@ -17,6 +29,8 @@ public struct FirnConfig: Codable, Sendable, Equatable {
     public var backend: String
     public var gpu: Bool
     public var directRouteDNS: Bool
+    public var extraMounts: [FirnExtraMount]
+    public var autoTrimMinutes: Int
 
     public init(
         cpus: Int = 8,
@@ -34,7 +48,9 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         hibernateSeconds: Int = 0,
         backend: String = "vz",
         gpu: Bool = false,
-        directRouteDNS: Bool = false
+        directRouteDNS: Bool = false,
+        extraMounts: [FirnExtraMount] = [],
+        autoTrimMinutes: Int = 60
     ) {
         self.cpus = cpus
         self.memoryGiB = memoryGiB
@@ -52,6 +68,8 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         self.backend = backend
         self.gpu = gpu
         self.directRouteDNS = directRouteDNS
+        self.extraMounts = extraMounts
+        self.autoTrimMinutes = autoTrimMinutes
     }
 
     public init(from decoder: Decoder) throws {
@@ -73,6 +91,8 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         self.backend = try c.decodeIfPresent(String.self, forKey: .backend) ?? d.backend
         self.gpu = try c.decodeIfPresent(Bool.self, forKey: .gpu) ?? d.gpu
         self.directRouteDNS = try c.decodeIfPresent(Bool.self, forKey: .directRouteDNS) ?? d.directRouteDNS
+        self.extraMounts = try c.decodeIfPresent([FirnExtraMount].self, forKey: .extraMounts) ?? d.extraMounts
+        self.autoTrimMinutes = try c.decodeIfPresent(Int.self, forKey: .autoTrimMinutes) ?? d.autoTrimMinutes
     }
 
     public static var defaultDockerContext: String {
@@ -119,6 +139,7 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         if let raw = env["FIRN_BACKEND"], raw == "vz" || raw == "krun" { cfg.backend = raw }
         if let raw = env["FIRN_GPU"], let b = parseEnvBool(raw) { cfg.gpu = b }
         if let raw = env["FIRN_DIRECT_ROUTE_DNS"], let b = parseEnvBool(raw) { cfg.directRouteDNS = b }
+        if let raw = env["FIRN_AUTO_TRIM_MINUTES"], let val = Int(raw), val >= 0 { cfg.autoTrimMinutes = val }
         return cfg
     }
 

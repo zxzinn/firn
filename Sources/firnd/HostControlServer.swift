@@ -295,7 +295,7 @@ public final class HostControlServer {
                 "subnets": ["10.87.0.0/24", "10.88.0.0/16"],
             ])
         }
-        if path == "/k8s/status" || path == "/k8s/kubeconfig" || path == "/machines" {
+        if path == "/k8s/status" || path == "/k8s/kubeconfig" || path == "/k8s/services" || path == "/machines" {
             do {
                 let (code, raw) = try bridge.guestHTTP(method: "GET", path: fullTarget, timeoutSeconds: 15.0)
                 return (code, raw)
@@ -304,7 +304,7 @@ public final class HostControlServer {
             }
         }
         if method == "POST" && (path.hasPrefix("/k8s/") || path.hasPrefix("/machines/") || path == "/machines") {
-            let timeout = (path == "/k8s/enable" || path == "/machines/create") ? 180.0 : 30.0
+            let timeout = (path == "/k8s/enable" || path == "/k8s/load" || path == "/machines/create" || path.hasSuffix("/clone")) ? 180.0 : 30.0
             do {
                 let (code, raw) = try bridge.guestHTTP(method: "POST", path: fullTarget, body: body.isEmpty ? nil : body, timeoutSeconds: timeout)
                 autoThaw.syncTopologyNow()
@@ -366,10 +366,11 @@ public final class HostControlServer {
             }
             return jsonResponse(out)
         }
-        if method == "POST" && path == "/disk/trim" {
+        if method == "POST" && (path == "/disk/trim" || path == "/disk/prune") {
             let before = FirnHostClient.hostSparseFileStats()
+            let timeout = (path == "/disk/prune") ? 120.0 : 60.0
             do {
-                let (code, raw) = try bridge.guestHTTP(method: "POST", path: "/disk/trim", timeoutSeconds: 60.0)
+                let (code, raw) = try bridge.guestHTTP(method: "POST", path: fullTarget, timeoutSeconds: timeout)
                 let after = FirnHostClient.hostSparseFileStats()
                 if var dict = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] {
                     dict["hostAllocatedBeforeBytes"] = before.allocatedBytes
@@ -408,6 +409,19 @@ public final class HostControlServer {
                 if let nv = req["nestedVirtualization"] as? Bool { next.nestedVirtualization = nv }
                 if let hib = (req["hibernateSeconds"] as? NSNumber)?.intValue, hib >= 0 { next.hibernateSeconds = hib }
                 if let drd = req["directRouteDNS"] as? Bool { next.directRouteDNS = drd }
+                if let atm = (req["autoTrimMinutes"] as? NSNumber)?.intValue, atm >= 0 { next.autoTrimMinutes = atm }
+                if let mountsRaw = req["extraMounts"] as? [[String: Any]] {
+                    var parsedMounts: [FirnExtraMount] = []
+                    for item in mountsRaw {
+                        guard let hostPath = item["hostPath"] as? String else { continue }
+                        let trimmedHost = hostPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmedHost.isEmpty else { continue }
+                        let guestPath = (item["guestPath"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        let ro = (item["readOnly"] as? Bool) ?? false
+                        parsedMounts.append(FirnExtraMount(hostPath: trimmedHost, guestPath: guestPath, readOnly: ro))
+                    }
+                    next.extraMounts = parsedMounts
+                }
                 liveConfig = next
                 stateLock.unlock()
 
@@ -427,7 +441,7 @@ public final class HostControlServer {
                     }
                     autoThaw.syncTopologyNow()
                 }
-                let restartNeeded = (prev.cpus != next.cpus || prev.memoryGiB != next.memoryGiB || prev.domain != next.domain || prev.diskSyncMode != next.diskSyncMode || prev.fsMode != next.fsMode || prev.nestedVirtualization != next.nestedVirtualization)
+                let restartNeeded = (prev.cpus != next.cpus || prev.memoryGiB != next.memoryGiB || prev.domain != next.domain || prev.diskSyncMode != next.diskSyncMode || prev.fsMode != next.fsMode || prev.nestedVirtualization != next.nestedVirtualization || prev.extraMounts != next.extraMounts)
                 if let cfgObj = (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(next))) as? [String: Any] {
                     var resp = cfgObj
                     resp["restartRequired"] = restartNeeded

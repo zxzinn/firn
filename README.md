@@ -2,18 +2,17 @@
 
 [繁體中文](./README.zh-TW.md)
 
-**Firn** is an open-source, lightweight macOS Docker, Kubernetes, and Linux VM runtime built natively in Swift and Go on Apple's `Virtualization.framework` (`VZVirtualMachine`), `virtio-vsock`, jumbo `virtio-net` (`MTU 16384`), hybrid `firnfs` v2, and Rosetta (`x86_64`).
+**Firn** is an open-source, lightweight macOS Docker, Kubernetes, and Linux VM runtime built natively in Swift and Go on Apple's `Virtualization.framework` (`VZVirtualMachine`), `virtio-vsock`, jumbo `virtio-net` (`MTU 16384`), hybrid `firnfs` v3, and Rosetta (`x86_64`).
 
-It installs cleanly with a single command (zero `zstd` or host `e2fsprogs` dependency, auto-pulling guest images and creating a `120 GiB` APFS sparse disk on first `firn up`) and delivers **~1.5–2.0s guest boot / ~2.0–2.5s cold `firn up`**, **~0.4–5.6% idle host CPU**, **`6,950 req/s` HTTP/1.1 keep-alive**, **`2.51 ms` local `:8443` HTTPS (`3,679 req/s` conn/req)**, **`0.132 ms` PostgreSQL `SELECT 1` RTT**, **`365–423 ms` cold 1,000-file walks / `98 ms` in-container reads via Depth-2 prefetch `firnfs` + 150ms `FSEvents` self-echo suppression**, **APFS VM state hibernation (`759.6 MiB -> 20.3 MiB`, `0 MiB` VM XPC footprint, `1.47s` resume)**, **built-in `k3s` Kubernetes (`firn k8s`)**, **multi-distro Linux machines (`firn machine`)**, **optional `utun` direct container IP routing**, **opt-in `--nested-kvm` (`/dev/kvm`)**, **Metal/Vulkan GPU acceleration via `krunkit`**, and a **native Menu Bar app (`Firn.app`) with CoreGraphics sparklines, streaming logs & update notifications**.
+It installs cleanly with a single command (zero `zstd` or host `e2fsprogs` dependency, auto-pulling guest images and creating a `120 GiB` APFS sparse disk on first `firn up`) and delivers **~1.9–2.9s clean cold `firn up`**, **`6,194–6,950 req/s` HTTP/1.1 keep-alive**, **`2.51 ms` local `:8443` HTTPS**, **`0.132–0.133 ms` PostgreSQL `SELECT 1` RTT**, **`385 ms` 1,000-file walks / `73–77 ms` reads + live kernel `inotify` HMR via `firnfs` v3**, **APFS VM hibernation (`760–861 MiB -> 20–24 MiB`, `0 MiB` VM XPC footprint, `1.32–1.47s` resume)**, **zero-config `k3s` Kubernetes (`firn k8s` + `https://*.k8s.firn.local:8443`)**, **multi-distro Linux machines with snapshot cloning (`firn machine`)**, **multi-arch Buildx with Rosetta (`firn buildx`)**, **extra VirtioFS host mounts (`firn mount`)**, **`utun` direct routing**, **opt-in `--nested-kvm`**, **Metal/Vulkan GPU (`krunkit`)**, and a **native Menu Bar Control Center (`Firn.app`)**.
 
 ## Why Firn?
 
-- **Zero VM footprint on hibernate & session-safe auto-hibernate**: Event-driven Docker `/events` long-polling keeps an awake VM at low CPU (`0.4%` quiescent). Calling `firn hibernate` (or setting `firn up --hibernate-seconds N` / `FIRN_HIBERNATE_SECONDS`) waits for zero active vsock/auto-thaw connections, saves VM state to APFS (`saveMachineStateTo`), and tears down the `VZVirtualMachine` XPC process—dropping host footprint from **`759.6 MiB` to `20.3 MiB` (`0 MiB` VM footprint)** while transparently resuming (`1.47s` on warm APFS cache) on the next `docker` or `*.firn.local` request.
-- **`firnfs` v2 Depth-2 streaming prefetch + live macOS coherency**: Combines asynchronous Depth-2 subdirectory streaming (`fsOpPushPrefetch = 0x81`, skipping `.git` / `node_modules` / `.cache`), `FOPEN_CACHE_DIR`, `FOPEN_NOFLUSH`, negative entry lookups, a **64 MiB LRU cache**, and macOS **`FSEvents`** push invalidation with `150ms` local write self-echo suppression—cutting cold 1,000-file walks by **`2.0–2.3×` (`365–423 ms`)**, keeping 1,000-file reads under `100 ms` (`78–98.5 ms`), and lifting `500 × 4 KiB` create+write+remove throughput through `/mnt/virtiofs-home` (`266.7 ms` in-container / `570.1 ms` wall).
-- **Pooled `1 MiB` full-duplex `AF_VSOCK` splicing**: Reusable page-aligned `1 MiB` buffer pools in `StreamBufferPool` with `16 MiB` max / `8 MiB` target guest `SO_VM_SOCKETS_BUFFER` windows deliver up to **`6,950.3 req/s`** HTTP/1.1 Keep-Alive (`p50 2.03 ms`), **`4,454.2 req/s`** conn/req, **`0.132 ms`** PG `SELECT 1` RTT, **`398 MiB/s`** PG bulk queries, and **`921–969 MiB/s`** raw TCP.
-- **Standalone Go `firn-hostnet` engine (zero `vmenet*` consumption)**: Uses a connected `AF_UNIX SOCK_DGRAM` `socketpair` with `MTU 16384` (`VZFileHandleNetworkDeviceAttachment`) + gVisor L2/L3 netstack and dynamic in-memory TLS leaf cert minting—serving local `https://*.firn.local:8443` in **`2.51 ms` (`3,678.9 req/s`)** and sustained outbound container HTTPS even on hosts with `251` `vmenet*` interfaces.
-- **Zero-dependency install & hardened self-update**: Install via a single `curl | bash` script or Homebrew, let `firn up` automatically fetch signed/checksummed guest images and allocate sparse `data.ext4` without external tools, inspect with `firn images status`, and self-update safely via `firn upgrade` (SHA-256 verification of macOS + Linux archives before touching the daemon, `codesign` virtualization entitlement verification, atomic `.bak` rollback, and `FirnBar` menu notifications).
-- **Built-in Kubernetes, Linux Machines, Nested KVM, `utun` & Metal GPU**: One-command `firn k8s enable` (`k3s v1.31.6+k3s1`, safe kubeconfig merge preserving existing `current-context`), persistent `firn machine` environments (`ubuntu`, `debian`, `alpine`, `arch`, `fedora`), opt-in `--nested-kvm` (`/dev/kvm`), non-conflicting `firn route` direct `10.87.0.0/24` + `10.88.0.0/16` routing, and optional `libkrun`/`krunkit` VirtIO-GPU Venus acceleration.
+- **Zero VM footprint on hibernate & session-safe auto-hibernate**: Event-driven Docker `/events` long-polling keeps an awake VM at low CPU (`2.9%` idle on an active host vs `149.3%` on same-host OrbStack Helper). Calling `firn hibernate` (or setting `firn up --hibernate-seconds N` / `FIRN_HIBERNATE_SECONDS`) waits for zero active vsock/auto-thaw connections, saves VM state to APFS (`saveMachineStateTo`), and tears down the `VZVirtualMachine` XPC process—dropping host footprint from **`861 MiB` to `23 MiB` (`0 MiB` VM XPC)** while transparently resuming (`1.32–1.87s`) and automatically shrinking the balloon (`convergeAfterResume`) + reconnecting `firnfs`.
+- **`firnfs` v3 live kernel `inotify` HMR + Depth-2 streaming prefetch**: Combines asynchronous Depth-2 subdirectory streaming (`fsOpPushPrefetch = 0x81`, skipping `.git` / `node_modules` / `.cache`), a **64 MiB LRU cache**, direct APFS `fsOpLookup` coherency, and a synthetic FUSE VFS notification worker (`FOPEN_DIRECT_IO` + `syscall.Gettid()`) that delivers native Linux kernel `IN_CREATE`, `IN_MODIFY`, `IN_CLOSE_WRITE`, `IN_DELETE`, and `IN_ISDIR` events inside containers on macOS host edits (`73–77 ms` 1,000-file reads, `239–274 ms` for `500 × 4 KiB` create+write+remove).
+- **Pooled `AF_VSOCK` & `firn-hostnet` Jumbo-16K L2/L3 network**: Full-duplex `AF_VSOCK` splicing (`32/16 MiB` socket buffer window attempt + pooled `1–2 MiB` buffers) delivers **`878.6 / 833.1 MiB/s`** raw TCP 128 MiB (`6,193.9 req/s` HTTP Keep-Alive, `0.133 ms` PG RTT, `365.8 MiB/s` PG bulk), paired with standalone Go `firn-hostnet` (`MTU 16384` `socketpair`, `CapabilityRXChecksumOffload`, zero `vmenet*` interfaces), resolving `host.docker.internal` / `host.firn.internal` to `10.89.0.1`, local `:8443` HTTPS, and `*.k8s.firn.local` ingress.
+- **Zero-config Kubernetes, Linux Machines, Buildx Rosetta, Nested KVM & Disk Ops**: One-command `firn k8s enable` + `firn k8s load` auto-discovers ClusterIP Services and Ingresses at `https://<svc>.<ns>.k8s.firn.local:8443`; `firn machine` supports `create`/`clone`/`shell` (`ubuntu`/`debian`/`alpine`/`arch`/`fedora`); `firn buildx setup` configures `linux/arm64,linux/amd64` multi-arch builds via Rosetta; `firn mount` manages extra VirtioFS host shares; `firn disk` reports Docker `/system/df` breakdown with online `fstrim`, `prune`, and background idle auto-trim (`autoTrimMinutes`).
+- **Zero-dependency distribution & automated regression gating**: Install via a single `curl | bash` script or Homebrew, upgrade safely with `firn upgrade`, control stacks/containers/k8s/machines/disk directly from `Firn.app` (`FirnBar`), and validate end-to-end via `make e2e`.
 
 ## Install & Quick Start
 
@@ -53,58 +52,57 @@ build/firn k8s enable && kubectl --context firn get nodes
 build/firn context use
 ```
 
-## Benchmarks (v0.5.0, Apple Silicon macOS)
+## Benchmarks (v0.6.0, Apple Silicon macOS)
 
-Reproducible suite (`scripts/benchmark.py`) run on **Apple M5 Max** (18-core CPU, 36.0 GiB RAM, macOS 27.2.1, Docker `29.8.2`, Compose `5.5.0`, `251` host `vmenet*` interfaces present):
+Reproducible suite (`scripts/benchmark.py`) run on **Apple M5 Max** (18-core CPU, 36.0 GiB RAM, macOS 27.2.1, Docker `29.8.2`, Compose `5.5.0`):
 
 ```sh
 python3 scripts/benchmark.py --contexts firn        # Benchmark Firn runtime
 python3 scripts/benchmark.py --compare              # Side-by-side firn vs orbstack table
 python3 scripts/benchmark.py --json                 # Full structured JSON report
+make e2e                                            # Full E2E verification (inotify, k8s, Rosetta, clone, disk)
 ```
 
-> **Measurement context**: `Firn v0.5.0` was evaluated live under heavy concurrent workstation CPU contention (`load average: 19.0–32.6` with external `node`/`Keynote`/Spotlight and OrbStack hosting 9 background stacks / 62 containers at `89.6–293.2%` CPU). `Firn v0.5.0` Cat 3–4 figures show the dedicated tuned run (`load 30.2–32.6`) alongside Cat 1–2 & 5–7 from the full suite run (`load 21.9–27.4`), compared directly against a same-moment OrbStack Cat 3–4 run on that exact loaded host plus prior quiescent `v0.4.0` / `OrbStack` baselines.
+> **Measurement context**: `Firn v0.6.0` figures include clean isolated Cat 3–5 + hibernate/resume runs (`clean`) alongside a full Cat 1–7 suite execution under heavy concurrent OrbStack CPU contention (`OrbStack Helper 149.3% CPU / 1,867.4 MiB RSS`), compared against prior `Firn v0.5.0` and `OrbStack` reference baselines.
 
 ### Categories 1–6: Cross-Runtime Comparison
 
-| Category | Metric | Firn v0.5.0 (live M5 Max) | Firn v0.4.0 (quiescent) | OrbStack (same-moment / ref) |
+| Category | Metric | Firn v0.6.0 (clean / Cat 1–7 loaded) | Firn v0.5.0 | OrbStack (ref) |
 | --- | --- | --- | --- | --- |
-| **1. Lifecycle & CLI** | `docker version` (5x median) | `44.87 ms` | **`21.26 ms`** | `22.5 ms` |
-| | `docker run --rm alpine:3.21 true` (5x median) | `454.42 ms` | **`379.75 ms`** | `477.6 ms` |
-| | `docker run --rm --entrypoint true postgres:18-alpine` (5x median) | `700.35 ms` | `460.64 ms` | **`408.4 ms`** |
-| | 3-service Compose warm `up -d --wait` (`postgres` + `valkey` + `mailpit`) | `2,289.48 ms` | `2,391.66 ms` | **`2,072.9 ms`** |
-| | 3-service Compose `down -v --remove-orphans` | `1,823.49 ms` | `1,582.06 ms` | **`825.5 ms`** |
-| **2. Volume Disk I/O** | Sequential Write 256 MiB (`dd ... bs=1M count=256 conv=fsync`) | `1,100.9 MiB/s` (`232.54 ms`) | **`1,814.6 MiB/s`** (`141.1 ms`) | `1,724.3 MiB/s` (`148.5 ms`) |
-| | Sequential Read 256 MiB (`dd`, page-cached post-write) | **`5,169.9 MiB/s`** (`49.52 ms`) | `3,728.4 MiB/s` (`68.7 ms`) | `4,913.7 MiB/s` (`52.1 ms`) |
-| | Small-file burst (`1,000 × 4 KiB` create + write + `fsync` + unlink) | `1,393.5 ms` (`717.6 ops/s`) | **`836.4 ms` (`1,195.6 ops/s`)** | `1,654.9 ms` (`604.3 ops/s`) |
-| **3. Host Shared FS** | 1,000-file tree walk (`find /work -type f`, cold / 3x median) | **`365.21 ms` cold / `368.89 ms` med** | `849.5 ms` cold / `441.1 ms` med | `3,020.8 ms` cold / `1,181.6 ms` med (same-moment) |
-| | Read all 1,000 files (in-container / wall) | `98.51 ms` (`498.26 ms` wall) | `78.0 ms` (`409.7 ms` wall) | **`61.13 ms`** (`983.8 ms` wall, same-moment) |
-| | Create + write + remove `500 × 4 KiB` files (in-container / wall) | **`266.72 ms`** (**`570.06 ms`** wall) | `383.6 ms` (`759.6 ms` wall) | `283.22 ms` (`1,067.0 ms` wall, same-moment) |
-| **4. Host ↔ Container Net** | Raw TCP 128 MiB Host → Container | `908.9 MiB/s` (`140.83 ms`) | `921.4 MiB/s` (`138.9 ms`) | **`2,360.3 MiB/s`** (`54.2 ms` ref) |
-| | Raw TCP 128 MiB Container → Host | `726.8 MiB/s` (`176.12 ms`) | `969.0 MiB/s` (`132.1 ms`) | **`4,172.3 MiB/s`** (`30.7 ms` ref) |
-| | HTTP/1.1 Keep-Alive (500 req, c=16, Mailpit `/api/v1/info`) | **`6,950.3 req/s`** (`p50 2.032 ms`) | `5,197.8 req/s` (`p50 2.63 ms`) | `2,180.7 req/s` (same-moment) |
-| | HTTP/1.1 Conn-per-req (500 req, c=16, Mailpit `/api/v1/info`) | **`4,454.2 req/s`** (`p50 3.376 ms`) | `4,061.7 req/s` (`p50 3.65 ms`) | `1,458.4 req/s` (same-moment) |
-| | Local HTTPS `https://mailpit.<stack>.firn.local:8443/api/v1/info` | **`HTTP 200` (`2.51 ms`**, **`3,678.9 req/s`** `c=16`) | `HTTP 200` (`3.05 ms`, `2,981.8 req/s`) | — |
-| | PostgreSQL `200x SELECT 1` RTT (avg / p50 / p95) | **`0.132 / 0.129 / 0.159 ms`** | `0.136 / 0.132 / 0.166 ms` | `1.141 / 0.903 / 2.698 ms` (same-moment) |
-| | PostgreSQL `19.25 MiB` bulk query (`20,185 × 1,000 B`, 3x median) | `397.6 MiB/s` (`48.41 ms`) | **`398.3 MiB/s`** (`48.34 ms`) | `206.3 MiB/s` (same-moment) |
-| **5. Outbound Egress** | Unproxied HTTPS inside `alpine:3.21` (`251` host `vmenet*` present) | `HTTP 200` (`1.41 MiB/s`, `0.329s`) | **`HTTP 200`** (`1.81 MiB/s`, `0.258s`) | **`HTTP 200`** (`1.83 MiB/s`, `0.25s` ref) |
-| **6. Image Build** | `docker build --no-cache` (`FROM alpine:3.21`, 500 files) | `756.96 ms` | **`338.07 ms`** | `2,180.0 ms` (`ref`) |
+| **1. Lifecycle & CLI** | `docker version` (5x median) | `91.11 ms` | `44.87 ms` | `22.5 ms` |
+| | `docker run --rm alpine:3.21 true` (5x median) | `452.91 ms` | `454.42 ms` | `477.6 ms` |
+| | `docker run --rm --entrypoint true postgres:18-alpine` (5x median) | `834.8 ms` | `700.35 ms` | **`408.4 ms`** |
+| | 3-service Compose warm `up -d --wait` (`postgres` + `valkey` + `mailpit`) | `6,237.17 ms` | `2,289.48 ms` | **`2,072.9 ms`** |
+| | 3-service Compose `down -v --remove-orphans` | `1,690.78 ms` | `1,823.49 ms` | **`825.5 ms`** |
+| **2. Volume Disk I/O** | Sequential Write 256 MiB (`dd ... bs=1M count=256 conv=fsync`) | `962.4 MiB/s` (`265.99 ms`) | `1,100.9 MiB/s` | **`1,724.3 MiB/s`** |
+| | Sequential Read 256 MiB (`dd`, page-cached post-write) | `3,760.7 MiB/s` (`68.07 ms`) | **`5,169.9 MiB/s`** | `4,913.7 MiB/s` |
+| | Small-file burst (`1,000 × 4 KiB` create + write + `fsync` + unlink) | **`1,263.9 ms` (`791.2 ops/s`)** | `1,393.5 ms` | `1,654.9 ms` |
+| **3. Host Shared FS** | 1,000-file tree walk (`find /work -type f`, cold / 3x median) | `385.52 ms` / `414.17 ms` | **`365.21 ms` / `368.89 ms`** | `3,020.8 ms` / `1,181.6 ms` |
+| | Read all 1,000 files (in-container) | `77.01 ms` (clean) / `350.27 ms` | `98.51 ms` | **`61.13 ms`** |
+| | Create + write + remove `500 × 4 KiB` files (in-container) | `274.34 ms` (clean) / `1,263.26 ms` | **`266.72 ms`** | `283.22 ms` |
+| **4. Host ↔ Container Net** | Raw TCP 128 MiB Host → Container | `878.6 MiB/s` (clean) / `435.2 MiB/s` | `908.9 MiB/s` | **`2,360.3 MiB/s`** |
+| | Raw TCP 128 MiB Container → Host | `833.1 MiB/s` (clean) / `94.8 MiB/s` | `726.8 MiB/s` | **`4,172.3 MiB/s`** |
+| | HTTP/1.1 Keep-Alive (500 req, c=16) | `6,193.9 req/s` (`p50 2.38 ms`, clean) | **`6,950.3 req/s`** | `2,180.7 req/s` |
+| | HTTP/1.1 Conn-per-req (500 req, c=16) | `4,407.5 req/s` (`p50 3.42 ms`, clean) | **`4,454.2 req/s`** | `1,458.4 req/s` |
+| | PostgreSQL `200x SELECT 1` RTT (avg / p50) | `0.139 / 0.133 ms` (clean) | **`0.132 / 0.129 ms`** | `1.141 / 0.903 ms` |
+| | PostgreSQL `19.25 MiB` bulk query (`20,185 × 1,000 B`) | `365.8 MiB/s` (`52.62 ms`, clean) | **`397.6 MiB/s`** | `206.3 MiB/s` |
+| **5. Outbound Egress** | Unproxied HTTPS inside `alpine:3.21` | `HTTP 200` (`0.85–1.51 MiB/s`, `0.308–0.55s`) | `HTTP 200` (`1.41 MiB/s`, `0.329s`) | **`HTTP 200`** (`1.83 MiB/s`, `0.25s`) |
+| **6. Image Build** | `docker build --no-cache` (`FROM alpine:3.21`, 500 files) | `1,653.72 ms` | **`756.96 ms`** | `2,180.0 ms` |
 
-### Category 7 & Runtime Lifecycle (v0.5.0 Verified)
+### Category 7 & v0.6.0 E2E Verification
 
-| Metric | Observed Result (v0.5.0) |
+| Metric | Observed Result (v0.6.0) |
 | --- | --- |
-| Clean VM shutdown (`firn down`) | `1,710.67 ms` (`835.82 ms` quiescent in v0.4.0) |
-| Cold VM boot (`firn up` auto-hibernate check / Cat 7 suite) | `1,689.4 ms` (`2.25s` auto-hibernate run) / `2,653.32 ms` wall (`2.03s` guest uptime under load `21.9–27.4`) |
-| Idle host usage (`top`, 0 containers, loaded host) | `5.6%` CPU / **`769.2 MiB`** (`firnd 32.6 + vm 736.6`, vs OrbStack Helper `89.6%` CPU / `2,675.3 MiB` RSS) |
-| Hibernate (`firn hibernate`, APFS `saveMachineStateTo`) | **`759.6 MiB → 20.3 MiB`** (`169.0 MiB` state, `0 MiB` VM XPC); **`firn resume` in `1,467.3 ms`** |
-| Post-resume `firnfs` Cat 3 coherence & speed | `423.28 ms` cold / `399.41 ms` med walk, **`98.37 ms`** read, `403.62 ms` create+write+rm |
-| Session-guarded Auto-Hibernate (`--hibernate-seconds 15`) | Zero active-session interruptions and zero snapshot save races across transitions |
-| 3 simultaneous stacks (`valkey` + `mailpit`, 6 containers) reclaim | `99.62 MiB → 18.77 MiB` (**`81.2%` reclaimed**, `4.8 MiB` in `zram0`) |
-| Target-first Auto-Thaw (Valkey `PING` / HTTPS `:8443` from frozen) | **`29.68 ms` TCP** / **`27.71 ms` HTTPS** (`pausedCount = 0`; `guestThaw = 13.94 ms`, `hostThaw = 14.46 ms`) |
-| Built-in Kubernetes (`firn k8s enable`) | `k3s v1.31.6+k3s1` `Ready` on `127.0.0.1:6443` (preserves existing `kubectl` `current-context`) |
-| Multi-distro Linux Machines (`firn machine create testbox --distro alpine`) | Assigned `10.87.0.2` + `testbox.firn.local`, interactive PTY `shell`, shared `$HOME` |
-| Opt-in Nested KVM (`firn up --nested-kvm`) | Exposes `/dev/kvm` (`crw-rw-rw- 1 root kvm`) inside guest |
+| Clean VM shutdown (`firn down`) | `1,822.78 ms` |
+| Cold VM boot (`firn up` clean / Cat 7 concurrent load) | `2,937.2 ms` / `5,050.87 ms` (`4.07s` guest) |
+| Idle host usage (`top`, 0 containers, loaded host) | `2.9%` CPU / **`776.0 MiB`** (`RSS 232.7 MiB`, vs OrbStack Helper `149.3%` CPU / `1,867.4 MiB` RSS) |
+| Hibernate (`firn hibernate` → `firn resume`) | **`1.11 GiB → 24.7 MiB`** (`1,420.8 ms`, `224.0 MiB` state, `0 MiB` VM XPC); **`firn resume` in `1,321.3 ms`** |
+| 3 simultaneous stacks (`valkey` + `mailpit`, 6 containers) reclaim | `95.38 MiB → 16.3 MiB` (**`82.9%` reclaimed**, `5.0 MiB` in `zram0`) |
+| Auto-Thaw (Valkey `PING` / HTTPS `:8443` from frozen, loaded) | `233.4 ms` TCP / `269.37 ms` HTTPS (`paused = 0`) |
+| `firnfs` v3 native `inotify` HMR (`make e2e`) | Containers receive `IN_MODIFY`, `IN_CREATE`, `IN_CLOSE_WRITE`, `IN_DELETE`, `IN_ISDIR` with 100% SHA-256 parity |
+| `host.docker.internal` & `host.firn.internal` | Automatically resolve to `10.89.0.1` inside containers and reach host services |
+| Zero-config k8s dev loop (`firn k8s enable`, `load`, `services`) | `k3s v1.31.6+k3s1` Ready + direct pod access via `https://<svc>.<ns>.k8s.firn.local:8443` |
+| Machine Clone & Buildx Rosetta (`make e2e`) | `firn machine clone` preserves root + `-home` volumes; `firn buildx setup` builds & runs `linux/amd64` (`uname -m == x86_64`) |
 
 ## Architecture
 
@@ -112,27 +110,27 @@ python3 scripts/benchmark.py --json                 # Full structured JSON repor
 flowchart LR
   subgraph macOS["macOS Host"]
     CLI["firn CLI / Docker CLI / kubectl"]
-    Bar["Firn.app (FirnBar: Sparklines, Logs & Update Check)"]
+    Bar["Firn.app (FirnBar: Control Center, Logs & Update Check)"]
     UTUN["firn-hostnet utun (10.87/10.88)"]
     subgraph Daemon["firnd (VZVirtualMachine / KrunMachineRunner)"]
       FSW["FSEventsWatcher (150ms echo filter)"]
       D["docker.sock <-> vsock:2375"]
       C["Control API <-> vsock:2376"]
-      T["AutoThawProxy + VsockBridge (StreamBufferPool 1M)"]
+      T["AutoThawProxy + VsockBridge"]
       DNS["Split DNS (:53535 *.firn.local)"]
       SH["shell.sock <-> vsock:2382 + SSH Agent :2383"]
     end
     subgraph HN["firn-hostnet (Go)"]
-      GV["gVisor L2/L3 (MTU 16384 socketpair)"]
-      TLS[":8088 HTTP / :8443 HTTPS + Dynamic Leaf CA"]
-      FSRV["FirnFSServer (Depth-2 Push Prefetch + firnfs.sock)"]
+      GV["gVisor L2/L3 (MTU 16384, 4M sock)"]
+      TLS[":8088 HTTP / :8443 HTTPS + Dynamic CA + k8s Ingress"]
+      FSRV["FirnFSServer (Depth-2 Prefetch + firnfs.sock)"]
     end
   end
   subgraph Linux["Alpine Linux VM (arm64 6.12.x + Rosetta x86_64 + /dev/kvm)"]
-    GD["firn-guestd (Go + firnfs v2 FUSE + cgroup v2 + k3s + machines)"]
+    GD["firn-guestd (Go + firnfs v3 FUSE/inotify + 40ms coalesce + k3s)"]
     ETH["eth0 (10.89.0.2/24 MTU 16384)"]
-    DK["dockerd (overlay2) + k3s (containerd) + Linux Machines"]
-    VFS["/mnt/virtiofs-home (direct write backing)"]
+    DK["dockerd (overlay2 + Buildx) + k3s + Linux Machines"]
+    VFS["/mnt/virtiofs-home + extraMounts"]
     SW["Tiered Swap: 2 GiB zram0 (pri 100) + 4 GiB swapfile (pri 10)"]
   end
   CLI --> D
@@ -141,7 +139,7 @@ flowchart LR
   UTUN <--> GV
   Bar --> C
   FSW --> FSRV
-  T <-->|"AF_VSOCK (16M max / 8M buf)"| GD
+  T <-->|"AF_VSOCK (32M/16M + 2M pool)"| GD
   D <-->|"AF_VSOCK"| GD
   C <-->|"AF_VSOCK"| GD
   SH <-->|"AF_VSOCK"| GD
@@ -164,14 +162,17 @@ flowchart LR
 | `firn resume [--json]` | Restore hibernated VM immediately (`firn` also wakes automatically on traffic) |
 | `firn status [--json]` | Show guest/host memory, CPU%, capabilities, APFS disk, DNS/HTTPS, route, and stacks |
 | `firn shell [-- COMMAND...]` | Open interactive PTY shell (`vsock:2382`) with `SSH_AUTH_SOCK` forwarding |
-| `firn k8s <status\|enable [--no-kubeconfig] [--use]\|disable\|reset\|freeze\|thaw\|kubeconfig>` | Manage built-in `k3s` Kubernetes cluster with non-destructive kubeconfig merge |
-| `firn machine <list\|create <name> [--distro D]\|shell <name>\|start\|stop\|delete>` | Manage persistent Ubuntu/Debian/Alpine/Arch/Fedora machines sharing `$HOME` |
+| `firn k8s <status\|enable\|disable\|reset\|freeze\|thaw\|services\|load <img...>\|kubeconfig>` | Manage built-in `k3s` cluster, list ClusterIP `*.k8s.<domain>` routes, or load local Docker images into `k8s.io` |
+| `firn machine <list\|create <name> [--distro D]\|clone <src> <dst>\|shell\|start\|stop\|delete>` | Manage persistent Ubuntu/Debian/Alpine/Arch/Fedora machines sharing `$HOME` or clone existing machines |
+| `firn mount <list\|add <hostPath> [--guest PATH] [--read-only]\|remove <hostPath>>` | Configure additional VirtioFS shared host directories |
+| `firn buildx <status\|setup\|remove>` | Set up multi-arch `firn-builder` (`linux/arm64,linux/amd64` with Rosetta) |
+| `firn socket <status\|link\|unlink>` | Inspect or manage optional `/var/run/docker.sock` compatibility symlink |
 | `firn route <status\|up\|install [--dns]\|uninstall\|dns <status\|on\|off>>` | Manage host `utun` direct routing to container subnets (`10.87.0.0/24`, `10.88.0.0/16`) |
 | `firn freeze <project> [--reclaim]` | Freeze Compose stack (`cgroup.freeze`) and reclaim RAM + drop caches |
 | `firn thaw <project>` | Unpause a frozen Compose stack (auto-thaws on traffic) |
 | `firn reclaim [project]` | Reclaim cold container pages without manual pause |
 | `firn balloon <shrink\|reset>` | Shrink memory balloon to guest demand or reset to `maxMemoryBytes` |
-| `firn disk <usage\|trim> [--json]` | Inspect APFS sparse disk + `zram0` usage or run online `fstrim` |
+| `firn disk <usage\|trim\|prune [--all]> [--json]` | Inspect APFS + Docker `/system/df` + `zram0` usage, run online `fstrim`, or prune cache/images + trim |
 | `firn dns <status\|install\|uninstall>` | Inspect DNS records or install/remove `/etc/resolver/<domain>` (`sudo`) |
 | `firn ca <status\|install\|uninstall>` | Inspect Firn Root CA or trust/untrust in macOS System Keychain (`sudo`) |
 | `firn https <status\|install\|uninstall>` | Inspect `:8443` TLS proxy or manage `:80`/`:443` `pf` anchor (`sudo`) |
@@ -213,6 +214,7 @@ Global settings live in `~/.firn/config.json` (editable via `FirnBar` → **Sett
 - `FIRN_BACKEND` (`vz` default or `krun`), `FIRN_GPU` (`false` default), `FIRN_NESTED_VIRT` (`false` default)
 - `FIRN_HIBERNATE_SECONDS` (`0` disables auto-hibernate), `FIRN_IDLE_SECONDS` (`900`), `FIRN_EXEMPT_PROJECTS`
 - `FIRN_DOMAIN` (`firn.local`), `FIRN_DNS_PORT` (`53535`), `FIRN_HTTP_PROXY_PORT` (`8088`), `FIRN_HTTPS_PROXY_PORT` (`8443`), `FIRN_DIRECT_ROUTE_DNS` (`false`)
+- `FIRN_AUTO_TRIM_MINUTES` (`60`, background idle `fstrim` interval; `0` disables), `extraMounts` via `firn mount`
 - `FIRN_INSTALL_DIR` (used by `scripts/install.sh`), `FIRN_IMAGE_VERSION` / `BUILD_DOCKER_CONTEXT` (used by `make build` / `guest/build-rootfs.sh`)
 
 ## Packaging & Homebrew

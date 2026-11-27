@@ -75,6 +75,15 @@ public final class BalloonController {
         }
     }
 
+    public func convergeAfterResume() {
+        for delay in [0.35, 2.5] {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, !self.runner.isHibernated else { return }
+                self.shrinkToGuestDemand(dropCaches: false, converge: true)
+            }
+        }
+    }
+
     private func queryGuestUsedBytes() -> UInt64 {
         var total: UInt64 = 0
         var available: UInt64 = 0

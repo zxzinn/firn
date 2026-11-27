@@ -204,3 +204,62 @@ func ControlLinuxMachine(eng *ReaperEngine, name, action string) error {
 	_, _ = eng.RefreshTopology(time.Now())
 	return nil
 }
+
+func CloneLinuxMachine(eng *ReaperEngine, srcName, dstName, defaultHostHome string) (LinuxMachineInfo, error) {
+	srcClean, err := sanitizeMachineName(srcName)
+	if err != nil {
+		return LinuxMachineInfo{}, err
+	}
+	dstClean, err := sanitizeMachineName(dstName)
+	if err != nil {
+		return LinuxMachineInfo{}, err
+	}
+	if srcClean == dstClean {
+		return LinuxMachineInfo{}, fmt.Errorf("target machine name %q must differ from source", dstClean)
+	}
+	machines, err := ListLinuxMachines(eng, eng.Domain())
+	if err != nil {
+		return LinuxMachineInfo{}, err
+	}
+	var srcMachine *LinuxMachineInfo
+	for i := range machines {
+		if machines[i].Name == srcClean {
+			srcMachine = &machines[i]
+			break
+		}
+	}
+	if srcMachine == nil {
+		return LinuxMachineInfo{}, fmt.Errorf("source machine %q not found", srcClean)
+	}
+	srcCname := srcMachine.Container
+	if srcCname == "" {
+		srcCname = machineContainerName(srcClean)
+	}
+	cloneImage := "firn-machine-clone/" + dstClean + ":latest"
+	if out, cerr := exec.Command("docker", "commit", srcCname, cloneImage).CombinedOutput(); cerr != nil {
+		return LinuxMachineInfo{}, fmt.Errorf("docker commit %s failed: %w (%s)", srcCname, cerr, strings.TrimSpace(string(out)))
+	}
+	srcVol := srcCname + "-home"
+	dstVol := machineContainerName(dstClean) + "-home"
+	if exec.Command("docker", "volume", "inspect", srcVol).Run() == nil {
+		if out, verr := exec.Command("docker", "volume", "create", dstVol).CombinedOutput(); verr != nil {
+			return LinuxMachineInfo{}, fmt.Errorf("docker volume create %s failed: %w (%s)", dstVol, verr, strings.TrimSpace(string(out)))
+		}
+		cpCmd := exec.Command("docker", "run", "--rm",
+			"-v", srcVol+":/from:ro",
+			"-v", dstVol+":/to",
+			"--entrypoint", "/bin/sh",
+			cloneImage,
+			"-c", "cp -a /from/. /to/",
+		)
+		if out, cerr := cpCmd.CombinedOutput(); cerr != nil {
+			return LinuxMachineInfo{}, fmt.Errorf("clone home volume %s -> %s failed: %w (%s)", srcVol, dstVol, cerr, strings.TrimSpace(string(out)))
+		}
+	}
+	return CreateLinuxMachine(eng, MachineCreateRequest{
+		Name:     dstClean,
+		Distro:   srcMachine.Distro,
+		Image:    cloneImage,
+		HostHome: defaultHostHome,
+	}, defaultHostHome)
+}

@@ -347,8 +347,8 @@ func (pm *ProxyManager) acceptPortLoop(hostPort int, ln net.Listener) {
 		}
 		if tc, ok := c.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
-			_ = tc.SetReadBuffer(1 << 20)
-			_ = tc.SetWriteBuffer(1 << 20)
+			_ = tc.SetReadBuffer(4 << 20)
+			_ = tc.SetWriteBuffer(4 << 20)
 		}
 		go pm.handleAcceptedTCP(hostPort, c)
 	}

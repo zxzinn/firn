@@ -532,12 +532,13 @@ type firnFSClient struct {
 	onInvalidate func([]string)
 	onPrefetch   func(string, []fsDirPrefetchItem)
 
-	mu        sync.Mutex
-	conn      net.Conn
-	writeMu   sync.Mutex
-	pending   map[uint32]chan []byte
-	nextReqID atomic.Uint32
-	closed    bool
+	mu           sync.Mutex
+	conn         net.Conn
+	writeMu      sync.Mutex
+	pending      map[uint32]chan []byte
+	nextReqID    atomic.Uint32
+	reconnecting atomic.Bool
+	closed       bool
 }
 
 func (c *firnFSClient) SetOnPrefetch(fn func(dirRel string, items []fsDirPrefetchItem)) {
@@ -619,6 +620,31 @@ func (c *firnFSClient) ensureConn() (net.Conn, error) {
 	return conn, nil
 }
 
+func (c *firnFSClient) scheduleReconnect() {
+	if !c.reconnecting.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer c.reconnecting.Store(false)
+		backoff := 300 * time.Millisecond
+		for {
+			c.mu.Lock()
+			done := c.closed || c.conn != nil
+			c.mu.Unlock()
+			if done {
+				return
+			}
+			if _, err := c.ensureConn(); err == nil {
+				return
+			}
+			time.Sleep(backoff)
+			if backoff < time.Second {
+				backoff = min(time.Second, backoff+200*time.Millisecond)
+			}
+		}
+	}()
+}
+
 func (c *firnFSClient) readLoop(conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
@@ -626,11 +652,16 @@ func (c *firnFSClient) readLoop(conn net.Conn) {
 		if c.conn == conn {
 			c.conn = nil
 		}
+		closed := c.closed
+		hasDialer := c.dialer != nil
 		for id, ch := range c.pending {
 			close(ch)
 			delete(c.pending, id)
 		}
 		c.mu.Unlock()
+		if !closed && hasDialer {
+			c.scheduleReconnect()
+		}
 	}()
 
 	var hdr [9]byte

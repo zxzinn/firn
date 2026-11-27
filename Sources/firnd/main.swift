@@ -181,6 +181,7 @@ func runDaemon() throws {
         pushGuestConfigAndProxy(bridge: bridge, cfg: liveCfg, proxyState: ProxyInspector.currentState())
         autoThaw.pushHibernatedTopology(hibernated: false)
         autoThaw.syncTopologyNow()
+        balloon.convergeAfterResume()
     }
 
     do {
@@ -272,10 +273,16 @@ func runDaemon() throws {
                     }
 
                     let currentCfg = FirnConfig.load()
+                    let projects = (obj["projects"] as? [[String: Any]]) ?? []
+                    let anyActive = projects.contains { (($0["runningCount"] as? Int) ?? 0) > 0 }
+                    let k3sRunning = ((obj["capabilities"] as? [String: Any])?["k3sRunning"] as? Bool) ?? false
+                    if currentCfg.autoTrimMinutes > 0 && !anyActive && !k3sRunning {
+                        let trimEveryTicks = max(1, currentCfg.autoTrimMinutes * 4)
+                        if tick % trimEveryTicks == 0 {
+                            _ = try? bridge.guestHTTP(method: "POST", path: "/disk/trim", timeoutSeconds: 45.0)
+                        }
+                    }
                     if currentCfg.hibernateSeconds > 0 {
-                        let projects = (obj["projects"] as? [[String: Any]]) ?? []
-                        let anyActive = projects.contains { (($0["runningCount"] as? Int) ?? 0) > 0 }
-                        let k3sRunning = ((obj["capabilities"] as? [String: Any])?["k3sRunning"] as? Bool) ?? false
                         let sessions = bridge.activeSessionCount + autoThaw.activeSessionCount
                         if !anyActive && !k3sRunning && sessions == 0 {
                             if idleAllStoppedSince == nil {

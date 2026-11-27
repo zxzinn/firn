@@ -166,12 +166,14 @@ func (p *ProxyAndDNSRelay) handleLocalDomainQuery(query []byte) []byte {
 		domain = "firn.local"
 	}
 	qname = strings.TrimSuffix(strings.ToLower(qname), ".")
-	if qname != domain && !strings.HasSuffix(qname, "."+domain) {
+	isHostAlias := qname == "host.docker.internal" || qname == "host.firn.internal" || qname == "gateway.docker.internal"
+	if !isHostAlias && qname != domain && !strings.HasSuffix(qname, "."+domain) {
 		return nil
 	}
 	ip4 := net.ParseIP("10.87.0.1").To4()
-	_, records, err := p.engine.CachedPortsAndDNS(time.Now())
-	if err == nil {
+	if isHostAlias {
+		ip4 = net.ParseIP("10.89.0.1").To4()
+	} else if _, records, err := p.engine.CachedPortsAndDNS(time.Now()); err == nil {
 		for _, rec := range records {
 			for _, candidate := range rec.Names {
 				if candidate == qname && rec.IP != "" {

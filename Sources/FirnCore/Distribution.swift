@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 public enum FirnVersion {
-    public static let current = "0.5.0"
+    public static let current = "0.6.0"
     public static let githubRepo = "zxzinn/firn"
 
     public static func clean(_ raw: String) -> String {

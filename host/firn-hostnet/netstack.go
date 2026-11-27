@@ -206,7 +206,9 @@ func (e *dgramL2Endpoint) IsAttached() bool {
 
 func (e *dgramL2Endpoint) MTU() uint32                                { return e.mtu }
 func (e *dgramL2Endpoint) SetMTU(mtu uint32)                          { e.mtu = mtu }
-func (e *dgramL2Endpoint) Capabilities() stack.LinkEndpointCapabilities { return 0 }
+func (e *dgramL2Endpoint) Capabilities() stack.LinkEndpointCapabilities {
+	return stack.CapabilityRXChecksumOffload
+}
 func (e *dgramL2Endpoint) MaxHeaderLength() uint16                    { return 0 }
 func (e *dgramL2Endpoint) LinkAddress() tcpip.LinkAddress             { return e.linkAddr }
 func (e *dgramL2Endpoint) SetLinkAddress(addr tcpip.LinkAddress)      { e.linkAddr = addr }
@@ -289,9 +291,10 @@ func (e *dgramL2Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.
 
 func tuneDgramSocket(fd int) {
 	for _, pair := range [][2]int{
+		{4 << 20, 4 << 20},
+		{4 << 20, 2 << 20},
 		{4 << 20, 1 << 20},
-		{2 << 20, 512 << 10},
-		{1 << 20, 256 << 10},
+		{2 << 20, 1 << 20},
 	} {
 		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, pair[0])
 		if unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, pair[1]) == nil {
@@ -441,8 +444,8 @@ func (e *NetEngine) installForwarders(hostAddr tcpip.Address) {
 		}
 		if tc, ok := upConn.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
-			_ = tc.SetReadBuffer(1 << 20)
-			_ = tc.SetWriteBuffer(1 << 20)
+			_ = tc.SetReadBuffer(4 << 20)
+			_ = tc.SetWriteBuffer(4 << 20)
 		}
 		var wq waiter.Queue
 		ep, terr := r.CreateEndpoint(&wq)
@@ -710,7 +713,7 @@ func (e *NetEngine) Close() {
 
 var copyBufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 256*1024)
+		b := make([]byte, 1024*1024)
 		return &b
 	},
 }

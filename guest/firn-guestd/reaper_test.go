@@ -23,8 +23,15 @@ type fakeDocker struct {
 	mu         sync.Mutex
 	containers map[string]dockerContainerSummary
 	inspects   map[string]*dockerContainerInspect
+	df         DockerDFSummary
 	paused     []string
 	unpaused   []string
+}
+
+func (f *fakeDocker) SystemDF() (DockerDFSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.df, nil
 }
 
 func (f *fakeDocker) ListContainers() ([]dockerContainerSummary, error) {

@@ -205,7 +205,8 @@ public final class LocalDNSServer {
             if directRouteEnabled, let q = WireDNS.parseQuestion(pkt) {
                 let qn = q.name.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
                 if let match = records.first(where: { rec in rec.names.contains { $0.lowercased() == qn } }),
-                   !match.ip.isEmpty {
+                   !match.ip.isEmpty,
+                   match.project != "k8s" {
                     directIP = match.ip
                 }
             }
