@@ -39,14 +39,56 @@ public func configureClientSocket(_ fd: Int32) {
     _ = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
 }
 
-private func streamOneDirection(srcFD: Int32, dstFD: Int32) {
-    let bufSize = 1 << 20
-    var buf = [UInt8](repeating: 0, count: bufSize)
-    while true {
-        let n = buf.withUnsafeMutableBytes { ptr -> Int in
-            guard let base = ptr.baseAddress else { return -1 }
-            return Darwin.read(srcFD, base, bufSize)
+private func writeRawExact(fd: Int32, base: UnsafeRawPointer, count: Int) -> Bool {
+    var off = 0
+    while off < count {
+        let w = Darwin.write(fd, base.advanced(by: off), count - off)
+        if w > 0 {
+            off += w
+            continue
         }
+        if w < 0 && errno == EINTR {
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+private final class StreamBufferPool {
+    static let shared = StreamBufferPool()
+    let bufferSize = 1 << 20
+    private let lock = NSLock()
+    private var free: [UnsafeMutableRawPointer] = []
+    private let maxCached = 32
+
+    func borrow() -> UnsafeMutableRawPointer {
+        lock.lock()
+        let ptr = free.popLast()
+        lock.unlock()
+        return ptr ?? UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 4096)
+    }
+
+    func recycle(_ ptr: UnsafeMutableRawPointer) {
+        lock.lock()
+        if free.count < maxCached {
+            free.append(ptr)
+            lock.unlock()
+        } else {
+            lock.unlock()
+            ptr.deallocate()
+        }
+    }
+}
+
+private func streamOneDirection(srcFD: Int32, dstFD: Int32) {
+    let pool = StreamBufferPool.shared
+    let buf = pool.borrow()
+    let bufSize = pool.bufferSize
+    defer { pool.recycle(buf) }
+
+    while true {
+        let n = Darwin.read(srcFD, buf, bufSize)
         if n < 0 && errno == EINTR {
             continue
         }
@@ -54,24 +96,7 @@ private func streamOneDirection(srcFD: Int32, dstFD: Int32) {
             _ = Darwin.shutdown(dstFD, SHUT_WR)
             return
         }
-        var off = 0
-        var writeFailed = false
-        while off < n {
-            let w = buf.withUnsafeBytes { ptr -> Int in
-                guard let base = ptr.baseAddress else { return -1 }
-                return Darwin.write(dstFD, base.advanced(by: off), n - off)
-            }
-            if w > 0 {
-                off += w
-                continue
-            }
-            if w < 0 && errno == EINTR {
-                continue
-            }
-            writeFailed = true
-            break
-        }
-        if writeFailed {
+        if !writeRawExact(fd: dstFD, base: buf, count: n) {
             _ = Darwin.shutdown(srcFD, SHUT_RD)
             _ = Darwin.shutdown(dstFD, SHUT_WR)
             return
@@ -206,6 +231,27 @@ public final class VsockBridge {
     private var dockerListenFD: Int32 = -1
     private var shellListenFD: Int32 = -1
     private var running = false
+    private let sessionLock = NSLock()
+    private var _activeSessions = 0
+
+    public var activeSessionCount: Int {
+        sessionLock.lock()
+        let v = _activeSessions
+        sessionLock.unlock()
+        return v
+    }
+
+    private func trackSession(_ body: () -> Void) {
+        sessionLock.lock()
+        _activeSessions += 1
+        sessionLock.unlock()
+        defer {
+            sessionLock.lock()
+            _activeSessions = max(0, _activeSessions - 1)
+            sessionLock.unlock()
+        }
+        body()
+    }
 
     public init(runner: any VMBackend) {
         self.runner = runner
@@ -223,11 +269,13 @@ public final class VsockBridge {
                     break
                 }
                 spawnIOThread {
-                    do {
-                        let vsockConn = try self.runner.connectVsock(port: 2375, timeoutSeconds: 15.0)
-                        spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
-                    } catch {
-                        close(clientFD)
+                    self.trackSession {
+                        do {
+                            let vsockConn = try self.runner.connectVsock(port: 2375, timeoutSeconds: 15.0)
+                            spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+                        } catch {
+                            close(clientFD)
+                        }
                     }
                 }
             }
@@ -246,11 +294,13 @@ public final class VsockBridge {
                     break
                 }
                 spawnIOThread {
-                    do {
-                        let vsockConn = try self.runner.connectVsock(port: 2382, timeoutSeconds: 15.0)
-                        spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
-                    } catch {
-                        close(clientFD)
+                    self.trackSession {
+                        do {
+                            let vsockConn = try self.runner.connectVsock(port: 2382, timeoutSeconds: 15.0)
+                            spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+                        } catch {
+                            close(clientFD)
+                        }
                     }
                 }
             }

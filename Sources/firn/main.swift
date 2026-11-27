@@ -3,7 +3,7 @@ import Foundation
 import FirnCore
 import Virtualization
 
-private let firnVersion = "0.4.0"
+private let firnVersion = FirnVersion.current
 
 private func urlEncoded(_ value: String) -> String {
     var allowed = CharacterSet.urlPathAllowed
@@ -189,7 +189,9 @@ private func printStatus(_ statusData: [String: Any]) {
         let k3s = ((caps["k3sRunning"] as? Bool) ?? false) ? "running" : "off"
         let utun = ((route["utunConnected"] as? Bool) ?? false) ? "connected" : "off"
         let gpu = ((caps["gpuDri"] as? Bool) ?? (caps["gpuAccelerationEnabled"] as? Bool) ?? false) ? "virtio-gpu" : "none"
-        print("Capabilities: fs=\(firnfs), net=\(jumbo), utun=\(utun), nested_kvm=\(kvm), gpu=\(gpu), k3s=\(k3s)")
+        let hibSec = u64(statusData, "hibernateSeconds")
+        let hibLabel = hibSec > 0 ? ", auto_hibernate=\(hibSec)s" : ""
+        print("Capabilities: fs=\(firnfs), net=\(jumbo), utun=\(utun), nested_kvm=\(kvm), gpu=\(gpu), k3s=\(k3s)\(hibLabel)")
     }
     if !disk.isEmpty {
         print(
@@ -276,8 +278,10 @@ private func cmdUp(_ args: [String]) throws -> Int32 {
     var backendOpt: String?
     var fsOpt: String?
     var diskSyncOpt: String?
+    var hibernateSecondsOpt: String?
     var gpuOpt = false
     var nestedKvmOpt = false
+    var noPullOpt = false
     var contextName = FirnConfig.defaultDockerContext
     var idx = 0
     while idx < args.count {
@@ -288,19 +292,28 @@ private func cmdUp(_ args: [String]) throws -> Int32 {
         if a == "--backend", idx + 1 < args.count { backendOpt = args[idx + 1]; idx += 2; continue }
         if a == "--fs", idx + 1 < args.count { fsOpt = args[idx + 1]; idx += 2; continue }
         if a == "--disk-sync", idx + 1 < args.count { diskSyncOpt = args[idx + 1]; idx += 2; continue }
+        if a == "--hibernate-seconds", idx + 1 < args.count { hibernateSecondsOpt = args[idx + 1]; idx += 2; continue }
         if a == "--gpu" { gpuOpt = true; idx += 1; continue }
         if a == "--nested-kvm" { nestedKvmOpt = true; idx += 1; continue }
+        if a == "--no-pull" { noPullOpt = true; idx += 1; continue }
         throw NSError(domain: "Firn", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unknown option for `up`: \(a)"])
     }
 
     let fm = FileManager.default
-    for required in [FirnPaths.kernelURL, FirnPaths.initramfsURL, FirnPaths.rootfsURL, FirnPaths.dataDiskURL] {
-        if !fm.fileExists(atPath: required.path) {
-            throw NSError(domain: "Firn", code: 3, userInfo: [NSLocalizedDescriptionKey: "VM images not built yet (missing \(required.path)); run `make build` first."])
+    let missingImages = FirnDistribution.missingGuestImages()
+    if !missingImages.isEmpty {
+        if noPullOpt {
+            let names = missingImages.map(\.lastPathComponent).joined(separator: ", ")
+            throw NSError(domain: "Firn", code: 3, userInfo: [NSLocalizedDescriptionKey: "VM images missing (\(names)). Run `firn images pull` (or `make rootfs`)."])
         }
+        print("[firn] Guest Linux images missing; downloading release assets automatically...")
+        _ = try pullGuestImages(version: nil, force: true, fallbackToLatest: true)
+    }
+    if try FirnDistribution.ensureSparseDataDisk() {
+        print("[firn] Created sparse 120 GiB data disk at \(FirnPaths.dataDiskURL.path).")
     }
     guard let firndBin = findRepoRootBinary("firnd") else {
-        throw NSError(domain: "Firn", code: 4, userInfo: [NSLocalizedDescriptionKey: "firnd binary not found; run `make build` first."])
+        throw NSError(domain: "Firn", code: 4, userInfo: [NSLocalizedDescriptionKey: "firnd binary not found; run `make build` or reinstall Firn."])
     }
 
     if !FirnHostClient.isDaemonAlive() {
@@ -316,6 +329,7 @@ private func cmdUp(_ args: [String]) throws -> Int32 {
         if let backendOpt { env["FIRN_BACKEND"] = backendOpt }
         if let fsOpt { env["FIRN_FS_MODE"] = fsOpt }
         if let diskSyncOpt { env["FIRN_DISK_SYNC"] = diskSyncOpt }
+        if let hibernateSecondsOpt { env["FIRN_HIBERNATE_SECONDS"] = hibernateSecondsOpt }
         if gpuOpt { env["FIRN_GPU"] = "true" }
         if nestedKvmOpt { env["FIRN_NESTED_VIRT"] = "true" }
 
@@ -660,10 +674,17 @@ private func cmdDoctor() -> Int32 {
         issues += 1
     }
 
-    let artifacts = [FirnPaths.kernelURL, FirnPaths.initramfsURL, FirnPaths.rootfsURL, FirnPaths.dataDiskURL]
-    let allArtifacts = artifacts.allSatisfy { fm.fileExists(atPath: $0.path) }
-    print("[\(allArtifacts ? "OK" : "FAIL")] VM state directory (\(FirnPaths.stateDir.path)): \(allArtifacts ? "all disk/kernel images present" : "missing artifacts")")
-    if !allArtifacts { issues += 1 }
+    let missingImgs = FirnDistribution.missingGuestImages()
+    let imgVer = FirnDistribution.installedImageVersion() ?? "unknown"
+    let hasDataDisk = fm.fileExists(atPath: FirnPaths.dataDiskURL.path)
+    let originLabel: String
+    switch FirnInstallOrigin.detect(executablePath: CommandLine.arguments[0]) {
+    case .homebrew(let cellar): originLabel = "homebrew (\(cellar))"
+    case .standalone(let dir): originLabel = "standalone (\(dir.path))"
+    }
+    print("[INFO] Install origin: \(originLabel), CLI v\(firnVersion), guest images: \(imgVer)")
+    print("[\(missingImgs.isEmpty ? "OK" : "FAIL")] VM state directory (\(FirnPaths.stateDir.path)): \(missingImgs.isEmpty ? "all kernel/initramfs/rootfs images present (data.ext4=\(hasDataDisk ? "present" : "created on firn up"))" : "missing \(missingImgs.map(\.lastPathComponent).joined(separator: ", ")) (run `firn images pull`)")")
+    if !missingImgs.isEmpty { issues += 1 }
 
     if FirnHostClient.isDaemonAlive(),
        let health = try? FirnHostClient.requestJSON(method: "GET", path: "/health", timeoutSeconds: 2),
@@ -1392,118 +1413,466 @@ private func cmdMachine(_ args: [String]) throws -> Int32 {
     }
 }
 
+private func curlAuthArgs() -> [String] {
+    var args = ["-fsSL", "-H", "Accept: application/vnd.github+json", "-H", "User-Agent: Firn/\(FirnVersion.current)"]
+    if let token = ProcessInfo.processInfo.environment["GITHUB_TOKEN"] ?? ProcessInfo.processInfo.environment["GH_TOKEN"], !token.isEmpty {
+        args.append(contentsOf: ["-H", "Authorization: Bearer \(token)"])
+    }
+    return args
+}
+
+private func fetchGitHubReleaseJSON(version: String?, fallbackToLatest: Bool = false) throws -> [String: Any] {
+    let primaryURL: String
+    if let v = version, !v.isEmpty {
+        let tag = FirnVersion.normalizedTag(v)
+        primaryURL = "https://api.github.com/repos/\(FirnVersion.githubRepo)/releases/tags/\(urlEncoded(tag))"
+    } else {
+        primaryURL = "https://api.github.com/repos/\(FirnVersion.githubRepo)/releases/latest"
+    }
+    let resp = try runShellCommand("/usr/bin/curl", curlAuthArgs() + [primaryURL])
+    if resp.code != 0 {
+        if version != nil && fallbackToLatest {
+            let latestURL = "https://api.github.com/repos/\(FirnVersion.githubRepo)/releases/latest"
+            let latestResp = try runShellCommand("/usr/bin/curl", curlAuthArgs() + [latestURL])
+            if latestResp.code == 0,
+               let rel = (try? JSONSerialization.jsonObject(with: Data(latestResp.stdout.utf8))) as? [String: Any] {
+                return rel
+            }
+        }
+        throw NSError(domain: "Firn", code: 91, userInfo: [NSLocalizedDescriptionKey: "Failed querying GitHub Releases (\(primaryURL)): \(resp.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"])
+    }
+    guard let release = (try? JSONSerialization.jsonObject(with: Data(resp.stdout.utf8))) as? [String: Any] else {
+        throw NSError(domain: "Firn", code: 92, userInfo: [NSLocalizedDescriptionKey: "Unexpected GitHub release JSON response"])
+    }
+    return release
+}
+
+private func downloadAndVerifyChecksums(release: [String: Any], tmpDir: URL) throws -> [String: String] {
+    let assets = (release["assets"] as? [[String: Any]]) ?? []
+    guard let sumsAsset = assets.first(where: { ($0["name"] as? String) == "SHA256SUMS.txt" }),
+          let sumsURLStr = sumsAsset["browser_download_url"] as? String else {
+        let tag = (release["tag_name"] as? String) ?? "unknown"
+        throw NSError(domain: "Firn", code: 93, userInfo: [NSLocalizedDescriptionKey: "Release \(tag) does not contain SHA256SUMS.txt"])
+    }
+    let sumsFile = tmpDir.appendingPathComponent("SHA256SUMS.txt")
+    let dlSums = try runShellCommand("/usr/bin/curl", ["-fsSL", "-o", sumsFile.path, sumsURLStr])
+    if dlSums.code != 0 {
+        throw NSError(domain: "Firn", code: 94, userInfo: [NSLocalizedDescriptionKey: "Failed downloading SHA256SUMS.txt: \(dlSums.stderr)"])
+    }
+    let sumsText = try String(contentsOf: sumsFile, encoding: .utf8)
+    return FirnDistribution.parseSHA256Sums(sumsText)
+}
+
+private func downloadAndVerifyAsset(name: String, release: [String: Any], expectedSums: [String: String], destDir: URL) throws -> URL {
+    let assets = (release["assets"] as? [[String: Any]]) ?? []
+    guard let asset = assets.first(where: { ($0["name"] as? String) == name }),
+          let urlStr = asset["browser_download_url"] as? String else {
+        let tag = (release["tag_name"] as? String) ?? "unknown"
+        throw NSError(domain: "Firn", code: 93, userInfo: [NSLocalizedDescriptionKey: "Release \(tag) does not contain asset \(name)"])
+    }
+    guard let expectedHash = expectedSums[name] else {
+        throw NSError(domain: "Firn", code: 96, userInfo: [NSLocalizedDescriptionKey: "SHA256SUMS.txt missing \(name) entry"])
+    }
+    let outFile = destDir.appendingPathComponent(name)
+    print("[firn] Downloading \(name)...")
+    let dl = try runShellCommand("/usr/bin/curl", ["-fSL", "-o", outFile.path, urlStr], capture: false)
+    if dl.code != 0 {
+        throw NSError(domain: "Firn", code: 95, userInfo: [NSLocalizedDescriptionKey: "Failed downloading \(urlStr)"])
+    }
+    let actualHash = try FirnHostClient.sha256Hex(of: outFile).lowercased()
+    guard actualHash == expectedHash else {
+        throw NSError(domain: "Firn", code: 97, userInfo: [NSLocalizedDescriptionKey: "SHA-256 verification failed for \(name)! expected=\(expectedHash) actual=\(actualHash)"])
+    }
+    print("[firn] Verified \(name) SHA-256 (\(actualHash.prefix(16))...).")
+    return outFile
+}
+
+private func installGuestImages(fromTarball archiveFile: URL, tagName: String) throws {
+    if FirnHostClient.isDaemonAlive() {
+        throw NSError(domain: "Firn", code: 99, userInfo: [NSLocalizedDescriptionKey: "Stop Firn first (`firn down`) before replacing VM images."])
+    }
+    let fm = FileManager.default
+    let imagesDir = FirnPaths.imagesDir
+    try fm.createDirectory(at: imagesDir, withIntermediateDirectories: true)
+
+    let stagingDir = imagesDir.appendingPathComponent(".staging-\(getpid())-\(UUID().uuidString.prefix(8))")
+    try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: stagingDir) }
+
+    print("[firn] Extracting Linux ARM64 VM images to \(imagesDir.path)...")
+    let untar = try runShellCommand("/usr/bin/tar", ["-xzf", archiveFile.path, "-C", stagingDir.path])
+    if untar.code != 0 {
+        throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "tar extraction failed for guest images: \(untar.stderr)"])
+    }
+
+    // Backwards-compatibility fallback only if a release contains rootfs.ext4.zst and zstd exists.
+    let stagedRootfs = stagingDir.appendingPathComponent("rootfs.ext4")
+    let stagedRootfsZst = stagingDir.appendingPathComponent("rootfs.ext4.zst")
+    if !fm.fileExists(atPath: stagedRootfs.path), fm.fileExists(atPath: stagedRootfsZst.path) {
+        guard let zstdPath = findExecutableOnPATH("zstd") else {
+            throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "Archive contains legacy rootfs.ext4.zst and `zstd` is not installed (`brew install zstd` or use v0.5.0+ images)."])
+        }
+        let dec = try runShellCommand(zstdPath, ["-d", "-f", stagedRootfsZst.path, "-o", stagedRootfs.path])
+        if dec.code != 0 {
+            throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "zstd decompression failed: \(dec.stderr)"])
+        }
+        try? fm.removeItem(at: stagedRootfsZst)
+    }
+
+    let names = ["vmlinux.Image", "initramfs.img", "rootfs.ext4"]
+    for name in names {
+        let src = stagingDir.appendingPathComponent(name)
+        guard fm.fileExists(atPath: src.path),
+              let attrs = try? fm.attributesOfItem(atPath: src.path),
+              ((attrs[.size] as? NSNumber)?.uint64Value ?? 0) > 0 else {
+            throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "Extracted archive missing valid \(name)"])
+        }
+    }
+
+    var swapped: [(dst: URL, bak: URL, hadOriginal: Bool)] = []
+    do {
+        for name in names {
+            let src = stagingDir.appendingPathComponent(name)
+            let dst = imagesDir.appendingPathComponent(name)
+            let bak = imagesDir.appendingPathComponent(".\(name).bak.\(getpid())")
+            try? fm.removeItem(at: bak)
+            let hadOriginal = fm.fileExists(atPath: dst.path)
+            if hadOriginal {
+                try fm.moveItem(at: dst, to: bak)
+            }
+            swapped.append((dst: dst, bak: bak, hadOriginal: hadOriginal))
+            try fm.moveItem(at: src, to: dst)
+        }
+    } catch {
+        for item in swapped.reversed() {
+            try? fm.removeItem(at: item.dst)
+            if item.hadOriginal && fm.fileExists(atPath: item.bak.path) {
+                try? fm.moveItem(at: item.bak, to: item.dst)
+            }
+        }
+        throw error
+    }
+    for item in swapped where item.hadOriginal {
+        try? fm.removeItem(at: item.bak)
+    }
+
+    try FirnDistribution.recordInstalledImageVersion(tagName)
+    if try FirnDistribution.ensureSparseDataDisk() {
+        print("[firn] Created sparse 120 GiB data disk at \(FirnPaths.dataDiskURL.path).")
+    }
+    print("[firn] Installed Linux VM images (\(tagName)) in \(imagesDir.path).")
+}
+
+@discardableResult
+private func pullGuestImages(version: String?, force: Bool, fallbackToLatest: Bool = false) throws -> String {
+    if FirnHostClient.isDaemonAlive() {
+        throw NSError(domain: "Firn", code: 99, userInfo: [NSLocalizedDescriptionKey: "Stop Firn first (`firn down`) before updating VM images, or run `firn upgrade`."])
+    }
+    let release = try fetchGitHubReleaseJSON(
+        version: version ?? (fallbackToLatest ? FirnVersion.current : nil),
+        fallbackToLatest: fallbackToLatest
+    )
+    guard let tagName = release["tag_name"] as? String else {
+        throw NSError(domain: "Firn", code: 92, userInfo: [NSLocalizedDescriptionKey: "Release JSON missing tag_name"])
+    }
+    if !force,
+       FirnDistribution.missingGuestImages().isEmpty,
+       let curImgVer = FirnDistribution.installedImageVersion(),
+       curImgVer == tagName {
+        print("[firn] Guest Linux images already match \(tagName).")
+        return tagName
+    }
+
+    let fm = FileManager.default
+    let tmpDir = fm.temporaryDirectory.appendingPathComponent("firn-images-\(getpid())-\(UUID().uuidString.prefix(8))")
+    try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: tmpDir) }
+
+    let sums = try downloadAndVerifyChecksums(release: release, tmpDir: tmpDir)
+    let archiveURL = try downloadAndVerifyAsset(name: "firn-linux-arm64-images.tar.gz", release: release, expectedSums: sums, destDir: tmpDir)
+    try installGuestImages(fromTarball: archiveURL, tagName: tagName)
+    return tagName
+}
+
+private func cmdImages(_ args: [String]) throws -> Int32 {
+    let sub = args.first ?? "status"
+    let rest = Array(args.dropFirst())
+    let asJSON = rest.contains("--json")
+
+    switch sub {
+    case "status":
+        let fm = FileManager.default
+        let files = [
+            ("vmlinux.Image", FirnPaths.kernelURL),
+            ("initramfs.img", FirnPaths.initramfsURL),
+            ("rootfs.ext4", FirnPaths.rootfsURL),
+        ]
+        var fileItems: [[String: Any]] = []
+        for (name, url) in files {
+            let exists = fm.fileExists(atPath: url.path)
+            let stats: (logicalBytes: UInt64, allocatedBytes: UInt64) = exists ? FirnHostClient.hostSparseFileStats(at: url) : (0, 0)
+            fileItems.append([
+                "name": name,
+                "path": url.path,
+                "exists": exists,
+                "logicalBytes": stats.logicalBytes,
+                "allocatedBytes": stats.allocatedBytes,
+            ])
+        }
+        let dataExists = fm.fileExists(atPath: FirnPaths.dataDiskURL.path)
+        let dataStats: (logicalBytes: UInt64, allocatedBytes: UInt64) = dataExists ? FirnHostClient.hostSparseFileStats() : (0, 0)
+        let imgVer = FirnDistribution.installedImageVersion() ?? "unknown"
+        let payload: [String: Any] = [
+            "imagesDir": FirnPaths.imagesDir.path,
+            "imageVersion": imgVer,
+            "ready": FirnDistribution.missingGuestImages().isEmpty,
+            "files": fileItems,
+            "dataDisk": [
+                "path": FirnPaths.dataDiskURL.path,
+                "exists": dataExists,
+                "logicalBytes": dataStats.logicalBytes,
+                "allocatedBytes": dataStats.allocatedBytes,
+            ],
+        ]
+        if asJSON {
+            printPrettyJSON(payload)
+            return 0
+        }
+        print("Guest VM Images (\(FirnPaths.imagesDir.path)): version=\(imgVer), ready=\(FirnDistribution.missingGuestImages().isEmpty)")
+        for item in fileItems {
+            let name = (item["name"] as? String) ?? ""
+            let exists = (item["exists"] as? Bool) ?? false
+            let log = u64(item, "logicalBytes")
+            let alloc = u64(item, "allocatedBytes")
+            let detail = exists ? "\(FirnHostClient.formatBytes(alloc)) alloc / \(FirnHostClient.formatBytes(log)) logical" : "MISSING"
+            print("  \(padRight(name, 16)) \(detail)")
+        }
+        let diskDetail = dataExists ? "\(FirnHostClient.formatBytes(dataStats.allocatedBytes)) alloc / \(FirnHostClient.formatBytes(dataStats.logicalBytes)) logical" : "auto-created on `firn up` (120 GiB sparse)"
+        print("  \(padRight("data.ext4", 16)) \(diskDetail)")
+        return 0
+
+    case "pull":
+        var targetVersion: String?
+        var force = false
+        var idx = 0
+        while idx < rest.count {
+            let a = rest[idx]
+            if a == "--version", idx + 1 < rest.count { targetVersion = rest[idx + 1]; idx += 2; continue }
+            if a == "--force" { force = true; idx += 1; continue }
+            if a == "--json" { idx += 1; continue }
+            throw NSError(domain: "Firn", code: 89, userInfo: [NSLocalizedDescriptionKey: "Usage: firn images pull [--version vX.Y.Z] [--force]"])
+        }
+        let pulledTag = try pullGuestImages(version: targetVersion, force: force, fallbackToLatest: targetVersion == nil)
+        if asJSON {
+            printPrettyJSON(["ok": true, "version": pulledTag, "imagesDir": FirnPaths.imagesDir.path])
+        }
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 89, userInfo: [NSLocalizedDescriptionKey: "Usage: firn images <status|pull [--version vX.Y.Z] [--force]> [--json]"])
+    }
+}
+
+private func verifyOrResignFirnd(binaryURL: URL, unpackedDir: URL, installDir: URL) throws {
+    let check = try runShellCommand("/usr/bin/codesign", ["-d", "--entitlements", ":-", binaryURL.path])
+    let hasEnt = check.stdout.contains("com.apple.security.virtualization") || check.stderr.contains("com.apple.security.virtualization")
+    if hasEnt {
+        return
+    }
+    let candidates = [
+        unpackedDir.appendingPathComponent("entitlements.plist"),
+        installDir.appendingPathComponent("entitlements.plist"),
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("entitlements.plist"),
+    ]
+    guard let plist = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+        throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "Unpacked `firnd` is missing virtualization entitlement and entitlements.plist was not found"])
+    }
+    let resign = try runShellCommand("/usr/bin/codesign", ["--entitlements", plist.path, "--force", "-s", "-", binaryURL.path])
+    if resign.code != 0 {
+        throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "Failed signing firnd with virtualization entitlement: \(resign.stderr)"])
+    }
+    let recheck = try runShellCommand("/usr/bin/codesign", ["-d", "--entitlements", ":-", binaryURL.path])
+    let reHasEnt = recheck.stdout.contains("com.apple.security.virtualization") || recheck.stderr.contains("com.apple.security.virtualization")
+    guard reHasEnt else {
+        throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "Post-sign entitlement verification failed for \(binaryURL.path)"])
+    }
+}
+
 private func cmdUpgrade(_ args: [String]) throws -> Int32 {
     var checkOnly = false
+    var noImages = false
+    var noRestart = false
+    var force = false
     var targetVersion: String?
     var idx = 0
     while idx < args.count {
         let a = args[idx]
         if a == "--check" { checkOnly = true; idx += 1; continue }
+        if a == "--no-images" { noImages = true; idx += 1; continue }
+        if a == "--no-restart" { noRestart = true; idx += 1; continue }
+        if a == "--force" { force = true; idx += 1; continue }
         if a == "--version", idx + 1 < args.count { targetVersion = args[idx + 1]; idx += 2; continue }
-        throw NSError(domain: "Firn", code: 90, userInfo: [NSLocalizedDescriptionKey: "Usage: firn upgrade [--check] [--version vX.Y.Z]"])
+        throw NSError(domain: "Firn", code: 90, userInfo: [NSLocalizedDescriptionKey: "Usage: firn upgrade [--check] [--version vX.Y.Z] [--no-images] [--no-restart] [--force]"])
     }
 
-    let apiURL: String
-    if let v = targetVersion {
-        let tag = v.hasPrefix("v") ? v : "v\(v)"
-        apiURL = "https://api.github.com/repos/zxzinn/firn/releases/tags/\(urlEncoded(tag))"
-    } else {
-        apiURL = "https://api.github.com/repos/zxzinn/firn/releases/latest"
-    }
-
-    let resp = try runShellCommand("/usr/bin/curl", ["-fsSL", "-H", "Accept: application/vnd.github+json", apiURL])
-    if resp.code != 0 {
-        throw NSError(domain: "Firn", code: 91, userInfo: [NSLocalizedDescriptionKey: "Failed querying GitHub Releases (\(apiURL)): \(resp.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"])
-    }
-    guard let release = (try? JSONSerialization.jsonObject(with: Data(resp.stdout.utf8))) as? [String: Any],
-          let tagName = release["tag_name"] as? String else {
+    let origin = FirnInstallOrigin.detect(executablePath: CommandLine.arguments[0])
+    let release = try fetchGitHubReleaseJSON(version: targetVersion)
+    guard let tagName = release["tag_name"] as? String else {
         throw NSError(domain: "Firn", code: 92, userInfo: [NSLocalizedDescriptionKey: "Unexpected GitHub release JSON response"])
     }
 
-    let cleanLatest = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
-    let htmlURL = (release["html_url"] as? String) ?? "https://github.com/zxzinn/firn/releases/tag/\(tagName)"
-    print("Current version: \(firnVersion)")
-    print("Latest release:  \(tagName) (\(htmlURL))")
+    let htmlURL = (release["html_url"] as? String) ?? "https://github.com/\(FirnVersion.githubRepo)/releases/tag/\(tagName)"
+    let installedImgVer = FirnDistribution.installedImageVersion() ?? "unknown"
+    let cmp = FirnVersion.compare(FirnVersion.current, tagName)
 
-    if cleanLatest == firnVersion && targetVersion == nil {
+    print("Current version: \(FirnVersion.current)")
+    print("Latest release:  \(tagName) (\(htmlURL))")
+    print("Guest images:    \(installedImgVer)")
+    switch origin {
+    case .homebrew(let cellar):
+        print("Install origin:  Homebrew (\(cellar))")
+    case .standalone(let dir):
+        print("Install origin:  Standalone (\(dir.path))")
+    }
+
+    let imagesNeedSync = !noImages && (!FirnDistribution.missingGuestImages().isEmpty || installedImgVer != tagName)
+    if cmp == .orderedDescending && targetVersion == nil && !force {
+        print("[firn] Local build (\(FirnVersion.current)) is ahead of latest published release (\(tagName)).")
+        return 0
+    }
+    if cmp == .orderedSame && targetVersion == nil && !force && !imagesNeedSync {
         print("[firn] Already up to date.")
         return 0
     }
     if checkOnly {
-        print("[firn] Update check complete; run `firn upgrade` to download and verify.")
+        if case .homebrew = origin, cmp == .orderedAscending {
+            print("[firn] Update available; run `brew update && brew upgrade firn`.")
+        } else {
+            print("[firn] Update check complete; run `firn upgrade` to download and verify.")
+        }
         return 0
     }
 
-    let assets = (release["assets"] as? [[String: Any]]) ?? []
-    let tarballAsset = assets.first { ($0["name"] as? String) == "firn-darwin-arm64.tar.gz" }
-    let sumsAsset = assets.first { ($0["name"] as? String) == "SHA256SUMS.txt" }
-    guard let tarballURLStr = tarballAsset?["browser_download_url"] as? String,
-          let sumsURLStr = sumsAsset?["browser_download_url"] as? String else {
-        throw NSError(domain: "Firn", code: 93, userInfo: [NSLocalizedDescriptionKey: "Release \(tagName) does not contain firn-darwin-arm64.tar.gz and SHA256SUMS.txt"])
+    if case .homebrew = origin, !force {
+        if cmp == .orderedAscending {
+            print("[firn] Installed via Homebrew. Upgrade binaries with:")
+            print("  brew update && brew upgrade firn")
+            if imagesNeedSync {
+                print("Then refresh guest VM images with:")
+                print("  firn down && firn images pull --version \(tagName)")
+            }
+            return 0
+        }
+        if imagesNeedSync {
+            let wasRunning = FirnHostClient.isDaemonAlive()
+            if wasRunning {
+                print("[firn] Stopping Firn daemon to refresh guest images...")
+                _ = cmdDown()
+            }
+            try pullGuestImages(version: tagName, force: true)
+            if wasRunning && !noRestart {
+                _ = try cmdUp([])
+            }
+            return 0
+        }
     }
 
     let fm = FileManager.default
-    let tmpDir = fm.temporaryDirectory.appendingPathComponent("firn-upgrade-\(getpid())")
+    let tmpDir = fm.temporaryDirectory.appendingPathComponent("firn-upgrade-\(getpid())-\(UUID().uuidString.prefix(8))")
     try fm.createDirectory(at: tmpDir, withIntermediateDirectories: true)
     defer { try? fm.removeItem(at: tmpDir) }
 
-    let sumsFile = tmpDir.appendingPathComponent("SHA256SUMS.txt")
-    let archiveFile = tmpDir.appendingPathComponent("firn-darwin-arm64.tar.gz")
-
-    let dlSums = try runShellCommand("/usr/bin/curl", ["-fsSL", "-o", sumsFile.path, sumsURLStr])
-    if dlSums.code != 0 {
-        throw NSError(domain: "Firn", code: 94, userInfo: [NSLocalizedDescriptionKey: "Failed downloading SHA256SUMS.txt: \(dlSums.stderr)"])
-    }
-    let dlArc = try runShellCommand("/usr/bin/curl", ["-fSL", "-o", archiveFile.path, tarballURLStr], capture: false)
-    if dlArc.code != 0 {
-        throw NSError(domain: "Firn", code: 95, userInfo: [NSLocalizedDescriptionKey: "Failed downloading \(tarballURLStr)"])
-    }
-
-    let sumsText = try String(contentsOf: sumsFile, encoding: .utf8)
-    var expectedHash: String?
-    for line in sumsText.split(separator: "\n") {
-        let parts = line.split(whereSeparator: { $0.isWhitespace })
-        if parts.count >= 2, parts[1].hasSuffix("firn-darwin-arm64.tar.gz") {
-            expectedHash = String(parts[0]).lowercased()
-            break
-        }
-    }
-    guard let expectedHash else {
-        throw NSError(domain: "Firn", code: 96, userInfo: [NSLocalizedDescriptionKey: "SHA256SUMS.txt missing firn-darwin-arm64.tar.gz entry"])
-    }
-
-    let actualHash = try FirnHostClient.sha256Hex(of: archiveFile).lowercased()
-    guard actualHash == expectedHash else {
-        throw NSError(domain: "Firn", code: 97, userInfo: [NSLocalizedDescriptionKey: "SHA-256 verification failed! expected=\(expectedHash) actual=\(actualHash)"])
-    }
-    print("[firn] Verified SHA-256 checksum (\(actualHash)).")
+    let sums = try downloadAndVerifyChecksums(release: release, tmpDir: tmpDir)
+    let macArchive = try downloadAndVerifyAsset(name: "firn-darwin-arm64.tar.gz", release: release, expectedSums: sums, destDir: tmpDir)
 
     let unpackDir = tmpDir.appendingPathComponent("unpack")
     try fm.createDirectory(at: unpackDir, withIntermediateDirectories: true)
-    let untar = try runShellCommand("/usr/bin/tar", ["-xzf", archiveFile.path, "-C", unpackDir.path])
+    let untar = try runShellCommand("/usr/bin/tar", ["-xzf", macArchive.path, "-C", unpackDir.path])
     if untar.code != 0 {
         throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "tar extraction failed: \(untar.stderr)"])
     }
 
     let installDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
-    for binName in ["firn", "firnd", "firn-hostnet"] {
-        let src = unpackDir.appendingPathComponent(binName)
-        if fm.fileExists(atPath: src.path) {
+    let unpackedFirnd = unpackDir.appendingPathComponent("firnd")
+    if fm.fileExists(atPath: unpackedFirnd.path) {
+        try verifyOrResignFirnd(binaryURL: unpackedFirnd, unpackedDir: unpackDir, installDir: installDir)
+    }
+
+    let assets = (release["assets"] as? [[String: Any]]) ?? []
+    let releaseHasImages = assets.contains { ($0["name"] as? String) == "firn-linux-arm64-images.tar.gz" }
+    var imagesArchive: URL?
+    if !noImages && releaseHasImages && (force || imagesNeedSync || cmp != .orderedSame) {
+        imagesArchive = try downloadAndVerifyAsset(name: "firn-linux-arm64-images.tar.gz", release: release, expectedSums: sums, destDir: tmpDir)
+    }
+
+    let wasRunning = FirnHostClient.isDaemonAlive()
+    if wasRunning {
+        print("[firn] Stopping running Firn daemon cleanly before applying upgrade (user data disk preserved)...")
+        _ = cmdDown()
+    }
+
+    // Atomically swap binaries + Firn.app with rollback backups.
+    var swaps: [(dst: URL, bak: URL, hadOriginal: Bool)] = []
+    do {
+        for binName in ["firn", "firnd", "firn-hostnet"] {
+            let src = unpackDir.appendingPathComponent(binName)
+            guard fm.fileExists(atPath: src.path) else { continue }
             let dst = installDir.appendingPathComponent(binName)
             let staged = installDir.appendingPathComponent(".\(binName).new.\(getpid())")
+            let bak = installDir.appendingPathComponent(".\(binName).bak.\(getpid())")
             try? fm.removeItem(at: staged)
+            try? fm.removeItem(at: bak)
             try fm.copyItem(at: src, to: staged)
             try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged.path)
-            _ = try? fm.replaceItemAt(dst, withItemAt: staged)
+            let hadOrig = fm.fileExists(atPath: dst.path)
+            if hadOrig {
+                try fm.moveItem(at: dst, to: bak)
+            }
+            swaps.append((dst: dst, bak: bak, hadOriginal: hadOrig))
+            try fm.moveItem(at: staged, to: dst)
         }
+        let srcPlist = unpackDir.appendingPathComponent("entitlements.plist")
+        if fm.fileExists(atPath: srcPlist.path) {
+            let dstPlist = installDir.appendingPathComponent("entitlements.plist")
+            try? fm.removeItem(at: dstPlist)
+            try fm.copyItem(at: srcPlist, to: dstPlist)
+        }
+        let srcApp = unpackDir.appendingPathComponent("Firn.app")
+        if fm.fileExists(atPath: srcApp.path) {
+            let dstApp = installDir.appendingPathComponent("Firn.app")
+            let bakApp = installDir.appendingPathComponent(".Firn.app.bak.\(getpid())")
+            try? fm.removeItem(at: bakApp)
+            let hadApp = fm.fileExists(atPath: dstApp.path)
+            if hadApp {
+                try fm.moveItem(at: dstApp, to: bakApp)
+            }
+            swaps.append((dst: dstApp, bak: bakApp, hadOriginal: hadApp))
+            try fm.copyItem(at: srcApp, to: dstApp)
+        }
+    } catch {
+        for item in swaps.reversed() {
+            try? fm.removeItem(at: item.dst)
+            if item.hadOriginal && fm.fileExists(atPath: item.bak.path) {
+                try? fm.moveItem(at: item.bak, to: item.dst)
+            }
+        }
+        throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "Binary upgrade failed and rolled back cleanly: \(error.localizedDescription)"])
     }
-    let srcApp = unpackDir.appendingPathComponent("Firn.app")
-    if fm.fileExists(atPath: srcApp.path) {
-        let dstApp = installDir.appendingPathComponent("Firn.app")
-        try? fm.removeItem(at: dstApp)
-        try fm.copyItem(at: srcApp, to: dstApp)
+    for item in swaps where item.hadOriginal {
+        try? fm.removeItem(at: item.bak)
     }
-    print("[firn] Upgraded Firn binaries in \(installDir.path) to \(tagName). Restart any running daemon with `firn down && firn up`.")
+
+    if let imagesArchive {
+        try installGuestImages(fromTarball: imagesArchive, tagName: tagName)
+    }
+
+    print("[firn] Upgraded Firn in \(installDir.path) to \(tagName).")
+    if wasRunning && !noRestart {
+        print("[firn] Restarting Firn daemon with upgraded runtime...")
+        let newCLI = installDir.appendingPathComponent("firn")
+        let upRes = try runShellCommand(newCLI.path, ["up"], capture: false)
+        return upRes.code
+    }
     return 0
 }
 
@@ -1512,9 +1881,10 @@ private func printHelp() {
     Firn \(firnVersion) - Native macOS Virtualization.framework Docker runtime
 
     Usage:
-      firn up [--cpus N] [--memory-gib N] [--context NAME] [--backend vz|krun] [--fs firnfs|virtiofs] [--disk-sync none|fsync] [--gpu] [--nested-kvm]
+      firn up [--cpus N] [--memory-gib N] [--context NAME] [--backend vz|krun] [--fs firnfs|virtiofs] [--disk-sync none|fsync] [--hibernate-seconds N] [--no-pull] [--gpu] [--nested-kvm]
       firn down
       firn status [--json]
+      firn images <status|pull [--version vX.Y.Z] [--force]> [--json]
       firn hibernate [--json]
       firn resume [--json]
       firn shell [-- COMMAND...]
@@ -1534,7 +1904,7 @@ private func printHelp() {
       firn gui
       firn doctor
       firn autostart <status|install|uninstall>
-      firn upgrade [--check] [--version vX.Y.Z]
+      firn upgrade [--check] [--version vX.Y.Z] [--no-images] [--no-restart] [--force]
       firn bench [--project NAME] [--compare-orbstack]
       firn logs [--serial|--daemon|--hostnet]
       firn version
@@ -1561,6 +1931,8 @@ private func runCLI() throws -> Int32 {
             printStatus(res)
         }
         return 0
+    case "images":
+        return try cmdImages(rest)
     case "hibernate":
         return try cmdHibernate(rest)
     case "resume":

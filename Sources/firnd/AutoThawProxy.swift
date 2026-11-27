@@ -43,6 +43,27 @@ public final class AutoThawProxy {
     private var httpListenFDs: [Int32] = []
     private var lastKnownProjects: Set<String> = []
     private var running = false
+    private let sessionLock = NSLock()
+    private var _activeSessions = 0
+
+    public var activeSessionCount: Int {
+        sessionLock.lock()
+        let v = _activeSessions
+        sessionLock.unlock()
+        return v
+    }
+
+    private func trackSession(_ body: () -> Void) {
+        sessionLock.lock()
+        _activeSessions += 1
+        sessionLock.unlock()
+        defer {
+            sessionLock.lock()
+            _activeSessions = max(0, _activeSessions - 1)
+            sessionLock.unlock()
+        }
+        body()
+    }
 
     public var onProjectsChanged: (([String]) -> Void)?
 
@@ -314,7 +335,9 @@ public final class AutoThawProxy {
             let destHost = useContainerIP ? entry.containerIP! : "127.0.0.1"
             let destPort = useContainerIP ? UInt16(entry.guestPort) : UInt16(entry.hostPort)
             let vsockConn = try openTunnelWithRetry(host: destHost, port: destPort)
-            spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+            trackSession {
+                spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+            }
         } catch {
             close(clientFD)
         }
@@ -452,7 +475,9 @@ public final class AutoThawProxy {
                 close(clientFD)
                 return
             }
-            spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+            trackSession {
+                spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
+            }
         } catch {
             let msg = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\nTunnel error: \(error.localizedDescription)\n"
             _ = writeAll(fd: clientFD, data: Data(msg.utf8))

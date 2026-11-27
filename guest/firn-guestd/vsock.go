@@ -52,13 +52,20 @@ type vsockConn struct {
 }
 
 func tuneVsockSocketBuffers(fd int) {
-	const bufBytes = 4 << 20
-	var maxVsockBuf uint64 = 8 << 20
-	var vsockBuf uint64 = 4 << 20
+	var maxVsockBuf uint64 = 16 << 20
+	var vsockBuf uint64 = 8 << 20
 	_, _, _ = syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferMaxSize, uintptr(unsafe.Pointer(&maxVsockBuf)), 8, 0)
 	_, _, _ = syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), afVsock, soVMSocketsBufferSize, uintptr(unsafe.Pointer(&vsockBuf)), 8, 0)
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bufBytes)
-	_ = syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bufBytes)
+	for _, bufBytes := range []int{8 << 20, 4 << 20} {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, bufBytes); err == nil {
+			break
+		}
+	}
+	for _, bufBytes := range []int{8 << 20, 4 << 20} {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, bufBytes); err == nil {
+			break
+		}
+	}
 }
 
 func newVsockConn(fd int, local, remote vsockAddr) (*vsockConn, error) {
@@ -83,6 +90,7 @@ func newVsockConn(fd int, local, remote vsockAddr) (*vsockConn, error) {
 
 func (c *vsockConn) Read(b []byte) (int, error)  { return c.file.Read(b) }
 func (c *vsockConn) Write(b []byte) (int, error) { return c.file.Write(b) }
+func (c *vsockConn) CloseRead() error            { return syscall.Shutdown(c.fd, syscall.SHUT_RD) }
 func (c *vsockConn) CloseWrite() error           { return syscall.Shutdown(c.fd, syscall.SHUT_WR) }
 func (c *vsockConn) LocalAddr() net.Addr         { return c.local }
 func (c *vsockConn) RemoteAddr() net.Addr        { return c.remote }

@@ -157,6 +157,7 @@ public enum FirnPaths {
     public static var kernelURL: URL { imagesDir.appendingPathComponent("vmlinux.Image") }
     public static var initramfsURL: URL { imagesDir.appendingPathComponent("initramfs.img") }
     public static var rootfsURL: URL { imagesDir.appendingPathComponent("rootfs.ext4") }
+    public static var imageVersionURL: URL { imagesDir.appendingPathComponent("version.txt") }
     public static var dataDiskURL: URL { stateDir.appendingPathComponent("data.ext4") }
     public static var machineIdURL: URL { stateDir.appendingPathComponent("machine-id.bin") }
     public static var vmStateURL: URL { stateDir.appendingPathComponent("vm-state.vzvmsave") }

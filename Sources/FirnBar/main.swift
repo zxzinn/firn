@@ -491,6 +491,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var logControllers: [ContainerLogsWindowController] = []
     private var metricSamples: [MetricSample] = []
     private var lastEventVersion: UInt64 = 0
+    private var availableUpdateTag: String?
+    private var updateCheckNote: String?
+    private var latestStatusPayload: [String: Any]?
+    private var latestDNSPayload: [String: Any]?
+    private var latestK8sPayload: [String: Any]?
+    private var latestMachinesPayload: [String: Any]?
     private var stopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -499,6 +505,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu(statusPayload: nil, dnsPayload: nil, k8sPayload: nil, machinesPayload: nil)
         refreshStatus()
         startEventWatcher()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5.0) { [weak self] in
+            self?.checkForUpdates(userInitiated: false)
+        }
         fallbackTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.refreshStatus()
         }
@@ -561,6 +570,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.latestStatusPayload = status
+                self.latestDNSPayload = dns
+                self.latestK8sPayload = k8s
+                self.latestMachinesPayload = machines
                 if let hostMem = status?["hostMemory"] as? [String: Any] {
                     let fpBytes = (hostMem["footprintBytes"] as? NSNumber)?.doubleValue ?? 0
                     let cpu = (hostMem["cpuPercent"] as? NSNumber)?.doubleValue ?? 0
@@ -571,6 +584,49 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.rebuildMenu(statusPayload: status, dnsPayload: dns, k8sPayload: k8s, machinesPayload: machines)
             }
+        }
+    }
+
+    private func checkForUpdates(userInitiated: Bool) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let rel = FirnDistribution.fetchLatestGitHubRelease()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let rel {
+                    if FirnVersion.compare(FirnVersion.current, rel.tagName) == .orderedAscending {
+                        self.availableUpdateTag = rel.tagName
+                        self.updateCheckNote = "Update available: \(rel.tagName)"
+                    } else {
+                        self.availableUpdateTag = nil
+                        if userInitiated {
+                            self.updateCheckNote = "Up to date (v\(FirnVersion.current))"
+                        }
+                    }
+                } else if userInitiated {
+                    self.updateCheckNote = "Update check unavailable offline"
+                }
+                self.rebuildMenu(
+                    statusPayload: self.latestStatusPayload,
+                    dnsPayload: self.latestDNSPayload,
+                    k8sPayload: self.latestK8sPayload,
+                    machinesPayload: self.latestMachinesPayload
+                )
+            }
+        }
+    }
+
+    private func appendVersionAndUpdateItems(to menu: NSMenu) {
+        if let tag = availableUpdateTag {
+            addAction("Update Available: \(tag) (`firn upgrade`)", to: menu) { [weak self] in
+                self?.openShellInTerminal(args: ["upgrade"])
+            }
+        } else if let note = updateCheckNote {
+            let noteItem = NSMenuItem(title: note, action: nil, keyEquivalent: "")
+            noteItem.isEnabled = false
+            menu.addItem(noteItem)
+        }
+        addAction("Check for Updates… (v\(FirnVersion.current))", to: menu) { [weak self] in
+            self?.checkForUpdates(userInitiated: true)
         }
     }
 
@@ -670,6 +726,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             addAction("Settings…", to: menu, keyEquivalent: ",") { [weak self] in
                 self?.openSettingsWindow()
             }
+            appendVersionAndUpdateItems(to: menu)
             menu.addItem(.separator())
             menu.addItem(NSMenuItem(title: "Quit Firn", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
             statusItem.menu = menu
@@ -722,6 +779,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.refreshStatus()
                 }
             }
+            appendVersionAndUpdateItems(to: menu)
             menu.addItem(NSMenuItem(title: "Quit Firn", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
             statusItem.menu = menu
             return
@@ -1015,6 +1073,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.refreshStatus()
             }
         }
+        appendVersionAndUpdateItems(to: menu)
         menu.addItem(NSMenuItem(title: "Quit Firn", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
     }

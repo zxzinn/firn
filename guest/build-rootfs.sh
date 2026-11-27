@@ -96,6 +96,8 @@ EOF
     mv /out/rootfs.ext4.tmp /out/rootfs.ext4
   '
 
+printf '%s\n' "${FIRN_IMAGE_VERSION:-local-build}" >"$OUT_DIR/version.txt"
+
 DATA_DISK="$STATE_DIR/data.ext4"
 if [ ! -f "$DATA_DISK" ]; then
   echo "[firn-rootfs] creating sparse 120 GiB data disk at $DATA_DISK..."
@@ -103,4 +105,4 @@ if [ ! -f "$DATA_DISK" ]; then
 fi
 
 echo "[firn-rootfs] done:"
-ls -lh "$OUT_DIR/vmlinux.Image" "$OUT_DIR/initramfs.img" "$OUT_DIR/rootfs.ext4" "$DATA_DISK"
+ls -lh "$OUT_DIR/vmlinux.Image" "$OUT_DIR/initramfs.img" "$OUT_DIR/rootfs.ext4" "$OUT_DIR/version.txt" "$DATA_DISK"

@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -120,6 +121,161 @@ func TestFirnFSClientRPCAndPushInvalidation(t *testing.T) {
 	if len(gotInval) != 1 || gotInval[0] != "src/main.ts" {
 		t.Fatalf("unexpected invalidated paths: %v", gotInval)
 	}
+}
+
+func TestFirnFSCacheTargetedInvalidationAndLocalOps(t *testing.T) {
+	cache := newFirnFSCache(64*1024*1024, 16384)
+	// Populate 50 sibling directories x 100 files = 5,000 entries
+	for d := 0; d < 50; d++ {
+		dirRel := "proj/d" + string(rune('a'+d/26)) + string(rune('a'+d%26))
+		items := make([]fsDirPrefetchItem, 100)
+		for f := 0; f < 100; f++ {
+			name := "file_" + string(rune('a'+f/26)) + string(rune('a'+f%26)) + ".dat"
+			items[f] = fsDirPrefetchItem{
+				Name:    name,
+				Attr:    fsAttrWire{Ino: uint64(d*100 + f + 1), Size: 4, Mode: 0o100644},
+				HasData: true,
+				Data:    []byte("abcd"),
+			}
+		}
+		cache.PutDirPrefetch(dirRel, items)
+	}
+
+	// Local create + absence checks keep directory complete without wiping siblings
+	rwItems := []fsDirPrefetchItem{}
+	cache.PutDirPrefetch("proj/rw", rwItems)
+	if !cache.IsKnownAbsent("proj/rw", "new.txt") {
+		t.Fatal("expected new.txt to be known absent inside empty cached rw dir")
+	}
+	cache.RecordLocalCreate("proj/rw", "new.txt", fsAttrWire{Ino: 99999, Size: 0, Mode: 0o100644})
+	if cache.IsKnownAbsent("proj/rw", "new.txt") {
+		t.Fatal("expected created file to no longer be known absent")
+	}
+	if !cache.IsKnownAbsent("proj/rw", "other.txt") {
+		t.Fatal("expected unrelated filename in same dir to remain known absent")
+	}
+	cache.UpdateWriteAttr("proj/rw/new.txt", 4096, 123456)
+	if attr, _, hasData, ok := cache.GetEntry("proj/rw/new.txt"); !ok || hasData || attr.Size != 4096 {
+		t.Fatalf("unexpected UpdateWriteAttr result: ok=%v hasData=%v attr=%+v", ok, hasData, attr)
+	}
+	cache.RecordLocalRemove("proj/rw", "new.txt")
+	if !cache.IsKnownAbsent("proj/rw", "new.txt") {
+		t.Fatal("expected removed file to be known absent again")
+	}
+
+	// Subtree directory invalidation removes only proj/daa and leaves proj/dab intact
+	cache.InvalidatePath("proj/daa")
+	if _, _, _, exists := cache.GetEntry("proj/daa/file_aa.dat"); exists {
+		t.Fatal("expected invalidated subtree entry to be evicted")
+	}
+	if _, _, _, exists := cache.GetEntry("proj/dab/file_aa.dat"); !exists {
+		t.Fatal("expected sibling directory entry to survive targeted invalidation")
+	}
+}
+
+func TestFirnFSCacheRecentLocalEcho(t *testing.T) {
+	cache := newFirnFSCache(1024*1024, 1024)
+	cache.PutDirPrefetch("work/rw", nil)
+	cache.RecordLocalCreate("work/rw", "local.tmp", fsAttrWire{Ino: 101, Mode: 0o100644})
+	now := time.Now().UnixNano()
+	if !cache.IsRecentLocalEcho("work/rw/local.tmp", now) {
+		t.Fatal("expected immediate echo for locally created path")
+	}
+	if cache.IsRecentLocalEcho("work/rw/external.txt", now) {
+		t.Fatal("expected unrelated path not to match local echo filter")
+	}
+	if cache.IsRecentLocalEcho("work/rw/local.tmp", now+int64(250*time.Millisecond)) {
+		t.Fatal("expected local echo window to expire after 250ms")
+	}
+}
+
+func TestFirnFSClientPushPrefetch(t *testing.T) {
+	cSide, sSide := net.Pipe()
+	defer cSide.Close()
+	defer sSide.Close()
+
+	cache := newFirnFSCache(1024*1024, 1024)
+	donePrefetch := make(chan string, 1)
+	client := newFirnFSClientWithConn(cSide, nil)
+	client.SetOnPrefetch(func(dirRel string, items []fsDirPrefetchItem) {
+		cache.PutDirPrefetch(dirRel, items)
+		donePrefetch <- dirRel
+	})
+	defer client.Close()
+
+	go func() {
+		var body bytes.Buffer
+		writeShortStr(&body, "work/d00")
+		var cnt [4]byte
+		binary.BigEndian.PutUint32(cnt[:], 1)
+		body.Write(cnt[:])
+		writeShortStr(&body, "hello.txt")
+		var rawAttr [64]byte
+		binary.BigEndian.PutUint64(rawAttr[0:8], 77)
+		binary.BigEndian.PutUint64(rawAttr[8:16], 5)
+		binary.BigEndian.PutUint32(rawAttr[48:52], 0o100644)
+		body.Write(rawAttr[:])
+		body.WriteByte(1)
+		var dlen [4]byte
+		binary.BigEndian.PutUint32(dlen[:], 5)
+		body.Write(dlen[:])
+		body.WriteString("hello")
+
+		var hdr [9]byte
+		hdr[4] = fsOpPushPrefetch
+		binary.BigEndian.PutUint32(hdr[5:9], uint32(body.Len()))
+		_, _ = sSide.Write(append(hdr[:], body.Bytes()...))
+	}()
+
+	select {
+	case dirRel := <-donePrefetch:
+		if dirRel != "work/d00" {
+			t.Fatalf("unexpected prefetch dirRel %q", dirRel)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for push prefetch")
+	}
+	attr, data, hasData, ok := cache.GetEntry("work/d00/hello.txt")
+	if !ok || !hasData || attr.Ino != 77 || string(data) != "hello" {
+		t.Fatalf("unexpected cached prefetch entry: ok=%v hasData=%v attr=%+v data=%q", ok, hasData, attr, string(data))
+	}
+}
+
+func TestAdaptiveVsockSpliceHalfClose(t *testing.T) {
+	a1, a2 := net.Pipe()
+	b1, b2 := net.Pipe()
+	defer a1.Close()
+	defer a2.Close()
+	defer b1.Close()
+	defer b2.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		spliceHalfClose(a2, b1)
+	}()
+
+	// Stream >512 KiB (crosses bulk threshold) + small reverse reply
+	payload := bytes.Repeat([]byte("V"), 768*1024)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := a1.Write(payload)
+		_ = a1.Close()
+		errCh <- err
+	}()
+
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(b2, got); err != nil {
+		t.Fatal(err)
+	}
+	_ = b2.Close()
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("bulk splice payload mismatch")
+	}
+	<-done
 }
 
 func TestK3sKubeconfigAndMachinesDNS(t *testing.T) {

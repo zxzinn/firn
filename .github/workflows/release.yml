@@ -14,12 +14,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: host/firn-hostnet/go.mod
+          cache-dependency-path: host/firn-hostnet/go.sum
       - name: Build macOS binaries & Firn.app
         run: |
           make hostnet
           make swift
+          codesign -d --entitlements :- build/firnd
           mkdir -p dist
-          tar -C build -czf dist/firn-darwin-arm64.tar.gz firn firnd firn-hostnet Firn.app
+          tar -C build -czf dist/firn-darwin-arm64.tar.gz firn firnd firn-hostnet entitlements.plist Firn.app
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dist
@@ -36,15 +38,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: guest/firn-guestd/go.mod
+          cache-dependency-path: guest/firn-guestd/go.sum
       - name: Build Linux ARM64 kernel, initramfs & rootfs
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq zstd e2fsprogs cpio gzip
-          bash guest/build-rootfs.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq e2fsprogs cpio gzip
+          FIRN_IMAGE_VERSION="${GITHUB_REF_NAME:-local-build}" bash guest/build-rootfs.sh
           mkdir -p dist
-          zstd -19 -T0 -f ~/.firn/images/rootfs.ext4 -o dist/rootfs.ext4.zst
-          cp ~/.firn/images/vmlinux.Image dist/vmlinux.Image
-          cp ~/.firn/images/initramfs.img dist/initramfs.img
-          tar -C dist -czf dist/firn-linux-arm64-images.tar.gz vmlinux.Image initramfs.img rootfs.ext4.zst
+          tar --format=posix --sparse -C ~/.firn/images -czf dist/firn-linux-arm64-images.tar.gz vmlinux.Image initramfs.img rootfs.ext4
       - uses: actions/upload-artifact@v4
         with:
           name: linux-images-dist
@@ -60,13 +60,61 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Prepare checksums
+      - name: Prepare checksums & Homebrew formula
         run: |
           mkdir -p release-files
           mv artifacts/macos-dist/firn-darwin-arm64.tar.gz release-files/
           mv artifacts/linux-images-dist/firn-linux-arm64-images.tar.gz release-files/
           (cd release-files && sha256sum firn-darwin-arm64.tar.gz firn-linux-arm64-images.tar.gz > SHA256SUMS.txt)
           cat release-files/SHA256SUMS.txt
+          TAG="${GITHUB_REF_NAME}"
+          VER="${TAG#v}"
+          DARWIN_SHA256="$(awk '$2 == "firn-darwin-arm64.tar.gz" { print $1 }' release-files/SHA256SUMS.txt)"
+          cat > release-files/firn.rb <<EOF
+          class Firn < Formula
+            desc "Native macOS Apple Silicon Docker, Kubernetes & Linux VM runtime"
+            homepage "https://github.com/zxzinn/firn"
+            url "https://github.com/zxzinn/firn/releases/download/${TAG}/firn-darwin-arm64.tar.gz"
+            version "${VER}"
+            sha256 "${DARWIN_SHA256}"
+            license "Apache-2.0"
+            head "https://github.com/zxzinn/firn.git", branch: "main"
+
+            depends_on macos: :sonoma
+            depends_on arch: :arm64
+            depends_on "go" => :build if build.head?
+
+            def install
+              if build.head?
+                system "make", "hostnet", "swift"
+                bin.install "build/firn", "build/firnd", "build/firn-hostnet"
+                bin.install "build/entitlements.plist" if File.exist?("build/entitlements.plist")
+                prefix.install "build/Firn.app"
+              else
+                bin.install "firn", "firnd", "firn-hostnet"
+                bin.install "entitlements.plist" if File.exist?("entitlements.plist")
+                prefix.install "Firn.app"
+              end
+              if File.exist?(bin/"entitlements.plist")
+                system "codesign", "--entitlements", bin/"entitlements.plist", "--force", "-s", "-", bin/"firnd"
+              end
+            end
+
+            def caveats
+              <<~EOS
+                Run \`firn doctor\` to check Hypervisor, Nested KVM, and guest images.
+                \`firn up\` downloads matching Linux VM images automatically on first run
+                (or run \`firn images pull\`).
+                Open FirnBar via \`firn gui\` or:
+                  #{prefix}/Firn.app
+              EOS
+            end
+
+            test do
+              assert_match "Firn ${VER}", shell_output("#{bin}/firn version")
+            end
+          end
+          EOF
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -74,3 +122,4 @@ jobs:
             release-files/firn-darwin-arm64.tar.gz
             release-files/firn-linux-arm64-images.tar.gz
             release-files/SHA256SUMS.txt
+            release-files/firn.rb

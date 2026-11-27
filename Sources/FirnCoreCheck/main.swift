@@ -48,7 +48,24 @@ expect(WireDNS.buildLocalResponse(for: externalQuery, domain: "firn.local", know
 let defaultCfg = FirnConfig()
 expect(defaultCfg.exemptProjects.isEmpty, "Open-source default exemptProjects must be empty")
 expect(defaultCfg.httpsProxyPort == 8443, "Default httpsProxyPort must be 8443")
-expect(defaultCfg.fsMode == "firnfs" && defaultCfg.diskSyncMode == "none" && !defaultCfg.nestedVirtualization, "Expected v0.4.0 default config flags")
+expect(defaultCfg.fsMode == "firnfs" && defaultCfg.diskSyncMode == "none" && !defaultCfg.nestedVirtualization, "Expected v0.5.0 default config flags")
+
+expect(FirnVersion.compare("0.4.0", "0.5.0") == .orderedAscending, "0.4.0 < 0.5.0 failed")
+expect(FirnVersion.compare("0.9.0", "0.10.0") == .orderedAscending, "0.9.0 < 0.10.0 failed")
+expect(FirnVersion.compare("v0.5.0-rc.1", "0.5.0") == .orderedAscending, "prerelease ordering failed")
+expect(FirnVersion.compare("v0.5.0", "0.5.0") == .orderedSame, "v0.5.0 == 0.5.0 failed")
+expect(FirnVersion.normalizedTag("0.5.0") == "v0.5.0", "normalizedTag failed")
+
+expect(FirnInstallOrigin.detect(executablePath: "/opt/homebrew/Cellar/firn/0.5.0/bin/firn") == .homebrew(cellarPath: "/opt/homebrew/Cellar/firn/0.5.0"), "Homebrew origin detect failed")
+expect(FirnInstallOrigin.detect(executablePath: "/opt/firn/bin/firn") == .standalone(binDir: URL(fileURLWithPath: "/opt/firn/bin")), "Standalone origin detect failed")
+
+let sampleSums = """
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  firn-darwin-arm64.tar.gz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *./firn-linux-arm64-images.tar.gz
+"""
+let parsedSums = FirnDistribution.parseSHA256Sums(sampleSums)
+expect(parsedSums["firn-darwin-arm64.tar.gz"] == String(repeating: "a", count: 64), "parseSHA256Sums darwin mismatch")
+expect(parsedSums["firn-linux-arm64-images.tar.gz"] == String(repeating: "b", count: 64), "parseSHA256Sums images mismatch")
 
 let tmpStateDir = FileManager.default.temporaryDirectory.appendingPathComponent("firn-check-\(UUID().uuidString)")
 defer { try? FileManager.default.removeItem(at: tmpStateDir) }
@@ -98,6 +115,24 @@ let diskStats = FirnHostClient.hostSparseFileStats(at: probeFile)
 expect(diskStats.logicalBytes == 8192 && diskStats.allocatedBytes > 0, "Expected hostSparseFileStats logical=8192 allocated>0")
 let digest = try FirnHostClient.sha256Hex(of: probeFile)
 expect(digest.count == 64, "Expected 64-char sha256 digest")
+
+let bigProbe = tmpStateDir.appendingPathComponent("multi-chunk.bin")
+let chunkData = Data(repeating: 0x5A, count: 1_200_000)
+try chunkData.write(to: bigProbe)
+let bigDigest = try FirnHostClient.sha256Hex(of: bigProbe)
+expect(bigDigest.count == 64, "Expected multi-chunk sha256 digest")
+
+let sparseDataDisk = tmpStateDir.appendingPathComponent("data.ext4")
+let createdSparse = try FirnDistribution.ensureSparseDataDisk(at: sparseDataDisk, sizeGiB: 120)
+let createdAgain = try FirnDistribution.ensureSparseDataDisk(at: sparseDataDisk, sizeGiB: 120)
+let sparseStats = FirnHostClient.hostSparseFileStats(at: sparseDataDisk)
+expect(createdSparse && !createdAgain, "ensureSparseDataDisk creation/idempotency mismatch")
+expect(sparseStats.logicalBytes == 120 * 1024 * 1024 * 1024 && sparseStats.allocatedBytes < 1024 * 1024, "Sparse disk allocation mismatch: \(sparseStats)")
+
+let imgDir = tmpStateDir.appendingPathComponent("images")
+expect(FirnDistribution.missingGuestImages(in: imgDir).count == 3, "Expected 3 missing images in empty dir")
+try FirnDistribution.recordInstalledImageVersion("v0.5.0", in: imgDir)
+expect(FirnDistribution.installedImageVersion(in: imgDir) == "v0.5.0", "installedImageVersion mismatch")
 
 expect(FirnHostClient.formatBytes(512 * 1024) == "0.5 MiB", "formatBytes MiB mismatch")
 expect(FirnHostClient.formatBytes(2 * 1024 * 1024 * 1024) == "2.00 GiB", "formatBytes GiB mismatch")

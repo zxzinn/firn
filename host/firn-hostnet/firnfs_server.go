@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -34,10 +35,14 @@ const (
 	fsOpLink           byte = 15
 	fsOpStatfs         byte = 16
 	fsOpPushInvalidate byte = 0x80
+	fsOpPushPrefetch   byte = 0x81
 
-	fsPrefetchMaxFiles = 1024
-	fsPrefetchMaxFile  = 64 * 1024
-	fsPrefetchMaxTotal = 8 * 1024 * 1024
+	fsPrefetchMaxFiles     = 1024
+	fsPrefetchMaxFile      = 64 * 1024
+	fsPrefetchMaxTotal     = 8 * 1024 * 1024
+	fsDeepPrefetchMaxDirs  = 64
+	fsDeepPrefetchMaxFiles = 2048
+	fsDeepPrefetchMaxTotal = 8 * 1024 * 1024
 
 	// Portable Linux errno numbers for Darwin -> Linux FUSE wire responses.
 	lnxEPERM        uint32 = 1
@@ -87,8 +92,9 @@ type FirnFSServer struct {
 }
 
 type fsClientConn struct {
-	conn    net.Conn
-	writeMu sync.Mutex
+	conn          net.Conn
+	writeMu       sync.Mutex
+	prefetchSlots atomic.Int32
 }
 
 func NewFirnFSServer(root string) (*FirnFSServer, error) {
@@ -168,6 +174,33 @@ func (s *FirnFSServer) serveConn(ctx context.Context, conn net.Conn) {
 		}
 		// Dispatch concurrently so slow disk I/O doesn't stall metadata lookups.
 		go func(id uint32, opc byte, req []byte) {
+			if opc == fsOpReaddirPref {
+				off := 0
+				rel, ok := readShortStr(req, &off)
+				if !ok {
+					_ = cc.writeFrame(id, opc, encodeErrno(lnxEINVAL))
+					return
+				}
+				resp, subdirs := s.handleReaddirPrefetchWithSubdirs(rel)
+				if werr := cc.writeFrame(id, opc, resp); werr != nil {
+					return
+				}
+				cleanRel := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+rel)), "/")
+				if cleanRel == "." {
+					cleanRel = ""
+				}
+				if cleanRel != "" && len(subdirs) > 0 {
+					if cc.prefetchSlots.Add(1) <= 2 {
+						go func() {
+							defer cc.prefetchSlots.Add(-1)
+							s.streamSubdirPrefetch(ctx, cc, cleanRel, subdirs)
+						}()
+					} else {
+						cc.prefetchSlots.Add(-1)
+					}
+				}
+				return
+			}
 			resp := s.handleOp(opc, req)
 			_ = cc.writeFrame(id, opc, resp)
 		}(reqID, op, payload)
@@ -744,14 +777,38 @@ type prefetchEntry struct {
 	data    []byte
 }
 
-func (s *FirnFSServer) handleReaddirPrefetch(rel string) []byte {
-	full, err := s.resolveRel(rel)
-	if err != nil {
-		return encodeErrno(toLinuxErrno(err))
+type prefetchBudget struct {
+	mu       sync.Mutex
+	files    int
+	bytes    int
+	maxFiles int
+	maxBytes int
+}
+
+func (b *prefetchBudget) reserve(size int) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.files >= b.maxFiles || b.bytes+size > b.maxBytes {
+		return false
 	}
+	b.files++
+	b.bytes += size
+	return true
+}
+
+func shouldSkipPrefetchSubdir(name string) bool {
+	switch name {
+	case ".git", "node_modules", ".Trash", "Library", ".cache", ".firn", ".build", "target", "__pycache__", ".venv":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *FirnFSServer) collectDirPrefetchEntries(full string, budget *prefetchBudget) ([]prefetchEntry, []string, error) {
 	entries, err := os.ReadDir(full)
 	if err != nil {
-		return encodeErrno(toLinuxErrno(err))
+		return nil, nil, err
 	}
 
 	results := make([]prefetchEntry, len(entries))
@@ -761,16 +818,15 @@ func (s *FirnFSServer) handleReaddirPrefetch(rel string) []byte {
 		workers = max(1, len(entries))
 	}
 
-	var idxCh = make(chan int, len(entries))
+	idxCh := make(chan int, len(entries))
 	for i := range entries {
 		idxCh <- i
 	}
 	close(idxCh)
 
 	var wg sync.WaitGroup
-	var budgetMu sync.Mutex
-	totalInline := 0
-	prefetchFiles := 0
+	var subdirsMu sync.Mutex
+	var subdirs []string
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -784,16 +840,15 @@ func (s *FirnFSServer) handleReaddirPrefetch(rel string) []byte {
 					continue
 				}
 				pe := prefetchEntry{name: name, attr: attr}
-				if (attr.Mode&lnxSIFMT) == lnxSIFREG && attr.Size <= fsPrefetchMaxFile {
-					allowed := false
-					budgetMu.Lock()
-					if prefetchFiles < fsPrefetchMaxFiles && totalInline+int(attr.Size) <= fsPrefetchMaxTotal {
-						prefetchFiles++
-						totalInline += int(attr.Size)
-						allowed = true
+				ftype := attr.Mode & lnxSIFMT
+				if ftype == lnxSIFDIR {
+					if !shouldSkipPrefetchSubdir(name) {
+						subdirsMu.Lock()
+						subdirs = append(subdirs, name)
+						subdirsMu.Unlock()
 					}
-					budgetMu.Unlock()
-					if allowed {
+				} else if ftype == lnxSIFREG && attr.Size <= fsPrefetchMaxFile {
+					if budget.reserve(int(attr.Size)) {
 						if b, rerr := os.ReadFile(ep); rerr == nil {
 							pe.hasData = true
 							pe.data = b
@@ -808,23 +863,22 @@ func (s *FirnFSServer) handleReaddirPrefetch(rel string) []byte {
 	}
 	wg.Wait()
 
-	var count uint32
-	for _, ok := range valid {
-		if ok {
-			count++
+	out := make([]prefetchEntry, 0, len(entries))
+	for i, pe := range results {
+		if valid[i] {
+			out = append(out, pe)
 		}
 	}
-	var out bytes.Buffer
-	out.Write(encodeErrno(0))
+	return out, subdirs, nil
+}
+
+func encodePrefetchEntries(out *bytes.Buffer, entries []prefetchEntry) {
 	var cntBuf [4]byte
-	binary.BigEndian.PutUint32(cntBuf[:], count)
+	binary.BigEndian.PutUint32(cntBuf[:], uint32(len(entries)))
 	out.Write(cntBuf[:])
-	for i, pe := range results {
-		if !valid[i] {
-			continue
-		}
-		writeShortStr(&out, pe.name)
-		writeAttr(&out, pe.attr)
+	for _, pe := range entries {
+		writeShortStr(out, pe.name)
+		writeAttr(out, pe.attr)
 		if pe.hasData {
 			out.WriteByte(1)
 			var dl [4]byte
@@ -835,7 +889,69 @@ func (s *FirnFSServer) handleReaddirPrefetch(rel string) []byte {
 			out.WriteByte(0)
 		}
 	}
-	return out.Bytes()
+}
+
+func (s *FirnFSServer) handleReaddirPrefetch(rel string) []byte {
+	resp, _ := s.handleReaddirPrefetchWithSubdirs(rel)
+	return resp
+}
+
+func (s *FirnFSServer) handleReaddirPrefetchWithSubdirs(rel string) ([]byte, []string) {
+	full, err := s.resolveRel(rel)
+	if err != nil {
+		return encodeErrno(toLinuxErrno(err)), nil
+	}
+	budget := prefetchBudget{maxFiles: fsPrefetchMaxFiles, maxBytes: fsPrefetchMaxTotal}
+	entries, subdirs, err := s.collectDirPrefetchEntries(full, &budget)
+	if err != nil {
+		return encodeErrno(toLinuxErrno(err)), nil
+	}
+	var out bytes.Buffer
+	out.Write(encodeErrno(0))
+	encodePrefetchEntries(&out, entries)
+	return out.Bytes(), subdirs
+}
+
+func (s *FirnFSServer) streamSubdirPrefetch(ctx context.Context, cc *fsClientConn, parentRel string, subdirs []string) {
+	if len(subdirs) > fsDeepPrefetchMaxDirs {
+		subdirs = subdirs[:fsDeepPrefetchMaxDirs]
+	}
+	budget := prefetchBudget{maxFiles: fsDeepPrefetchMaxFiles, maxBytes: fsDeepPrefetchMaxTotal}
+	workers := min(16, max(1, len(subdirs)))
+	subCh := make(chan string, len(subdirs))
+	for _, name := range subdirs {
+		subCh <- name
+	}
+	close(subCh)
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for subName := range subCh {
+				if ctx.Err() != nil {
+					return
+				}
+				subRel := parentRel + "/" + subName
+				subFull, err := s.resolveRel(subRel)
+				if err != nil {
+					continue
+				}
+				entries, _, err := s.collectDirPrefetchEntries(subFull, &budget)
+				if err != nil {
+					continue
+				}
+				var payload bytes.Buffer
+				writeShortStr(&payload, subRel)
+				encodePrefetchEntries(&payload, entries)
+				if cc.writeFrame(0, fsOpPushPrefetch, payload.Bytes()) != nil {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func statTimes(path string) (syscall.Timespec, syscall.Timespec, error) {

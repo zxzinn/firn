@@ -32,9 +32,11 @@ const (
 	fsOpLink           byte = 15
 	fsOpStatfs         byte = 16
 	fsOpPushInvalidate byte = 0x80
+	fsOpPushPrefetch   byte = 0x81
 
 	firnFSCacheMaxBytes   = 64 * 1024 * 1024
 	firnFSCacheMaxEntries = 16384
+	firnLocalEchoWindowNs = int64(150 * time.Millisecond)
 )
 
 type fsAttrWire struct {
@@ -73,6 +75,24 @@ func cleanFirnFSRelPath(rel string) string {
 		return ""
 	}
 	return rel
+}
+
+func cleanFastRelPath(rel string) string {
+	if rel == "" {
+		return ""
+	}
+	if rel[0] != '/' && rel[len(rel)-1] != '/' && rel != "." &&
+		!strings.Contains(rel, "//") && !strings.Contains(rel, "..") && !strings.Contains(rel, "\\") {
+		return rel
+	}
+	return cleanFirnFSRelPath(rel)
+}
+
+func parentOfFirnFSRel(rel string) string {
+	if idx := strings.LastIndex(rel, "/"); idx > 0 {
+		return rel[:idx]
+	}
+	return ""
 }
 
 func joinFirnFSRel(dir, name string) string {
@@ -127,6 +147,49 @@ func decodeFSAttr(data []byte, off *int) (fsAttrWire, bool) {
 	}, true
 }
 
+// decodeDirPrefetchItems decodes cnt serialized prefetch entries starting at *off.
+// Data slices point into data when copyData is false; callers storing directly into
+// long-lived buffers can set copyData=true or rely on PutDirPrefetch copying.
+func decodeDirPrefetchItems(data []byte, off *int, cnt int, copyData bool) ([]fsDirPrefetchItem, bool) {
+	if cnt < 0 || cnt > 65536 {
+		return nil, false
+	}
+	items := make([]fsDirPrefetchItem, 0, cnt)
+	for i := 0; i < cnt; i++ {
+		name, ok1 := readShortStr(data, off)
+		attr, ok2 := decodeFSAttr(data, off)
+		if !ok1 || !ok2 || *off >= len(data) {
+			return nil, false
+		}
+		hasData := data[*off] != 0
+		*off++
+		var fileData []byte
+		if hasData {
+			if *off+4 > len(data) {
+				return nil, false
+			}
+			dlen := int(binary.BigEndian.Uint32(data[*off : *off+4]))
+			*off += 4
+			if dlen < 0 || *off+dlen > len(data) {
+				return nil, false
+			}
+			if copyData {
+				fileData = append([]byte(nil), data[*off:*off+dlen]...)
+			} else {
+				fileData = data[*off : *off+dlen]
+			}
+			*off += dlen
+		}
+		items = append(items, fsDirPrefetchItem{
+			Name:    name,
+			Attr:    attr,
+			HasData: hasData,
+			Data:    fileData,
+		})
+	}
+	return items, true
+}
+
 type cachedFSEntry struct {
 	rel     string
 	attr    fsAttrWire
@@ -136,17 +199,20 @@ type cachedFSEntry struct {
 }
 
 type cachedFSDir struct {
-	items []string
+	items   []string
+	nameIdx map[string]int
 }
 
 type firnFSCache struct {
-	mu         sync.RWMutex
-	maxBytes   int
-	maxEntries int
-	curBytes   int
-	entries    map[string]*cachedFSEntry
-	dirs       map[string]cachedFSDir
-	lru        *list.List
+	mu               sync.RWMutex
+	maxBytes         int
+	maxEntries       int
+	curBytes         int
+	entries          map[string]*cachedFSEntry
+	dirs             map[string]cachedFSDir
+	childrenByParent map[string]map[string]struct{}
+	recentLocalMut   map[string]int64
+	lru              *list.List
 }
 
 func newFirnFSCache(maxBytes, maxEntries int) *firnFSCache {
@@ -157,55 +223,115 @@ func newFirnFSCache(maxBytes, maxEntries int) *firnFSCache {
 		maxEntries = firnFSCacheMaxEntries
 	}
 	return &firnFSCache{
-		maxBytes:   maxBytes,
-		maxEntries: maxEntries,
-		entries:    make(map[string]*cachedFSEntry),
-		dirs:       make(map[string]cachedFSDir),
-		lru:        list.New(),
+		maxBytes:         maxBytes,
+		maxEntries:       maxEntries,
+		entries:          make(map[string]*cachedFSEntry),
+		dirs:             make(map[string]cachedFSDir),
+		childrenByParent: make(map[string]map[string]struct{}),
+		recentLocalMut:   make(map[string]int64),
+		lru:              list.New(),
+	}
+}
+
+func (c *firnFSCache) recordLocalMutationLocked(rel string, nowNs int64) {
+	if rel == "" {
+		return
+	}
+	c.recentLocalMut[rel] = nowNs
+	if len(c.recentLocalMut) > 4096 {
+		cutoff := nowNs - int64(500*time.Millisecond)
+		for k, ts := range c.recentLocalMut {
+			if ts < cutoff {
+				delete(c.recentLocalMut, k)
+			}
+		}
+	}
+}
+
+func (c *firnFSCache) IsRecentLocalEcho(rel string, nowNs int64) bool {
+	rel = cleanFastRelPath(rel)
+	c.mu.RLock()
+	ts, ok := c.recentLocalMut[rel]
+	c.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	return nowNs >= ts && (nowNs-ts) <= firnLocalEchoWindowNs
+}
+
+func (c *firnFSCache) trackChildLocked(rel string) {
+	if rel == "" {
+		return
+	}
+	parent := parentOfFirnFSRel(rel)
+	set := c.childrenByParent[parent]
+	if set == nil {
+		set = make(map[string]struct{})
+		c.childrenByParent[parent] = set
+	}
+	set[rel] = struct{}{}
+}
+
+func (c *firnFSCache) untrackChildIfGoneLocked(rel string) {
+	if rel == "" {
+		return
+	}
+	if _, inEnt := c.entries[rel]; inEnt {
+		return
+	}
+	if _, inDir := c.dirs[rel]; inDir {
+		return
+	}
+	parent := parentOfFirnFSRel(rel)
+	if set, ok := c.childrenByParent[parent]; ok {
+		delete(set, rel)
+		if len(set) == 0 {
+			delete(c.childrenByParent, parent)
+		}
 	}
 }
 
 func (c *firnFSCache) GetEntry(rel string) (fsAttrWire, []byte, bool, bool) {
-	rel = cleanFirnFSRelPath(rel)
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	rel = cleanFastRelPath(rel)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	ent, ok := c.entries[rel]
 	if !ok {
 		return fsAttrWire{}, nil, false, false
 	}
-	c.lru.MoveToFront(ent.elem)
 	return ent.attr, ent.data, ent.hasData, true
 }
 
 func (c *firnFSCache) PutEntry(rel string, attr fsAttrWire, data []byte, hasData bool) {
-	rel = cleanFirnFSRelPath(rel)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.putEntryLocked(rel, attr, data, hasData)
-}
-
-func (c *firnFSCache) putEntryLocked(rel string, attr fsAttrWire, data []byte, hasData bool) {
+	rel = cleanFastRelPath(rel)
 	var copied []byte
 	if hasData && data != nil {
 		copied = append([]byte(nil), data...)
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.putEntryOwnedLocked(rel, attr, copied, hasData)
+}
+
+func (c *firnFSCache) putEntryOwnedLocked(rel string, attr fsAttrWire, ownedData []byte, hasData bool) {
 	if existing, ok := c.entries[rel]; ok {
 		c.curBytes -= len(existing.data)
 		existing.attr = attr
-		existing.data = copied
+		existing.data = ownedData
 		existing.hasData = hasData
-		c.curBytes += len(copied)
+		c.curBytes += len(ownedData)
 		c.lru.MoveToFront(existing.elem)
 	} else {
 		ent := &cachedFSEntry{
 			rel:     rel,
 			attr:    attr,
 			hasData: hasData,
-			data:    copied,
+			data:    ownedData,
 		}
 		ent.elem = c.lru.PushFront(ent)
 		c.entries[rel] = ent
-		c.curBytes += len(copied)
+		c.curBytes += len(ownedData)
+		c.trackChildLocked(rel)
 	}
 	c.evictLocked()
 }
@@ -220,26 +346,38 @@ func (c *firnFSCache) evictLocked() {
 		c.lru.Remove(tail)
 		delete(c.entries, ent.rel)
 		c.curBytes -= len(ent.data)
+		c.untrackChildIfGoneLocked(ent.rel)
 	}
 }
 
 func (c *firnFSCache) PutDirPrefetch(dirRel string, items []fsDirPrefetchItem) {
-	dirRel = cleanFirnFSRelPath(dirRel)
+	dirRel = cleanFastRelPath(dirRel)
 	names := make([]string, 0, len(items))
+	nameIdx := make(map[string]int, len(items))
+	copiedData := make([][]byte, len(items))
+	for i, it := range items {
+		if it.HasData && it.Data != nil {
+			copiedData[i] = append([]byte(nil), it.Data...)
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, it := range items {
-		names = append(names, it.Name)
+	for i, it := range items {
+		if _, dup := nameIdx[it.Name]; !dup {
+			nameIdx[it.Name] = len(names)
+			names = append(names, it.Name)
+		}
 		childRel := joinFirnFSRel(dirRel, it.Name)
-		c.putEntryLocked(childRel, it.Attr, it.Data, it.HasData)
+		c.putEntryOwnedLocked(childRel, it.Attr, copiedData[i], it.HasData)
 	}
-	c.dirs[dirRel] = cachedFSDir{items: names}
+	c.dirs[dirRel] = cachedFSDir{items: names, nameIdx: nameIdx}
+	c.trackChildLocked(dirRel)
 }
 
 func (c *firnFSCache) GetDirPrefetch(dirRel string) ([]fsDirPrefetchItem, bool) {
-	dirRel = cleanFirnFSRelPath(dirRel)
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	dirRel = cleanFastRelPath(dirRel)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	dir, ok := c.dirs[dirRel]
 	if !ok {
 		return nil, false
@@ -251,7 +389,6 @@ func (c *firnFSCache) GetDirPrefetch(dirRel string) ([]fsDirPrefetchItem, bool) 
 		if !exists {
 			return nil, false
 		}
-		c.lru.MoveToFront(ent.elem)
 		out = append(out, fsDirPrefetchItem{
 			Name:    name,
 			Attr:    ent.attr,
@@ -262,35 +399,114 @@ func (c *firnFSCache) GetDirPrefetch(dirRel string) ([]fsDirPrefetchItem, bool) 
 	return out, true
 }
 
-func (c *firnFSCache) InvalidatePath(rel string) {
-	rel = cleanFirnFSRelPath(rel)
-	parent := ""
-	if idx := strings.LastIndex(rel, "/"); idx > 0 {
-		parent = rel[:idx]
+func (c *firnFSCache) IsKnownAbsent(parentRel, name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
 	}
+	parentRel = cleanFastRelPath(parentRel)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	dir, ok := c.dirs[parentRel]
+	if !ok {
+		return false
+	}
+	_, exists := dir.nameIdx[name]
+	return !exists
+}
+
+func (c *firnFSCache) RecordLocalCreate(parentRel, name string, attr fsAttrWire) {
+	parentRel = cleanFastRelPath(parentRel)
+	childRel := joinFirnFSRel(parentRel, name)
+	nowNs := time.Now().UnixNano()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.removeEntryLocked(rel)
-	delete(c.dirs, rel)
-	if rel != "" {
-		delete(c.dirs, parent)
-		prefix := rel + "/"
-		for k := range c.entries {
-			if strings.HasPrefix(k, prefix) {
-				c.removeEntryLocked(k)
+	c.putEntryOwnedLocked(childRel, attr, nil, false)
+	c.recordLocalMutationLocked(childRel, nowNs)
+	if dir, ok := c.dirs[parentRel]; ok {
+		if _, exists := dir.nameIdx[name]; !exists {
+			if dir.nameIdx == nil {
+				dir.nameIdx = make(map[string]int)
 			}
+			dir.nameIdx[name] = len(dir.items)
+			dir.items = append(dir.items, name)
+			c.dirs[parentRel] = dir
 		}
-		for k := range c.dirs {
-			if strings.HasPrefix(k, prefix) {
-				delete(c.dirs, k)
+	}
+}
+
+func (c *firnFSCache) RecordLocalRemove(parentRel, name string) {
+	parentRel = cleanFastRelPath(parentRel)
+	childRel := joinFirnFSRel(parentRel, name)
+	nowNs := time.Now().UnixNano()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removeSubtreeLocked(childRel)
+	c.recordLocalMutationLocked(childRel, nowNs)
+	if dir, ok := c.dirs[parentRel]; ok {
+		if idx, exists := dir.nameIdx[name]; exists {
+			lastIdx := len(dir.items) - 1
+			if idx != lastIdx {
+				moved := dir.items[lastIdx]
+				dir.items[idx] = moved
+				dir.nameIdx[moved] = idx
 			}
+			dir.items = dir.items[:lastIdx]
+			delete(dir.nameIdx, name)
+			c.dirs[parentRel] = dir
 		}
-	} else {
-		for k := range c.dirs {
-			delete(c.dirs, k)
+	}
+}
+
+func (c *firnFSCache) UpdateWriteAttr(rel string, minSize uint64, mtimeNs int64) {
+	rel = cleanFastRelPath(rel)
+	nowNs := time.Now().UnixNano()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.recordLocalMutationLocked(rel, nowNs)
+	if ent, ok := c.entries[rel]; ok {
+		c.curBytes -= len(ent.data)
+		ent.data = nil
+		ent.hasData = false
+		if minSize > ent.attr.Size {
+			ent.attr.Size = minSize
 		}
-		for k := range c.entries {
-			c.removeEntryLocked(k)
+		ent.attr.MtimeNs = mtimeNs
+	}
+}
+
+func (c *firnFSCache) InvalidatePath(rel string) {
+	rel = cleanFastRelPath(rel)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if rel == "" {
+		c.curBytes = 0
+		c.entries = make(map[string]*cachedFSEntry)
+		c.dirs = make(map[string]cachedFSDir)
+		c.childrenByParent = make(map[string]map[string]struct{})
+		c.lru.Init()
+		return
+	}
+	parent := parentOfFirnFSRel(rel)
+	delete(c.dirs, parent)
+	c.untrackChildIfGoneLocked(parent)
+	c.removeSubtreeLocked(rel)
+}
+
+func (c *firnFSCache) removeSubtreeLocked(rootRel string) {
+	stack := []string{rootRel}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		c.removeEntryLocked(cur)
+		if _, hadDir := c.dirs[cur]; hadDir {
+			delete(c.dirs, cur)
+			c.untrackChildIfGoneLocked(cur)
+		}
+		if kids, ok := c.childrenByParent[cur]; ok {
+			for k := range kids {
+				stack = append(stack, k)
+			}
+			delete(c.childrenByParent, cur)
 		}
 	}
 }
@@ -300,6 +516,7 @@ func (c *firnFSCache) removeEntryLocked(rel string) {
 		c.curBytes -= len(ent.data)
 		c.lru.Remove(ent.elem)
 		delete(c.entries, rel)
+		c.untrackChildIfGoneLocked(rel)
 	}
 }
 
@@ -313,6 +530,7 @@ type firnFSClient struct {
 	addr         string
 	dialer       func() (net.Conn, error)
 	onInvalidate func([]string)
+	onPrefetch   func(string, []fsDirPrefetchItem)
 
 	mu        sync.Mutex
 	conn      net.Conn
@@ -320,6 +538,12 @@ type firnFSClient struct {
 	pending   map[uint32]chan []byte
 	nextReqID atomic.Uint32
 	closed    bool
+}
+
+func (c *firnFSClient) SetOnPrefetch(fn func(dirRel string, items []fsDirPrefetchItem)) {
+	c.mu.Lock()
+	c.onPrefetch = fn
+	c.mu.Unlock()
 }
 
 func newFirnFSClient(addr string, onInvalidate func([]string)) *firnFSClient {
@@ -431,6 +655,23 @@ func (c *firnFSClient) readLoop(conn net.Conn) {
 				paths := decodeInvalidationPayload(payload)
 				if len(paths) > 0 {
 					go c.onInvalidate(paths)
+				}
+			}
+			continue
+		}
+		if reqID == 0 && op == fsOpPushPrefetch {
+			c.mu.Lock()
+			fn := c.onPrefetch
+			c.mu.Unlock()
+			if fn != nil {
+				off := 0
+				dirRel, ok1 := readShortStr(payload, &off)
+				if ok1 && off+4 <= len(payload) {
+					cnt := int(binary.BigEndian.Uint32(payload[off : off+4]))
+					off += 4
+					if items, ok2 := decodeDirPrefetchItems(payload, &off, cnt, false); ok2 {
+						fn(dirRel, items)
+					}
 				}
 			}
 			continue

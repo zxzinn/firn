@@ -22,6 +22,7 @@ swift:
 	cp -f "$(SWIFT_REL_BIN)/firn" build/firn
 	cp -f "$(SWIFT_REL_BIN)/firnd" build/firnd
 	cp -f "$(SWIFT_REL_BIN)/FirnBar" build/Firn.app/Contents/MacOS/FirnBar
+	cp -f entitlements.plist build/entitlements.plist
 	chmod 755 build/firn build/firnd build/Firn.app/Contents/MacOS/FirnBar
 	codesign --entitlements entitlements.plist --force -s - build/firnd
 	printf '%s\n' \
@@ -36,9 +37,9 @@ swift:
 	  '    <key>CFBundleName</key>' \
 	  '    <string>Firn</string>' \
 	  '    <key>CFBundleShortVersionString</key>' \
-	  '    <string>0.4.0</string>' \
+	  '    <string>0.5.0</string>' \
 	  '    <key>CFBundleVersion</key>' \
-	  '    <string>0.4.0</string>' \
+	  '    <string>0.5.0</string>' \
 	  '    <key>LSUIElement</key>' \
 	  '    <true/>' \
 	  '</dict>' \

@@ -20,6 +20,7 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
     private let wakeCond = NSCondition()
     private var waking = false
     private var _hibernated = false
+    private var _hibernating = false
     private var suppressStopCallback = false
     private var stopWaitSem: DispatchSemaphore?
     private var _capabilities: VMBackendCapabilities
@@ -53,7 +54,7 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
 
     public var isHibernated: Bool {
         stateLock.lock()
-        let v = _hibernated
+        let v = _hibernated || _hibernating
         stateLock.unlock()
         return v
     }
@@ -90,9 +91,10 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
 
     private func buildConfiguration(truncateSerial: Bool) throws -> (vzConfig: VZVirtualMachineConfiguration, hostSocketpairFD: Int32?) {
         let fm = FileManager.default
+        _ = try FirnDistribution.ensureSparseDataDisk()
         for required in [FirnPaths.kernelURL, FirnPaths.initramfsURL, FirnPaths.rootfsURL, FirnPaths.dataDiskURL] {
             guard fm.fileExists(atPath: required.path) else {
-                throw NSError(domain: "Firn", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing VM artifact: \(required.path). Run `make build` first."])
+                throw NSError(domain: "Firn", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing VM artifact: \(required.path). Run `firn images pull` (or `make build`)."])
             }
         }
         try fm.createDirectory(at: FirnPaths.runDir, withIntermediateDirectories: true)
@@ -288,7 +290,7 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
         let beforeHost = HostProcessMetrics.current(daemonPID: getpid())
 
         stateLock.lock()
-        if _hibernated {
+        if _hibernated || _hibernating {
             stateLock.unlock()
             return HibernateOutcome(
                 mode: FileManager.default.fileExists(atPath: FirnPaths.vmStateURL.path) ? "snapshot" : "park",
@@ -298,6 +300,7 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
                 hostFootprintAfterBytes: beforeHost.footprintBytes
             )
         }
+        _hibernating = true
         let useSnapshot = _capabilities.saveRestoreSupported
         stateLock.unlock()
 
@@ -309,9 +312,13 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
         stateLock.unlock()
 
         defer {
+            wakeCond.lock()
             stateLock.lock()
+            _hibernating = false
             suppressStopCallback = false
             stateLock.unlock()
+            wakeCond.broadcast()
+            wakeCond.unlock()
         }
 
         if useSnapshot {
@@ -394,7 +401,7 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
 
     public func ensureAwake() throws {
         wakeCond.lock()
-        while waking {
+        while waking || _hibernating {
             wakeCond.wait()
         }
         stateLock.lock()

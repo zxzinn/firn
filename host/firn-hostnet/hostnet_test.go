@@ -106,6 +106,79 @@ func TestFirnFSPathConfinementAndPrefetch(t *testing.T) {
 	}
 }
 
+func TestFirnFSDepth2StreamingPrefetch(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	for _, sub := range []string{"d00", "d01", "node_modules"} {
+		dir := filepath.Join(work, sub)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "item.txt"), []byte("payload-"+sub), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv, err := NewFirnFSServer(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cConn, sConn := net.Pipe()
+	defer cConn.Close()
+	go srv.serveConn(ctx, sConn)
+
+	var reqPayload bytes.Buffer
+	writeShortStr(&reqPayload, "work")
+	var reqHdr [9]byte
+	binary.BigEndian.PutUint32(reqHdr[0:4], 11)
+	reqHdr[4] = fsOpReaddirPref
+	binary.BigEndian.PutUint32(reqHdr[5:9], uint32(reqPayload.Len()))
+	if _, err := cConn.Write(append(reqHdr[:], reqPayload.Bytes()...)); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = cConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	gotReply := false
+	prefetched := make(map[string]bool)
+	for len(prefetched) < 2 || !gotReply {
+		var hdr [9]byte
+		if _, err := io.ReadFull(cConn, hdr[:]); err != nil {
+			t.Fatalf("read frame failed (gotReply=%v prefetched=%v): %v", gotReply, prefetched, err)
+		}
+		id := binary.BigEndian.Uint32(hdr[0:4])
+		op := hdr[4]
+		plen := binary.BigEndian.Uint32(hdr[5:9])
+		body := make([]byte, plen)
+		if plen > 0 {
+			if _, err := io.ReadFull(cConn, body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if id == 11 && op == fsOpReaddirPref {
+			gotReply = true
+			continue
+		}
+		if id == 0 && op == fsOpPushPrefetch {
+			off := 0
+			dirRel, ok := readShortStr(body, &off)
+			if !ok {
+				t.Fatalf("bad push prefetch dirRel")
+			}
+			if strings.Contains(dirRel, "node_modules") {
+				t.Fatalf("expected node_modules to be skipped by Depth-2 prefetch, got %q", dirRel)
+			}
+			prefetched[dirRel] = true
+		}
+	}
+	if !prefetched["work/d00"] || !prefetched["work/d01"] {
+		t.Fatalf("expected Depth-2 push prefetch for work/d00 and work/d01, got %v", prefetched)
+	}
+}
+
 func TestDynamicLeafCertAndTLSHandshake(t *testing.T) {
 	dir := t.TempDir()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

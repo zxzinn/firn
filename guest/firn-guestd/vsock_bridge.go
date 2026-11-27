@@ -85,8 +85,8 @@ func serveTunnelBridge(vsockPort uint32) error {
 			}
 			if tc, ok := upstream.(*net.TCPConn); ok {
 				_ = tc.SetNoDelay(true)
-				_ = tc.SetReadBuffer(4 << 20)
-				_ = tc.SetWriteBuffer(4 << 20)
+				_ = tc.SetReadBuffer(8 << 20)
+				_ = tc.SetWriteBuffer(8 << 20)
 			}
 			if _, err := client.Write([]byte{0x00}); err != nil {
 				_ = upstream.Close()

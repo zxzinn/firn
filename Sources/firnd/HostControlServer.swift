@@ -185,6 +185,7 @@ public final class HostControlServer {
             ],
             "ports": autoThaw.currentPortMappings().count,
             "topologyVersion": autoThaw.currentTopologyVersion(),
+            "hibernateSeconds": cfg.hibernateSeconds,
         ]
     }
 
@@ -209,7 +210,9 @@ public final class HostControlServer {
                 common["hibernated"] = true
                 common["backend"] = caps.backendName
                 common["hibernateMode"] = FileManager.default.fileExists(atPath: FirnPaths.vmStateURL.path) ? "snapshot" : "park"
-                common["capabilities"] = caps.asJSONDictionary()
+                var hibCaps = caps.asJSONDictionary()
+                hibCaps["firnfsActive"] = (cfg.fsMode == "firnfs")
+                common["capabilities"] = hibCaps
                 common["vmMemory"] = [
                     "totalBytes": 0,
                     "freeBytes": 0,

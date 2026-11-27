@@ -77,9 +77,10 @@ public final class KrunMachineRunner: VMBackend {
             )
         }
         let fm = FileManager.default
+        _ = try FirnDistribution.ensureSparseDataDisk()
         for required in [FirnPaths.kernelURL, FirnPaths.initramfsURL, FirnPaths.rootfsURL, FirnPaths.dataDiskURL] {
             guard fm.fileExists(atPath: required.path) else {
-                throw NSError(domain: "FirnKrun", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing VM artifact: \(required.path)"])
+                throw NSError(domain: "FirnKrun", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing VM artifact: \(required.path). Run `firn images pull` (or `make build`)."])
             }
         }
         try fm.createDirectory(at: FirnPaths.runDir, withIntermediateDirectories: true)

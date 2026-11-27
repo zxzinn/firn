@@ -276,13 +276,21 @@ func runDaemon() throws {
                         let projects = (obj["projects"] as? [[String: Any]]) ?? []
                         let anyActive = projects.contains { (($0["runningCount"] as? Int) ?? 0) > 0 }
                         let k3sRunning = ((obj["capabilities"] as? [String: Any])?["k3sRunning"] as? Bool) ?? false
-                        if !anyActive && !k3sRunning {
+                        let sessions = bridge.activeSessionCount + autoThaw.activeSessionCount
+                        if !anyActive && !k3sRunning && sessions == 0 {
                             if idleAllStoppedSince == nil {
                                 idleAllStoppedSince = Date()
                             } else if Date().timeIntervalSince(idleAllStoppedSince!) >= Double(currentCfg.hibernateSeconds) {
-                                _ = try? runner.hibernate()
-                                autoThaw.pushHibernatedTopology(hibernated: true)
-                                idleAllStoppedSince = nil
+                                fputs("[firnd] auto-hibernating VM after \(currentCfg.hibernateSeconds)s idle...\n", stderr)
+                                fflush(stderr)
+                                do {
+                                    _ = try runner.hibernate()
+                                    autoThaw.pushHibernatedTopology(hibernated: true)
+                                    idleAllStoppedSince = nil
+                                } catch {
+                                    fputs("[firnd] auto-hibernate failed: \(error.localizedDescription)\n", stderr)
+                                    fflush(stderr)
+                                }
                             }
                         } else {
                             idleAllStoppedSince = nil

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,11 +23,12 @@ import (
 )
 
 type firnFSMount struct {
-	server     *fuse.Server
-	client     *firnFSClient
-	root       *firnFSNode
-	cache      *firnFSCache
-	backingDir string
+	server      *fuse.Server
+	client      *firnFSClient
+	root        *firnFSNode
+	cache       *firnFSCache
+	backingDir  string
+	renameEpoch atomic.Uint64
 }
 
 func detectVirtioFSBacking() string {
@@ -84,21 +86,28 @@ func startFirnFS(mountPoint, hostAddr string) (*firnFSMount, error) {
 		}
 		return c, nil
 	}, func(paths []string) {
+		nowNs := time.Now().UnixNano()
+		nonEcho := make([]string, 0, len(paths))
 		for _, raw := range paths {
 			rel := cleanFirnFSRelPath(raw)
-			cache.InvalidatePath(rel)
-			if rootNode != nil {
-				mountObj.notifyKernelInvalidate(rel)
+			if cache.IsRecentLocalEcho(rel, nowNs) {
+				continue
 			}
+			cache.InvalidatePath(rel)
+			nonEcho = append(nonEcho, rel)
+		}
+		if rootNode != nil && len(nonEcho) > 0 {
+			mountObj.notifyKernelInvalidateBatch(nonEcho)
 		}
 	})
+	client.SetOnPrefetch(cache.PutDirPrefetch)
 	if _, err := client.ensureConn(); err != nil {
 		client.Close()
 		return nil, err
 	}
 	mountObj.client = client
 
-	rootNode = &firnFSNode{fsys: mountObj}
+	rootNode = &firnFSNode{fsys: mountObj, pathValid: true}
 	mountObj.root = rootNode
 
 	ttl := 60 * time.Second
@@ -110,6 +119,7 @@ func startFirnFS(mountPoint, hostAddr string) (*firnFSMount, error) {
 			MaxWrite:                 1 << 20,
 			MaxBackground:            64,
 			ExplicitDataCacheControl: true,
+			EnableSymlinkCaching:     true,
 			ExtraCapabilities:        fuse.CAP_WRITEBACK_CACHE,
 			FsName:                   "firnfs",
 			Name:                     "firnfs",
@@ -139,9 +149,22 @@ func (m *firnFSMount) Unmount() {
 	}
 }
 
+func (m *firnFSMount) notifyKernelInvalidateBatch(rawPaths []string) {
+	seenParents := make(map[*fs.Inode]struct{})
+	for _, raw := range rawPaths {
+		rel := cleanFirnFSRelPath(raw)
+		m.notifyKernelInvalidateWithSeen(rel, seenParents)
+	}
+}
+
 func (m *firnFSMount) notifyKernelInvalidate(rel string) {
+	m.notifyKernelInvalidateWithSeen(rel, nil)
+}
+
+func (m *firnFSMount) notifyKernelInvalidateWithSeen(rel string, seenParents map[*fs.Inode]struct{}) {
 	rootInode := &m.root.Inode
 	if rel == "" {
+		_ = rootInode.NotifyContent(0, 0)
 		return
 	}
 	parts := strings.Split(rel, "/")
@@ -160,6 +183,12 @@ func (m *firnFSMount) notifyKernelInvalidate(rel string) {
 		_ = child.NotifyContent(0, 0)
 	}
 	_ = parent.NotifyEntry(name)
+	if seenParents == nil {
+		_ = parent.NotifyContent(0, 0)
+	} else if _, done := seenParents[parent]; !done {
+		seenParents[parent] = struct{}{}
+		_ = parent.NotifyContent(0, 0)
+	}
 }
 
 func errToErrno(err error) syscall.Errno {
@@ -173,11 +202,7 @@ func errToErrno(err error) syscall.Errno {
 	return syscall.EIO
 }
 
-func lstatLinuxAttr(fullPath string) (fsAttrWire, syscall.Errno) {
-	var st syscall.Stat_t
-	if err := syscall.Lstat(fullPath, &st); err != nil {
-		return fsAttrWire{}, errToErrno(err)
-	}
+func statTToWire(st *syscall.Stat_t) fsAttrWire {
 	return fsAttrWire{
 		Ino:     st.Ino,
 		Size:    uint64(st.Size),
@@ -189,7 +214,23 @@ func lstatLinuxAttr(fullPath string) (fsAttrWire, syscall.Errno) {
 		Nlink:   uint32(st.Nlink),
 		UID:     st.Uid,
 		GID:     st.Gid,
-	}, 0
+	}
+}
+
+func lstatLinuxAttr(fullPath string) (fsAttrWire, syscall.Errno) {
+	var st syscall.Stat_t
+	if err := syscall.Lstat(fullPath, &st); err != nil {
+		return fsAttrWire{}, errToErrno(err)
+	}
+	return statTToWire(&st), 0
+}
+
+func fstatLinuxAttr(fd int) (fsAttrWire, syscall.Errno) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fsAttrWire{}, errToErrno(err)
+	}
+	return statTToWire(&st), 0
 }
 
 type firnFSFileHandle struct {
@@ -228,7 +269,11 @@ func (h *firnFSFileHandle) Write(ctx context.Context, data []byte, off int64) (u
 		return 0, syscall.EBADF
 	}
 	n, err := f.WriteAt(data, off)
-	h.fsys.cache.InvalidatePath(h.rel)
+	var minSize uint64
+	if off >= 0 && n >= 0 {
+		minSize = uint64(off) + uint64(n)
+	}
+	h.fsys.cache.UpdateWriteAttr(h.rel, minSize, time.Now().UnixNano())
 	if err != nil {
 		return uint32(n), errToErrno(err)
 	}
@@ -253,24 +298,60 @@ func (h *firnFSFileHandle) Release(ctx context.Context) syscall.Errno {
 	if f == nil {
 		return 0
 	}
-	err := f.Close()
-	if full := h.fsys.backingPath(h.rel); full != "" {
-		if attr, ec := lstatLinuxAttr(full); ec == 0 {
-			h.fsys.cache.PutEntry(h.rel, attr, nil, false)
-		}
-	}
-	return errToErrno(err)
+	return errToErrno(f.Close())
 }
+
+type firnFSDirHandle struct {
+	mu      sync.Mutex
+	idx     int
+	entries []fuse.DirEntry
+}
+
+var (
+	_ = (fs.FileReaddirenter)((*firnFSDirHandle)(nil))
+	_ = (fs.FileSeekdirer)((*firnFSDirHandle)(nil))
+	_ = (fs.FileReleasedirer)((*firnFSDirHandle)(nil))
+)
+
+func (d *firnFSDirHandle) Readdirent(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.idx >= len(d.entries) {
+		return nil, 0
+	}
+	e := d.entries[d.idx]
+	d.idx++
+	e.Off = uint64(d.idx)
+	return &e, 0
+}
+
+func (d *firnFSDirHandle) Seekdir(ctx context.Context, off uint64) syscall.Errno {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	idx := int(off)
+	if idx < 0 || idx > len(d.entries) {
+		return syscall.EINVAL
+	}
+	d.idx = idx
+	return 0
+}
+
+func (d *firnFSDirHandle) Releasedir(ctx context.Context, releaseFlags uint32) {}
 
 type firnFSNode struct {
 	fs.Inode
-	fsys *firnFSMount
+	fsys        *firnFSMount
+	pathMu      sync.RWMutex
+	cachedRel   string
+	cachedEpoch uint64
+	pathValid   bool
 }
 
 var (
 	_ = (fs.NodeLookuper)((*firnFSNode)(nil))
 	_ = (fs.NodeGetattrer)((*firnFSNode)(nil))
 	_ = (fs.NodeSetattrer)((*firnFSNode)(nil))
+	_ = (fs.NodeOpendirHandler)((*firnFSNode)(nil))
 	_ = (fs.NodeReaddirer)((*firnFSNode)(nil))
 	_ = (fs.NodeOpener)((*firnFSNode)(nil))
 	_ = (fs.NodeReader)((*firnFSNode)(nil))
@@ -287,12 +368,36 @@ var (
 	_ = (fs.NodeStatfser)((*firnFSNode)(nil))
 )
 
-func (n *firnFSNode) relPath() string {
-	p := n.Path(n.Root())
-	if p == "" || p == "." {
-		return ""
+func (n *firnFSNode) newChildNode(childRel string) *firnFSNode {
+	return &firnFSNode{
+		fsys:        n.fsys,
+		cachedRel:   childRel,
+		cachedEpoch: n.fsys.renameEpoch.Load(),
+		pathValid:   true,
 	}
-	return strings.TrimPrefix(filepath.ToSlash(p), "/")
+}
+
+func (n *firnFSNode) relPath() string {
+	epoch := n.fsys.renameEpoch.Load()
+	n.pathMu.RLock()
+	if n.pathValid && n.cachedEpoch == epoch {
+		rel := n.cachedRel
+		n.pathMu.RUnlock()
+		return rel
+	}
+	n.pathMu.RUnlock()
+
+	p := n.Path(n.Root())
+	rel := ""
+	if p != "" && p != "." {
+		rel = strings.TrimPrefix(filepath.ToSlash(p), "/")
+	}
+	n.pathMu.Lock()
+	n.cachedRel = rel
+	n.cachedEpoch = epoch
+	n.pathValid = true
+	n.pathMu.Unlock()
+	return rel
 }
 
 func fillFuseAttr(src fsAttrWire, dst *fuse.Attr) {
@@ -340,6 +445,14 @@ func (n *firnFSNode) fetchAttr(rel string) (fsAttrWire, syscall.Errno) {
 	if attr, _, _, ok := n.fsys.cache.GetEntry(rel); ok {
 		return attr, 0
 	}
+	if full := n.fsys.backingPath(rel); full != "" {
+		attr, ec := lstatLinuxAttr(full)
+		if ec != 0 {
+			return fsAttrWire{}, ec
+		}
+		n.fsys.cache.PutEntry(rel, attr, nil, false)
+		return attr, 0
+	}
 	var req bytes.Buffer
 	writeShortStr(&req, rel)
 	resp, err := n.fsys.client.call(fsOpLookup, req.Bytes())
@@ -355,7 +468,11 @@ func (n *firnFSNode) fetchAttr(rel string) (fsAttrWire, syscall.Errno) {
 }
 
 func (n *firnFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	childRel := joinFirnFSRel(n.relPath(), name)
+	parentRel := n.relPath()
+	if n.fsys.cache.IsKnownAbsent(parentRel, name) {
+		return nil, syscall.ENOENT
+	}
+	childRel := joinFirnFSRel(parentRel, name)
 	attr, ec := n.fetchAttr(childRel)
 	if ec != 0 {
 		return nil, ec
@@ -363,7 +480,7 @@ func (n *firnFSNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	fillFuseAttr(attr, &out.Attr)
 	out.SetEntryTimeout(60 * time.Second)
 	out.SetAttrTimeout(60 * time.Second)
-	child := &firnFSNode{fsys: n.fsys}
+	child := n.newChildNode(childRel)
 	return n.NewInode(ctx, child, stableFromWire(attr)), 0
 }
 
@@ -464,7 +581,7 @@ func (n *firnFSNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetA
 	return 0
 }
 
-func (n *firnFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+func (n *firnFSNode) loadDirEntries() ([]fuse.DirEntry, syscall.Errno) {
 	rel := n.relPath()
 	if cached, ok := n.fsys.cache.GetDirPrefetch(rel); ok {
 		entries := make([]fuse.DirEntry, 0, len(cached))
@@ -475,7 +592,7 @@ func (n *firnFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 				Ino:  it.Attr.Ino,
 			})
 		}
-		return fs.NewListDirStream(entries), 0
+		return entries, 0
 	}
 
 	var req bytes.Buffer
@@ -493,43 +610,41 @@ func (n *firnFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) 
 	}
 	cnt := int(binary.BigEndian.Uint32(resp[4:8]))
 	off := 8
-	items := make([]fsDirPrefetchItem, 0, cnt)
-	entries := make([]fuse.DirEntry, 0, cnt)
-	for i := 0; i < cnt; i++ {
-		name, ok1 := readShortStr(resp, &off)
-		attr, ok2 := decodeFSAttr(resp, &off)
-		if !ok1 || !ok2 || off >= len(resp) {
-			return nil, syscall.EIO
-		}
-		hasData := resp[off] != 0
-		off++
-		var data []byte
-		if hasData {
-			if off+4 > len(resp) {
-				return nil, syscall.EIO
-			}
-			dlen := int(binary.BigEndian.Uint32(resp[off : off+4]))
-			off += 4
-			if off+dlen > len(resp) {
-				return nil, syscall.EIO
-			}
-			data = append([]byte(nil), resp[off:off+dlen]...)
-			off += dlen
-		}
-		items = append(items, fsDirPrefetchItem{Name: name, Attr: attr, HasData: hasData, Data: data})
-		entries = append(entries, fuse.DirEntry{
-			Mode: attr.Mode & syscall.S_IFMT,
-			Name: name,
-			Ino:  attr.Ino,
-		})
+	items, ok := decodeDirPrefetchItems(resp, &off, cnt, false)
+	if !ok {
+		return nil, syscall.EIO
 	}
 	n.fsys.cache.PutDirPrefetch(rel, items)
+	entries := make([]fuse.DirEntry, 0, len(items))
+	for _, it := range items {
+		entries = append(entries, fuse.DirEntry{
+			Mode: it.Attr.Mode & syscall.S_IFMT,
+			Name: it.Name,
+			Ino:  it.Attr.Ino,
+		})
+	}
+	return entries, 0
+}
+
+func (n *firnFSNode) OpendirHandle(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	entries, ec := n.loadDirEntries()
+	if ec != 0 {
+		return nil, 0, ec
+	}
+	return &firnFSDirHandle{entries: entries}, fuse.FOPEN_CACHE_DIR | fuse.FOPEN_KEEP_CACHE, 0
+}
+
+func (n *firnFSNode) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	entries, ec := n.loadDirEntries()
+	if ec != 0 {
+		return nil, ec
+	}
 	return fs.NewListDirStream(entries), 0
 }
 
 func (n *firnFSNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	if (flags & (syscall.O_WRONLY | syscall.O_RDWR | syscall.O_TRUNC | syscall.O_APPEND)) == 0 {
-		return nil, fuse.FOPEN_KEEP_CACHE, 0
+		return nil, fuse.FOPEN_KEEP_CACHE | fuse.FOPEN_NOFLUSH, 0
 	}
 	rel := n.relPath()
 	if full := n.fsys.backingPath(rel); full != "" {
@@ -538,7 +653,7 @@ func (n *firnFSNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uin
 		if err != nil {
 			return nil, 0, errToErrno(err)
 		}
-		n.fsys.cache.InvalidatePath(rel)
+		n.fsys.cache.UpdateWriteAttr(rel, 0, time.Now().UnixNano())
 		return &firnFSFileHandle{file: f, rel: rel, fsys: n.fsys}, 0, 0
 	}
 	return nil, 0, 0
@@ -600,7 +715,11 @@ func (n *firnFSNode) Write(ctx context.Context, f fs.FileHandle, data []byte, of
 		}
 		written, werr := file.WriteAt(data, off)
 		_ = file.Close()
-		n.fsys.cache.InvalidatePath(rel)
+		var minSize uint64
+		if off >= 0 && written >= 0 {
+			minSize = uint64(off) + uint64(written)
+		}
+		n.fsys.cache.UpdateWriteAttr(rel, minSize, time.Now().UnixNano())
 		if werr != nil {
 			return uint32(written), errToErrno(werr)
 		}
@@ -653,17 +772,16 @@ func (n *firnFSNode) Create(ctx context.Context, name string, flags uint32, mode
 		if err != nil {
 			return nil, nil, 0, errToErrno(err)
 		}
-		attr, ec := lstatLinuxAttr(childFull)
+		attr, ec := fstatLinuxAttr(int(file.Fd()))
 		if ec != 0 {
 			_ = file.Close()
 			return nil, nil, 0, ec
 		}
-		n.fsys.cache.InvalidatePath(childRel)
-		n.fsys.cache.PutEntry(childRel, attr, nil, false)
+		n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 		fillFuseAttr(attr, &out.Attr)
 		out.SetEntryTimeout(60 * time.Second)
 		out.SetAttrTimeout(60 * time.Second)
-		child := &firnFSNode{fsys: n.fsys}
+		child := n.newChildNode(childRel)
 		fh := &firnFSFileHandle{file: file, rel: childRel, fsys: n.fsys}
 		return n.NewInode(ctx, child, stableFromWire(attr)), fh, 0, 0
 	}
@@ -683,17 +801,17 @@ func (n *firnFSNode) Create(ctx context.Context, name string, flags uint32, mode
 	if ec != 0 {
 		return nil, nil, 0, ec
 	}
-	n.fsys.cache.InvalidatePath(childRel)
-	n.fsys.cache.PutEntry(childRel, attr, nil, false)
+	n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 	fillFuseAttr(attr, &out.Attr)
 	out.SetEntryTimeout(60 * time.Second)
 	out.SetAttrTimeout(60 * time.Second)
-	child := &firnFSNode{fsys: n.fsys}
+	child := n.newChildNode(childRel)
 	return n.NewInode(ctx, child, stableFromWire(attr)), nil, 0, 0
 }
 
 func (n *firnFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	childRel := joinFirnFSRel(n.relPath(), name)
+	parentRel := n.relPath()
+	childRel := joinFirnFSRel(parentRel, name)
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		perm := os.FileMode(mode & 0o7777)
 		if perm == 0 {
@@ -706,12 +824,12 @@ func (n *firnFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *f
 		if ec != 0 {
 			return nil, ec
 		}
-		n.fsys.cache.InvalidatePath(childRel)
-		n.fsys.cache.PutEntry(childRel, attr, nil, false)
+		n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
+		n.fsys.cache.PutDirPrefetch(childRel, nil)
 		fillFuseAttr(attr, &out.Attr)
 		out.SetEntryTimeout(60 * time.Second)
 		out.SetAttrTimeout(60 * time.Second)
-		child := &firnFSNode{fsys: n.fsys}
+		child := n.newChildNode(childRel)
 		return n.NewInode(ctx, child, stableFromWire(attr)), 0
 	}
 
@@ -729,22 +847,23 @@ func (n *firnFSNode) Mkdir(ctx context.Context, name string, mode uint32, out *f
 	if ec != 0 {
 		return nil, ec
 	}
-	n.fsys.cache.InvalidatePath(childRel)
-	n.fsys.cache.PutEntry(childRel, attr, nil, false)
+	n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
+	n.fsys.cache.PutDirPrefetch(childRel, nil)
 	fillFuseAttr(attr, &out.Attr)
 	out.SetEntryTimeout(60 * time.Second)
 	out.SetAttrTimeout(60 * time.Second)
-	child := &firnFSNode{fsys: n.fsys}
+	child := n.newChildNode(childRel)
 	return n.NewInode(ctx, child, stableFromWire(attr)), 0
 }
 
 func (n *firnFSNode) Unlink(ctx context.Context, name string) syscall.Errno {
-	childRel := joinFirnFSRel(n.relPath(), name)
+	parentRel := n.relPath()
+	childRel := joinFirnFSRel(parentRel, name)
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		if err := syscall.Unlink(childFull); err != nil {
 			return errToErrno(err)
 		}
-		n.fsys.cache.InvalidatePath(childRel)
+		n.fsys.cache.RecordLocalRemove(parentRel, name)
 		return 0
 	}
 
@@ -756,18 +875,19 @@ func (n *firnFSNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 	ec := syscall.Errno(binary.BigEndian.Uint32(resp[0:4]))
 	if ec == 0 {
-		n.fsys.cache.InvalidatePath(childRel)
+		n.fsys.cache.RecordLocalRemove(parentRel, name)
 	}
 	return ec
 }
 
 func (n *firnFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
-	childRel := joinFirnFSRel(n.relPath(), name)
+	parentRel := n.relPath()
+	childRel := joinFirnFSRel(parentRel, name)
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		if err := syscall.Rmdir(childFull); err != nil {
 			return errToErrno(err)
 		}
-		n.fsys.cache.InvalidatePath(childRel)
+		n.fsys.cache.RecordLocalRemove(parentRel, name)
 		return 0
 	}
 
@@ -779,7 +899,7 @@ func (n *firnFSNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	}
 	ec := syscall.Errno(binary.BigEndian.Uint32(resp[0:4]))
 	if ec == 0 {
-		n.fsys.cache.InvalidatePath(childRel)
+		n.fsys.cache.RecordLocalRemove(parentRel, name)
 	}
 	return ec
 }
@@ -802,6 +922,7 @@ func (n *firnFSNode) Rename(ctx context.Context, name string, newParent fs.Inode
 		if err := os.Rename(oldFull, newFull); err != nil {
 			return errToErrno(err)
 		}
+		n.fsys.renameEpoch.Add(1)
 		n.fsys.cache.InvalidatePath(oldRel)
 		n.fsys.cache.InvalidatePath(newRel)
 		return 0
@@ -816,6 +937,7 @@ func (n *firnFSNode) Rename(ctx context.Context, name string, newParent fs.Inode
 	}
 	ec := syscall.Errno(binary.BigEndian.Uint32(resp[0:4]))
 	if ec == 0 {
+		n.fsys.renameEpoch.Add(1)
 		n.fsys.cache.InvalidatePath(oldRel)
 		n.fsys.cache.InvalidatePath(newRel)
 	}
@@ -823,7 +945,8 @@ func (n *firnFSNode) Rename(ctx context.Context, name string, newParent fs.Inode
 }
 
 func (n *firnFSNode) Symlink(ctx context.Context, target, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	childRel := joinFirnFSRel(n.relPath(), name)
+	parentRel := n.relPath()
+	childRel := joinFirnFSRel(parentRel, name)
 	if childFull := n.fsys.backingPath(childRel); childFull != "" {
 		if err := os.Symlink(target, childFull); err != nil {
 			return nil, errToErrno(err)
@@ -832,12 +955,11 @@ func (n *firnFSNode) Symlink(ctx context.Context, target, name string, out *fuse
 		if ec != 0 {
 			return nil, ec
 		}
-		n.fsys.cache.InvalidatePath(childRel)
-		n.fsys.cache.PutEntry(childRel, attr, nil, false)
+		n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 		fillFuseAttr(attr, &out.Attr)
 		out.SetEntryTimeout(60 * time.Second)
 		out.SetAttrTimeout(60 * time.Second)
-		child := &firnFSNode{fsys: n.fsys}
+		child := n.newChildNode(childRel)
 		return n.NewInode(ctx, child, stableFromWire(attr)), 0
 	}
 
@@ -852,12 +974,11 @@ func (n *firnFSNode) Symlink(ctx context.Context, target, name string, out *fuse
 	if ec != 0 {
 		return nil, ec
 	}
-	n.fsys.cache.InvalidatePath(childRel)
-	n.fsys.cache.PutEntry(childRel, attr, nil, false)
+	n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 	fillFuseAttr(attr, &out.Attr)
 	out.SetEntryTimeout(60 * time.Second)
 	out.SetAttrTimeout(60 * time.Second)
-	child := &firnFSNode{fsys: n.fsys}
+	child := n.newChildNode(childRel)
 	return n.NewInode(ctx, child, stableFromWire(attr)), 0
 }
 
@@ -896,7 +1017,8 @@ func (n *firnFSNode) Link(ctx context.Context, target fs.InodeEmbedder, name str
 	} else {
 		targetRel = strings.TrimPrefix(filepath.ToSlash(target.EmbeddedInode().Path(n.Root())), "/")
 	}
-	newRel := joinFirnFSRel(n.relPath(), name)
+	parentRel := n.relPath()
+	newRel := joinFirnFSRel(parentRel, name)
 	if targetFull := n.fsys.backingPath(targetRel); targetFull != "" {
 		newFull := n.fsys.backingPath(newRel)
 		if err := os.Link(targetFull, newFull); err != nil {
@@ -907,9 +1029,9 @@ func (n *firnFSNode) Link(ctx context.Context, target fs.InodeEmbedder, name str
 			return nil, ec
 		}
 		n.fsys.cache.InvalidatePath(targetRel)
-		n.fsys.cache.InvalidatePath(newRel)
+		n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 		fillFuseAttr(attr, &out.Attr)
-		child := &firnFSNode{fsys: n.fsys}
+		child := n.newChildNode(newRel)
 		return n.NewInode(ctx, child, stableFromWire(attr)), 0
 	}
 
@@ -925,9 +1047,9 @@ func (n *firnFSNode) Link(ctx context.Context, target fs.InodeEmbedder, name str
 		return nil, ec
 	}
 	n.fsys.cache.InvalidatePath(targetRel)
-	n.fsys.cache.InvalidatePath(newRel)
+	n.fsys.cache.RecordLocalCreate(parentRel, name, attr)
 	fillFuseAttr(attr, &out.Attr)
-	child := &firnFSNode{fsys: n.fsys}
+	child := n.newChildNode(newRel)
 	return n.NewInode(ctx, child, stableFromWire(attr)), 0
 }
 

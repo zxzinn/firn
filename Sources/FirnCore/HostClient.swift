@@ -181,11 +181,20 @@ public enum FirnHostClient {
     }
 
     public static func sha256Hex(of fileURL: URL) throws -> String {
-        let data = try Data(contentsOf: fileURL)
-        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        data.withUnsafeBytes { ptr in
-            _ = CC_SHA256(ptr.baseAddress, CC_LONG(ptr.count), &digest)
+        let fh = try FileHandle(forReadingFrom: fileURL)
+        defer { try? fh.close() }
+        var ctx = CC_SHA256_CTX()
+        CC_SHA256_Init(&ctx)
+        let chunkSize = 1024 * 1024
+        while true {
+            let chunk = try fh.read(upToCount: chunkSize)
+            guard let chunk, !chunk.isEmpty else { break }
+            chunk.withUnsafeBytes { ptr in
+                _ = CC_SHA256_Update(&ctx, ptr.baseAddress, CC_LONG(ptr.count))
+            }
         }
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        CC_SHA256_Final(&digest, &ctx)
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
