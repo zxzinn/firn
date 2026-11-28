@@ -83,29 +83,43 @@ func (p *ProxyAndDNSRelay) ServeHTTPProxy(addr string) error {
 }
 
 func (p *ProxyAndDNSRelay) ServeDNS(addr string) error {
-	pc, err := net.ListenPacket("udp", addr)
+	udpAddr, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
 		return err
 	}
+	conn, err := net.ListenUDP("udp4", udpAddr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := enableUDPPktInfo(conn); err != nil {
+		log.Printf("[firn-guestd] warning: enable IP_PKTINFO on %s failed: %v", addr, err)
+	}
 	log.Printf("[firn-guestd] dns relay listening on udp %s (vsock:2379 fallback upstream)", addr)
+	return p.serveDNSConn(conn)
+}
+
+func (p *ProxyAndDNSRelay) serveDNSConn(conn *net.UDPConn) error {
 	buf := make([]byte, 4096)
+	oobBuf := make([]byte, 256)
 	for {
-		n, remote, err := pc.ReadFrom(buf)
+		n, oobn, _, remote, err := conn.ReadMsgUDP(buf, oobBuf)
 		if err != nil {
 			return err
 		}
 		pkt := append([]byte(nil), buf[:n]...)
-		go func(query []byte, dest net.Addr) {
+		replyOOB := replyPktInfoOOB(oobBuf[:oobn])
+		go func(query []byte, dest *net.UDPAddr, oob []byte) {
 			if resp := p.handleLocalDomainQuery(query); resp != nil {
-				_, _ = pc.WriteTo(resp, dest)
+				_, _, _ = conn.WriteMsgUDP(resp, oob, dest)
 				return
 			}
 			resp, err := p.relayDNSViaHost(query)
 			if err == nil && len(resp) > 0 {
-				_, _ = pc.WriteTo(resp, dest)
+				_, _, _ = conn.WriteMsgUDP(resp, oob, dest)
 				return
 			}
-		}(pkt, remote)
+		}(pkt, remote, replyOOB)
 	}
 }
 

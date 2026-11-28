@@ -102,6 +102,10 @@ docker --context firn run --rm alpine:3.21 sh -eu -c "
   body2=\$(wget -qO- \"http://host.firn.internal:$HOST_PORT/\")
   test \"\$body2\" = 'firn-host-ok'
 "
+docker --context firn network rm firn-e2e-dns-net >/dev/null 2>&1 || true
+docker --context firn network create firn-e2e-dns-net >/dev/null
+docker --context firn run --rm --network firn-e2e-dns-net alpine:3.21 nslookup host.docker.internal | grep -q '10.89.0.1'
+docker --context firn network rm firn-e2e-dns-net >/dev/null
 kill "$HOST_SRV_PID" >/dev/null 2>&1 || true
 wait "$HOST_SRV_PID" >/dev/null 2>&1 || true
 HOST_SRV_PID=""

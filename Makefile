@@ -37,9 +37,9 @@ swift:
 	  '    <key>CFBundleName</key>' \
 	  '    <string>Firn</string>' \
 	  '    <key>CFBundleShortVersionString</key>' \
-	  '    <string>0.6.0</string>' \
+	  '    <string>0.6.1</string>' \
 	  '    <key>CFBundleVersion</key>' \
-	  '    <string>0.6.0</string>' \
+	  '    <string>0.6.1</string>' \
 	  '    <key>LSUIElement</key>' \
 	  '    <true/>' \
 	  '</dict>' \

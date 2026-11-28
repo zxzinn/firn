@@ -1,9 +1,9 @@
 class Firn < Formula
   desc "Native macOS Apple Silicon Docker, Kubernetes & Linux VM runtime"
   homepage "https://github.com/zxzinn/firn"
-  url "https://github.com/zxzinn/firn/releases/download/v0.6.0/firn-darwin-arm64.tar.gz"
-  version "0.6.0"
-  sha256 "eb35fa016e18434e94b81c2175e4ad6ce064246a06c8945b556dd60f89f76199"
+  url "https://github.com/zxzinn/firn/releases/download/v0.6.1/firn-darwin-arm64.tar.gz"
+  version "0.6.1"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Apache-2.0"
   head "https://github.com/zxzinn/firn.git", branch: "main"
 
@@ -38,6 +38,6 @@ class Firn < Formula
   end
 
   test do
-    assert_match "Firn 0.6.0", shell_output("#{bin}/firn version")
+    assert_match "Firn 0.6.1", shell_output("#{bin}/firn version")
   end
 end

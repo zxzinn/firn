@@ -166,3 +166,42 @@ func TestReaperEngineDiskUsageDF(t *testing.T) {
 		t.Fatalf("unexpected Docker DF propagation: %+v", du)
 	}
 }
+
+func TestServeDNSUDP(t *testing.T) {
+	fd := &fakeDocker{
+		containers: map[string]dockerContainerSummary{},
+		inspects:   map[string]*dockerContainerInspect{},
+	}
+	eng := NewReaperEngine(fd, 900, "firn.local", nil)
+	relay := NewProxyAndDNSRelay(eng)
+
+	srvConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	_ = enableUDPPktInfo(srvConn)
+	defer srvConn.Close()
+
+	go func() {
+		_ = relay.serveDNSConn(srvConn)
+	}()
+
+	cliConn, err := net.DialUDP("udp4", nil, srvConn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer cliConn.Close()
+
+	_ = cliConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := cliConn.Write(buildTestDNSQuery("host.docker.internal", 1)); err != nil {
+		t.Fatalf("Write DNS query: %v", err)
+	}
+	resp := make([]byte, 512)
+	n, err := cliConn.Read(resp)
+	if err != nil {
+		t.Fatalf("Read DNS response: %v", err)
+	}
+	if n < 16 || net.IP(resp[n-4:n]).String() != "10.89.0.1" {
+		t.Fatalf("expected 10.89.0.1 A record over UDP, got len=%d ip=%v", n, net.IP(resp[n-4:n]))
+	}
+}

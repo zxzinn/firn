@@ -140,8 +140,8 @@ expect(FirnHostClient.formatBytes(2 * 1024 * 1024 * 1024) == "2.00 GiB", "format
 expect(HostProcessMetrics.samplePID(getpid())?.footprint ?? 0 > 0, "Expected non-zero proc_pid_rusage footprint for current process")
 _ = FirnHostClient.metalGPUDeviceName()
 
-// v0.6.0 assertions: version, extraMounts, autoTrimMinutes, k8s local DNS handling
-expect(FirnVersion.current == "0.6.0", "Expected FirnVersion.current == 0.6.0, got \(FirnVersion.current)")
+// v0.6.x assertions: version, extraMounts, autoTrimMinutes, k8s local DNS handling
+expect(FirnVersion.current == "0.6.1", "Expected FirnVersion.current == 0.6.1, got \(FirnVersion.current)")
 expect(defaultCfg.autoTrimMinutes == 60 && defaultCfg.extraMounts.isEmpty, "Expected v0.6.0 default autoTrimMinutes=60 and empty extraMounts")
 
 var v06Cfg = FirnConfig()

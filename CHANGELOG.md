@@ -2,6 +2,11 @@
 
 All notable changes to Firn are documented in this file.
 
+## v0.6.1
+
+- **Custom Docker Compose Bridge DNS Fix (`firn-guestd`)**:
+  - Updated [`proxy_relay.go`](./guest/firn-guestd/proxy_relay.go) (`ServeDNS` on `udp4` with Linux `IP_PKTINFO` in [`proxy_relay_linux.go`](./guest/firn-guestd/proxy_relay_linux.go)) so UDP DNS replies preserve the queried destination IP (`10.87.0.1`, `10.89.0.2`, `127.0.0.1`) instead of falling back to the bridge subnet gateway source IP when queried from custom `10.88.x.x` Compose networks.
+
 ## v0.6.0
 
 - **`firnfs` v3 Kernel `inotify` HMR Forwarding, Gateway Compatibility & Extra Host Mounts**:
