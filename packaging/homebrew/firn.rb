@@ -3,7 +3,7 @@ class Firn < Formula
   homepage "https://github.com/zxzinn/firn"
   url "https://github.com/zxzinn/firn/releases/download/v0.6.1/firn-darwin-arm64.tar.gz"
   version "0.6.1"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "fe4e0cf7ed748f31bf77f296183f26107c151e5d733df991f597a3275cefba1a"
   license "Apache-2.0"
   head "https://github.com/zxzinn/firn.git", branch: "main"
 
