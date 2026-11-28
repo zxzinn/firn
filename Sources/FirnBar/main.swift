@@ -525,6 +525,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.store = s
         }
+        setupMainMenu()
         rebuildMenu(statusPayload: nil, dnsPayload: nil, k8sPayload: nil, machinesPayload: nil)
         refreshStatus()
         startEventWatcher()
@@ -753,6 +754,96 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             try? proc.run()
             proc.waitUntilExit()
             self?.refreshStatus()
+        }
+    }
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu(title: "Firn")
+        appMenu.addItem(withTitle: "Open Control Center", action: #selector(openDashboardAction(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "Settings…", action: #selector(openSettingsAction(_:)), keyEquivalent: ",")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Firn", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        for item in appMenu.items where item.action != #selector(NSApplication.terminate(_:)) {
+            item.target = self
+        }
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        let viewMenuItem = NSMenuItem()
+        mainMenu.addItem(viewMenuItem)
+        let viewMenu = NSMenu(title: "View")
+        let paletteItem = NSMenuItem(title: "Command Palette…", action: #selector(openCommandPaletteAction(_:)), keyEquivalent: "k")
+        paletteItem.target = self
+        viewMenu.addItem(paletteItem)
+        let refreshItem = NSMenuItem(title: "Refresh Status", action: #selector(refreshStatusAction(_:)), keyEquivalent: "r")
+        refreshItem.target = self
+        viewMenu.addItem(refreshItem)
+        viewMenu.addItem(.separator())
+        for (idx, sec) in DashboardSection.allCases.enumerated() {
+            let item = NSMenuItem(title: sec.rawValue, action: #selector(selectDashboardSectionAction(_:)), keyEquivalent: "\(idx + 1)")
+            item.tag = idx
+            item.target = self
+            viewMenu.addItem(item)
+        }
+        viewMenuItem.submenu = viewMenu
+
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenuItem.submenu = windowMenu
+
+        NSApplication.shared.mainMenu = mainMenu
+        NSApplication.shared.windowsMenu = windowMenu
+    }
+
+    @objc private func openDashboardAction(_ sender: Any?) {
+        openDashboardWindow()
+    }
+
+    @objc private func openSettingsAction(_ sender: Any?) {
+        openSettingsWindow()
+    }
+
+    @objc private func openCommandPaletteAction(_ sender: Any?) {
+        Task { @MainActor in
+            self.openDashboardWindow()
+            self.store?.showCommandPalette.toggle()
+        }
+    }
+
+    @objc private func refreshStatusAction(_ sender: Any?) {
+        refreshStatus()
+        Task { @MainActor in
+            self.store?.refreshDockerInventory()
+        }
+    }
+
+    @objc private func selectDashboardSectionAction(_ sender: NSMenuItem) {
+        let idx = sender.tag
+        let all = DashboardSection.allCases
+        guard idx >= 0, idx < all.count else { return }
+        let targetSection = all[idx]
+        Task { @MainActor in
+            self.openDashboardWindow()
+            self.store?.selectedSection = targetSection
         }
     }
 

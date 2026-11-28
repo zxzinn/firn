@@ -112,7 +112,7 @@ make e2e                                            # 完整 E2E 驗證（inotif
 - **儲存層、掛載清理與高負載網路**：透過原生 `"data-root": "/var/lib/firn/docker"` 移除雙重 bind-mount（`/proc/mounts` `overlay` 項目由 `94` 減半為 `45`），調校 `/dev/vdb`（`scheduler=none`、`read_ahead_kb=1024`、`commit=60,barrier=0`）使 256 MiB `conv=fsync` 循序寫入達 **`1.4–1.7 GB/s`**（循序讀取 **`2.2 GB/s`**）；高負載下 128 MiB 原始 TCP 達 **`648.2 MiB/s`（峰值 `880.5 MiB/s`）** 宿主→容器與 **`457.3 MiB/s`（峰值 `560.5 MiB/s`）** 容器→宿主（較同負載 v0.6.0 **快 `4.8×`**）。
 - **精準自動冷凍、記憶體壓力防線與孤兒 Worktree 清理**：排除專案內網連線與 Docker `HEALTHCHECK` Probe 雜訊，並在 macOS 發出 `warning`/`critical` 記憶體壓力警報時自動優先冷凍孤兒／閒置專案並縮減 Balloon（`firn stacks`）。
 - **即時 Volume 快照複製與內建 Registry Pull-Through Cache**：`50.0 MiB` Volume 於 **`37.8 ms`** 完成快照、**`96.3 ms`** 完成複製（`copy_file_range`，SHA-256 與寫入隔離 100% 通過）；透過內建 `127.0.0.1:5000` 快取（`firn cache`），`busybox:1.36.1-musl` 第二次拉取由 **`4,912.8 ms` 加速至 `1,209.3 ms`**（`4.06×`）。
-- **Liquid Glass 主控台、Layered Strata SVG 識別與 Distroless Shell**：`Firn.app` 新增 7 分頁原生 SwiftUI 控制中心（Graphite Pro 淺／深自適應與 macOS 26+ 原生液態玻璃，舊版退回 `.ultraThinMaterial`）、純 SVG Layered Strata 品牌圖示（[assets/brand/](./assets/brand/)），以及支援 `/bin/bash` → `/bin/sh` → `/bin/ash` → `/busybox/sh` 探測與無 shell 映像檔（distroless）自動 `firn shell -t` + `nsenter` 除錯連線。
+- **Liquid Glass 主控台、`⌘K` 指令面板與 Distroless Shell**：`Firn.app` 新增 7 分頁原生 SwiftUI 控制中心（Graphite Pro 淺／深自適應與 macOS 26+ 原生液態玻璃，舊版退回 `.ultraThinMaterial`）、`⌘K` 快速指令面板與 `⌘1`–`⌘7`／`⌘R` 選單快捷鍵、Stack 即時 RAM 走勢圖（sparkline）、純 SVG Layered Strata 品牌圖示（[assets/brand/](./assets/brand/)），以及支援 `/bin/bash` → `/bin/sh` → `/bin/ash` → `/busybox/sh` 探測與無 shell 映像檔（distroless）自動 `firn shell -t` + `nsenter` 除錯連線。
 
 ## 系統架構
 

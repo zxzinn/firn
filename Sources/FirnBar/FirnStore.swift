@@ -350,11 +350,13 @@ final class FirnStore: ObservableObject {
     @Published var machines: [FirnMachineInfo] = []
 
     @Published var samples: [FirnMetricSample] = []
+    @Published var stackMemoryHistory: [String: [Double]] = [:]
     @Published var config = FirnConfig.load()
     @Published var busyAction: String?
     @Published var toast: FirnToast?
     @Published var lastUpdated: Date?
     @Published var activeLogSession: FirnLogSession?
+    @Published var showCommandPalette = false
 
     var onRequestRefresh: (() -> Void)?
     private var toastDismissTask: Task<Void, Never>?
@@ -413,6 +415,7 @@ final class FirnStore: ObservableObject {
         guard let status = statusPayload else {
             vmState = .offline
             stacks = []
+            stackMemoryHistory = [:]
             var net = FirnNetworkInfo()
             net.domain = config.domain
             net.dnsPort = Int(config.dnsPort)
@@ -438,9 +441,11 @@ final class FirnStore: ObservableObject {
         vmFootprintBytes = u64(hostMem, "vmFootprintBytes")
         cpuPercent = (hostMem["cpuPercent"] as? NSNumber)?.doubleValue ?? 0
 
+        var recordedSample = false
         if let last = samples.last, Date().timeIntervalSince(last.timestamp) < 1.2 {
             // Avoid tight bursts from double triggers
         } else {
+            recordedSample = true
             samples.append(FirnMetricSample(
                 timestamp: Date(),
                 footprintMiB: Double(hostFootprintBytes) / (1024.0 * 1024.0),
@@ -577,6 +582,19 @@ final class FirnStore: ObservableObject {
                 endpoints: links
             )
         }
+
+        var nextHistory: [String: [Double]] = [:]
+        for s in stacks {
+            var hist = stackMemoryHistory[s.project] ?? []
+            if recordedSample || hist.isEmpty {
+                hist.append(Double(s.memoryBytes) / (1024.0 * 1024.0))
+                if hist.count > 30 {
+                    hist.removeFirst(hist.count - 30)
+                }
+            }
+            nextHistory[s.project] = hist
+        }
+        stackMemoryHistory = nextHistory
 
         let rawSnaps = (volumesPayload?["snapshots"] as? [[String: Any]]) ?? []
         snapshots = rawSnaps.map { s in

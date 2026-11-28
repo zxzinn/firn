@@ -52,6 +52,9 @@ struct FirnControlCenterView: View {
         .sheet(item: $activeSheet) { sheet in
             FirnControlSheetContent(sheet: sheet, store: store)
         }
+        .sheet(isPresented: $store.showCommandPalette) {
+            CommandPaletteView(store: store)
+        }
         .alert(
             activeAlert?.title ?? "",
             isPresented: isAlertPresented,
@@ -252,6 +255,19 @@ struct FirnControlCenterView: View {
             }
 
             FirnGlassGroup(spacing: 8) {
+                Button {
+                    store.showCommandPalette = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "magnifyingglass")
+                        Text("⌘K")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .help("Command Palette (⌘K)")
+                .firnGlassButton()
+
                 headerSectionActions
                 Button {
                     store.onRequestRefresh?()

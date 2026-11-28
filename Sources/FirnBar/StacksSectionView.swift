@@ -146,6 +146,17 @@ private struct StackCardView: View {
 
                 Spacer()
 
+                let memHistory = store.stackMemoryHistory[stack.project] ?? [Double(stack.memoryBytes) / (1024.0 * 1024.0)]
+                let sparkColor: Color = stack.orphaned
+                    ? FirnTheme.amber(colorScheme)
+                    : (stack.pausedCount > 0 ? FirnTheme.frozen(colorScheme) : FirnTheme.cobalt(colorScheme))
+                LiveAreaSparkline(
+                    values: memHistory,
+                    minUpperBound: 64,
+                    accent: sparkColor
+                )
+                .frame(width: 92, height: 26)
+
                 FirnGlassGroup(spacing: 6) {
                     HStack(spacing: 6) {
                         if stack.orphaned {
