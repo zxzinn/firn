@@ -205,6 +205,8 @@ public final class HTTPSDomainProxy {
         }
         if target.paused, let proj = target.project {
             try? autoThaw.ensureThawed(project: proj, targetContainer: target.containerName)
+        } else {
+            autoThaw.recordProjectTouch(target.project)
         }
         let mappings = autoThaw.currentPortMappings()
         let mapping = mappings.first {

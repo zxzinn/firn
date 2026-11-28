@@ -87,6 +87,10 @@ type ProxyManager struct {
 	httpProxy  *httputil.ReverseProxy
 	wakeMu     sync.Mutex
 	closed     bool
+
+	actMu           sync.Mutex
+	activeSessions  map[string]int
+	touchedProjects map[string]struct{}
 }
 
 func NewProxyManager(cfg ProxyManagerConfig) *ProxyManager {
@@ -94,14 +98,16 @@ func NewProxyManager(cfg ProxyManagerConfig) *ProxyManager {
 		cfg.Domain = "firn.local"
 	}
 	pm := &ProxyManager{
-		cfg:        cfg,
-		domain:     cfg.Domain,
-		ports:      make(map[int]PortMappingEntry),
-		listeners:  make(map[int][]net.Listener),
-		ipIndex:    make(map[string]DNSRecordEntry),
-		hostIndex:  make(map[string]DNSRecordEntry),
-		portByCont: make(map[string][]PortMappingEntry),
-		leafCache:  make(map[string]*tls.Certificate),
+		cfg:             cfg,
+		domain:          cfg.Domain,
+		ports:           make(map[int]PortMappingEntry),
+		listeners:       make(map[int][]net.Listener),
+		ipIndex:         make(map[string]DNSRecordEntry),
+		hostIndex:       make(map[string]DNSRecordEntry),
+		portByCont:      make(map[string][]PortMappingEntry),
+		leafCache:       make(map[string]*tls.Certificate),
+		activeSessions:  make(map[string]int),
+		touchedProjects: make(map[string]struct{}),
 	}
 
 	transport := &http.Transport{
@@ -251,6 +257,8 @@ func (pm *ProxyManager) serveDomainHTTP(w http.ResponseWriter, r *http.Request) 
 	}
 
 	ctx := context.WithValue(r.Context(), targetCtxKey{}, resolvedTarget{ip: destIP, port: destPort})
+	pm.beginProjectSession(rec.Project)
+	defer pm.endProjectSession(rec.Project)
 	pm.httpProxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
@@ -383,7 +391,65 @@ func (pm *ProxyManager) handleAcceptedTCP(hostPort int, client net.Conn) {
 		_ = client.Close()
 		return
 	}
+	pm.beginProjectSession(entry.Project)
 	spliceDual(client, up)
+	pm.endProjectSession(entry.Project)
+}
+
+func (pm *ProxyManager) beginProjectSession(project string) {
+	if project == "" {
+		return
+	}
+	pm.actMu.Lock()
+	pm.activeSessions[project]++
+	pm.touchedProjects[project] = struct{}{}
+	pm.actMu.Unlock()
+}
+
+func (pm *ProxyManager) endProjectSession(project string) {
+	if project == "" {
+		return
+	}
+	pm.actMu.Lock()
+	if cur := pm.activeSessions[project]; cur <= 1 {
+		delete(pm.activeSessions, project)
+	} else {
+		pm.activeSessions[project] = cur - 1
+	}
+	pm.touchedProjects[project] = struct{}{}
+	pm.actMu.Unlock()
+}
+
+func (pm *ProxyManager) TouchProjectByIP(ip string) {
+	if ip == "" {
+		return
+	}
+	pm.mu.RLock()
+	rec, ok := pm.ipIndex[ip]
+	pm.mu.RUnlock()
+	if !ok || rec.Project == "" {
+		return
+	}
+	pm.actMu.Lock()
+	pm.touchedProjects[rec.Project] = struct{}{}
+	pm.actMu.Unlock()
+}
+
+func (pm *ProxyManager) DrainActivity() (map[string]int, []string) {
+	pm.actMu.Lock()
+	active := make(map[string]int, len(pm.activeSessions))
+	for k, v := range pm.activeSessions {
+		if v > 0 {
+			active[k] = v
+		}
+	}
+	touched := make([]string, 0, len(pm.touchedProjects))
+	for k := range pm.touchedProjects {
+		touched = append(touched, k)
+	}
+	pm.touchedProjects = make(map[string]struct{})
+	pm.actMu.Unlock()
+	return active, touched
 }
 
 func (pm *ProxyManager) markUnpausedLocal(project string) {
@@ -646,6 +712,14 @@ func serveControlSocket(
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(engine.Stats())
+	})
+	mux.HandleFunc("/activity", func(w http.ResponseWriter, r *http.Request) {
+		active, touched := proxyMgr.DrainActivity()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"activeProjects":  active,
+			"touchedProjects": touched,
+		})
 	})
 	mux.HandleFunc("/topology", func(w http.ResponseWriter, r *http.Request) {
 		var upd TopologyUpdatePayload

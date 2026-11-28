@@ -8,7 +8,7 @@ mount -t sysfs sysfs /sys 2>/dev/null || true
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mount -o remount,rw / 2>/dev/null || true
 mount --make-rshared / 2>/dev/null || true
-mkdir -p /dev/pts /dev/shm /run /tmp /var/lib/firn /var/lib/docker /var/log/firn /run/firn /sys/fs/cgroup
+mkdir -p /dev/pts /dev/shm /run /tmp /var/lib/firn /var/log/firn /run/firn /sys/fs/cgroup /etc/rancher/k3s
 mount -t devpts devpts /dev/pts 2>/dev/null || true
 mount -t tmpfs tmpfs /dev/shm 2>/dev/null || true
 mount -t tmpfs tmpfs /run 2>/dev/null || true
@@ -36,6 +36,21 @@ hostname firn 2>/dev/null || true
 ip link set lo up 2>/dev/null || true
 printf 'nameserver 127.0.0.1\n' >/etc/resolv.conf
 
+HOST_HOME=""
+FS_MODE="firnfs"
+NET_MODE="jumbo"
+DISK_SYNC="none"
+EXTRA_MOUNTS=""
+for token in $(cat /proc/cmdline); do
+  case "$token" in
+    firn.home=*) HOST_HOME="${token#firn.home=}" ;;
+    firn.fs=*) FS_MODE="${token#firn.fs=}" ;;
+    firn.net=*) NET_MODE="${token#firn.net=}" ;;
+    firn.disksync=*) DISK_SYNC="${token#firn.disksync=}" ;;
+    firn.mounts=*) EXTRA_MOUNTS="${token#firn.mounts=}" ;;
+  esac
+done
+
 # Fast in-memory zram swap (priority 100) absorbs freshly thawed/cold container pages first.
 if [ -e /sys/block/zram0 ]; then
   echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || true
@@ -45,15 +60,26 @@ if [ -e /sys/block/zram0 ]; then
   fi
 fi
 
-# Persistent data disk (/dev/vdb) holds Docker state, k3s state, and backing swapfile (priority 10).
+# Persistent data disk (/dev/vdb) holds Docker state, k3s state, snapshots, cache, and backing swapfile (priority 10).
 if [ -b /dev/vdb ]; then
+  if [ -d /sys/block/vdb/queue ]; then
+    echo none > /sys/block/vdb/queue/scheduler 2>/dev/null || true
+    echo 1024 > /sys/block/vdb/queue/read_ahead_kb 2>/dev/null || true
+  fi
   if ! blkid /dev/vdb 2>/dev/null | grep -q 'TYPE='; then
     echo "[firn-init] formatting /dev/vdb (ext4)..."
     mkfs.ext4 -q -F -L firn-data /dev/vdb
   fi
-  mount -t ext4 -o noatime,nodiratime /dev/vdb /var/lib/firn
-  mkdir -p /var/lib/firn/docker /var/lib/docker /var/lib/firn/log /var/lib/firn/k3s
-  mount --bind /var/lib/firn/docker /var/lib/docker
+  DATA_MNT_OPTS="noatime,nodiratime"
+  if [ "$DISK_SYNC" != "fsync" ]; then
+    DATA_MNT_OPTS="noatime,nodiratime,commit=60,barrier=0"
+  fi
+  mount -t ext4 -o "$DATA_MNT_OPTS" /dev/vdb /var/lib/firn 2>/dev/null || mount -t ext4 -o noatime,nodiratime /dev/vdb /var/lib/firn
+  mkdir -p /var/lib/firn/docker /var/lib/firn/log /var/lib/firn/k3s /var/lib/firn/snapshots /var/lib/firn/registry-cache
+  if [ -d /var/lib/docker ] && [ ! -L /var/lib/docker ]; then
+    rmdir /var/lib/docker 2>/dev/null || rm -rf /var/lib/docker 2>/dev/null || true
+  fi
+  [ -e /var/lib/docker ] || ln -s /var/lib/firn/docker /var/lib/docker
 
   if [ ! -f /var/lib/firn/swapfile ]; then
     echo "[firn-init] creating 4 GiB /var/lib/firn/swapfile..."
@@ -70,28 +96,19 @@ sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
-sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
-sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_rmem="4096 1048576 16777216" >/dev/null 2>&1 || true
-sysctl -w net.ipv4.tcp_wmem="4096 1048576 16777216" >/dev/null 2>&1 || true
+sysctl -w net.core.rmem_max=33554432 >/dev/null 2>&1 || true
+sysctl -w net.core.wmem_max=33554432 >/dev/null 2>&1 || true
+sysctl -w net.core.rmem_default=2097152 >/dev/null 2>&1 || true
+sysctl -w net.core.wmem_default=2097152 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_rmem="4096 2097152 33554432" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_wmem="4096 2097152 33554432" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0 >/dev/null 2>&1 || true
+sysctl -w net.core.netdev_max_backlog=16384 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.tcp_window_scaling=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.tcp_sack=1 >/dev/null 2>&1 || true
 sysctl -w vm.swappiness=80 >/dev/null 2>&1 || true
 sysctl -w fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true
 sysctl -w fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true
-
-HOST_HOME=""
-FS_MODE="firnfs"
-NET_MODE="jumbo"
-EXTRA_MOUNTS=""
-for token in $(cat /proc/cmdline); do
-  case "$token" in
-    firn.home=*) HOST_HOME="${token#firn.home=}" ;;
-    firn.fs=*) FS_MODE="${token#firn.fs=}" ;;
-    firn.net=*) NET_MODE="${token#firn.net=}" ;;
-    firn.mounts=*) EXTRA_MOUNTS="${token#firn.mounts=}" ;;
-  esac
-done
 
 # Always keep VirtioFS mounted as fallback backing at /mnt/virtiofs-home.
 mkdir -p /mnt/virtiofs-home
@@ -180,6 +197,12 @@ for _ in $(seq 1 100); do
   sleep 0.02
 done
 
+# Sync Docker & k3s mirror configuration with persistent registry-cache toggle before starting dockerd.
+if [ -f /var/lib/firn/registry-cache/disabled ]; then
+  sed -i '/"registry-mirrors"/d' /etc/docker/daemon.json 2>/dev/null || true
+  rm -f /etc/rancher/k3s/registries.yaml 2>/dev/null || true
+fi
+
 DOCKERD_PROXY_ENV="HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128 NO_PROXY=localhost,127.0.0.1,::1,10.87.0.0/16,10.88.0.0/16,.local,.firn.local"
 env $DOCKERD_PROXY_ENV dockerd --config-file=/etc/docker/daemon.json >/var/log/firn/dockerd.log 2>&1 &
 DOCKERD_PID=$!
@@ -203,7 +226,6 @@ shutdown_clean() {
   swapoff -a 2>/dev/null || true
   sync
   fstrim /var/lib/firn 2>/dev/null || true
-  umount /var/lib/docker 2>/dev/null || true
   umount /var/lib/firn 2>/dev/null || true
   umount -a -r 2>/dev/null || true
   sync

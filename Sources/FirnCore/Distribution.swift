@@ -1,8 +1,9 @@
 import Darwin
 import Foundation
+import MachO
 
 public enum FirnVersion {
-    public static let current = "0.6.1"
+    public static let current = "0.7.0"
     public static let githubRepo = "zxzinn/firn"
 
     public static func clean(_ raw: String) -> String {
@@ -75,8 +76,38 @@ public enum FirnInstallOrigin: Equatable, Sendable {
     case homebrew(cellarPath: String)
     case standalone(binDir: URL)
 
+    public static func currentExecutablePath(fallbackArgv0: String = CommandLine.arguments[0]) -> String {
+        var size: UInt32 = 4096
+        var buf = [CChar](repeating: 0, count: Int(size))
+        let rc = _NSGetExecutablePath(&buf, &size)
+        if rc != 0 && size > 0 {
+            buf = [CChar](repeating: 0, count: Int(size) + 1)
+            if _NSGetExecutablePath(&buf, &size) == 0 {
+                return URL(fileURLWithPath: String(cString: buf)).resolvingSymlinksInPath().path
+            }
+        } else if rc == 0 {
+            return URL(fileURLWithPath: String(cString: buf)).resolvingSymlinksInPath().path
+        }
+        return resolveExecutablePath(fallbackArgv0)
+    }
+
+    public static func resolveExecutablePath(_ executablePath: String) -> String {
+        if executablePath.contains("/") {
+            return URL(fileURLWithPath: executablePath).resolvingSymlinksInPath().path
+        }
+        if let pathEnv = ProcessInfo.processInfo.environment["PATH"] {
+            for dir in pathEnv.split(separator: ":") {
+                let candidate = URL(fileURLWithPath: String(dir)).appendingPathComponent(executablePath)
+                if FileManager.default.isExecutableFile(atPath: candidate.path) {
+                    return candidate.resolvingSymlinksInPath().path
+                }
+            }
+        }
+        return URL(fileURLWithPath: executablePath).resolvingSymlinksInPath().path
+    }
+
     public static func detect(executablePath: String) -> FirnInstallOrigin {
-        let resolved = URL(fileURLWithPath: executablePath).resolvingSymlinksInPath()
+        let resolved = URL(fileURLWithPath: resolveExecutablePath(executablePath)).resolvingSymlinksInPath()
         let path = resolved.path
         for marker in ["/Cellar/firn/", "/opt/homebrew/Cellar/firn/", "/usr/local/Cellar/firn/"] {
             if let range = path.range(of: marker) {

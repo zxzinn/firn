@@ -2,6 +2,8 @@ import Darwin
 import Foundation
 import FirnCore
 
+private let cleanupExitLock = NSLock()
+
 private final class DaemonState {
     let runner: any VMBackend
     let bridge: VsockBridge
@@ -11,9 +13,13 @@ private final class DaemonState {
     let httpsProxy: HTTPSDomainProxy?
     let hostNet: HostNetSupervisor?
     let fsWatcher: FSEventsWatcher?
+    let lockFD: Int32
     let stopSemaphore = DispatchSemaphore(value: 0)
+    private let stateLock = NSLock()
+    private var _shuttingDown = false
     var hostServer: HostControlServer?
     var proxyWatcher: ProxyWatcher?
+    var pressureGuard: MemoryPressureGuard?
     var termSrc: DispatchSourceSignal?
     var intSrc: DispatchSourceSignal?
 
@@ -25,7 +31,8 @@ private final class DaemonState {
         autoThaw: AutoThawProxy,
         httpsProxy: HTTPSDomainProxy?,
         hostNet: HostNetSupervisor?,
-        fsWatcher: FSEventsWatcher?
+        fsWatcher: FSEventsWatcher?,
+        lockFD: Int32
     ) {
         self.runner = runner
         self.bridge = bridge
@@ -35,7 +42,41 @@ private final class DaemonState {
         self.httpsProxy = httpsProxy
         self.hostNet = hostNet
         self.fsWatcher = fsWatcher
+        self.lockFD = lockFD
     }
+
+    func beginShutdown() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        if _shuttingDown { return false }
+        _shuttingDown = true
+        return true
+    }
+}
+
+private func acquireDaemonSingletonLock() throws -> Int32 {
+    try FileManager.default.createDirectory(at: FirnPaths.runDir, withIntermediateDirectories: true)
+    let lockPath = FirnPaths.lockFileURL.path
+    let fd = Darwin.open(lockPath, O_CREAT | O_RDWR | O_EXLOCK | O_NONBLOCK, 0o600)
+    guard fd >= 0 else {
+        let lockErr = errno
+        if lockErr == EWOULDBLOCK || lockErr == EAGAIN {
+            let existing = (try? String(contentsOf: FirnPaths.lockFileURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? (try? String(contentsOf: FirnPaths.pidFileURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+                ?? "unknown"
+            fputs("[firnd] another firnd instance is already running (pid=\(existing)); exiting cleanly.\n", stderr)
+            fflush(stderr)
+            exit(0)
+        }
+        throw NSError(domain: NSPOSIXErrorDomain, code: Int(lockErr), userInfo: [NSLocalizedDescriptionKey: "Cannot lock \(lockPath)"])
+    }
+    _ = Darwin.ftruncate(fd, 0)
+    _ = Darwin.lseek(fd, 0, SEEK_SET)
+    let pidText = "\(ProcessInfo.processInfo.processIdentifier)\n"
+    _ = pidText.withCString { ptr in
+        Darwin.write(fd, ptr, strlen(ptr))
+    }
+    return fd
 }
 
 func cleanupAndExit(
@@ -45,8 +86,12 @@ func cleanupAndExit(
     dnsServer: LocalDNSServer,
     bridge: VsockBridge,
     hostNet: HostNetSupervisor?,
+    pressureGuard: MemoryPressureGuard? = nil,
+    lockFD: Int32 = -1,
     code: Int32 = 0
 ) -> Never {
+    cleanupExitLock.lock()
+    pressureGuard?.stop()
     fsWatcher?.stop()
     httpsProxy?.stop()
     autoThaw.stop()
@@ -54,14 +99,33 @@ func cleanupAndExit(
     bridge.stop()
     hostNet?.stop()
     try? FileManager.default.removeItem(at: FirnPaths.pidFileURL)
+    if lockFD >= 0 {
+        Darwin.close(lockFD)
+    }
     exit(code)
 }
 
 private func shutdownVMAndExit(state: DaemonState) -> Never {
+    guard state.beginShutdown() else {
+        while true {
+            Thread.sleep(forTimeInterval: 1.0)
+        }
+    }
     state.hostServer?.stop()
-    if !state.runner.isHibernated {
+    let shouldWaitForPoweroff = !state.runner.isHibernated
+    if shouldWaitForPoweroff {
         // Ask guest PID 1 via firn-guestd to flush buffers, fstrim, and remount rootfs read-only.
-        _ = try? state.bridge.guestHTTP(method: "POST", path: "/poweroff", timeoutSeconds: 2.0)
+        _ = try? state.bridge.guestHTTP(method: "POST", path: "/poweroff", timeoutSeconds: 1.5)
+    }
+    // Tear down host listeners and firn-hostnet immediately so ports/subprocesses are released
+    // even if launchd sends SIGKILL before guest fstrim/poweroff finishes.
+    state.pressureGuard?.stop()
+    state.fsWatcher?.stop()
+    state.httpsProxy?.stop()
+    state.autoThaw.stop()
+    state.dnsServer.stop()
+    state.hostNet?.stop()
+    if shouldWaitForPoweroff {
         if state.stopSemaphore.wait(timeout: .now() + 6.0) == .timedOut {
             state.runner.stopGracefully(timeoutSeconds: 4.0)
         }
@@ -73,6 +137,8 @@ private func shutdownVMAndExit(state: DaemonState) -> Never {
         dnsServer: state.dnsServer,
         bridge: state.bridge,
         hostNet: state.hostNet,
+        pressureGuard: state.pressureGuard,
+        lockFD: state.lockFD,
         code: 0
     )
 }
@@ -101,11 +167,25 @@ func runDaemon() throws {
     signal(SIGPIPE, SIG_IGN)
     signal(SIGHUP, SIG_IGN)
 
+    let lockFD = try acquireDaemonSingletonLock()
     let cfg = FirnConfig.load()
-    try FileManager.default.createDirectory(at: FirnPaths.runDir, withIntermediateDirectories: true)
     try String(ProcessInfo.processInfo.processIdentifier).write(to: FirnPaths.pidFileURL, atomically: true, encoding: .utf8)
 
-    let hostNet = HostNetSupervisor(config: cfg)
+    let hostNetSupervisor = HostNetSupervisor(config: cfg)
+    var hostNetRunning = false
+    if let hostNetSupervisor {
+        do {
+            try hostNetSupervisor.start()
+            hostNetRunning = true
+            hostNetSupervisor.pushDNSServers(VsockBridge.currentMacOSDNSServers())
+        } catch {
+            hostNetSupervisor.stop()
+            fputs("[firnd] warning: firn-hostnet failed to start (\(error.localizedDescription)); falling back to VZ NAT\n", stderr)
+            fflush(stderr)
+        }
+    }
+    let hostNet: HostNetSupervisor? = hostNetRunning ? hostNetSupervisor : nil
+
     let useKrun = (cfg.backend == "krun") || cfg.gpu
     let runner: any VMBackend = useKrun
         ? KrunMachineRunner(config: cfg)
@@ -141,27 +221,23 @@ func runDaemon() throws {
         autoThaw: autoThaw,
         httpsProxy: httpsProxy,
         hostNet: hostNet,
-        fsWatcher: fsWatcher
+        fsWatcher: fsWatcher,
+        lockFD: lockFD
     )
+    let pressureGuard = MemoryPressureGuard(
+        runner: runner,
+        bridge: bridge,
+        balloon: balloon,
+        autoThaw: autoThaw
+    )
+    state.pressureGuard = pressureGuard
 
     autoThaw.onProjectsChanged = { projects in
         httpsProxy?.reloadCertificates(projects: projects)
     }
 
-    var hostNetRunning = false
-    if let hostNet {
-        do {
-            try hostNet.start()
-            hostNetRunning = true
-            hostNet.pushDNSServers(VsockBridge.currentMacOSDNSServers())
-        } catch {
-            fputs("[firnd] warning: firn-hostnet failed to start (\(error.localizedDescription)); falling back to VZ NAT\n", stderr)
-            fflush(stderr)
-        }
-    }
-
     runner.onVMNetSocketPairReady = { fd in
-        if hostNetRunning, let hostNet {
+        if let hostNet {
             do {
                 try hostNet.sendVMNetSocketFD(fd)
             } catch {
@@ -193,12 +269,14 @@ func runDaemon() throws {
             autoThaw: autoThaw,
             httpsProxy: httpsProxy,
             dnsServer: dnsServer,
-            hostNet: hostNetRunning ? hostNet : nil
+            hostNet: hostNet,
+            pressureGuard: pressureGuard
         ) {
             shutdownVMAndExit(state: state)
         }
         try hostServer.start()
         state.hostServer = hostServer
+        pressureGuard.start()
 
         try runner.start()
         bridge.startHostRelays()
@@ -211,6 +289,9 @@ func runDaemon() throws {
 
         runner.onStop = { (error: Error?) in
             state.stopSemaphore.signal()
+            guard state.beginShutdown() else {
+                return
+            }
             if let error {
                 fputs("[firnd] VM stopped with error: \(error.localizedDescription)\n", stderr)
                 fflush(stderr)
@@ -223,11 +304,50 @@ func runDaemon() throws {
                 dnsServer: dnsServer,
                 bridge: bridge,
                 hostNet: hostNet,
+                pressureGuard: pressureGuard,
+                lockFD: lockFD,
                 code: error == nil ? 0 : 1
             )
         }
 
         pushGuestConfigAndProxy(bridge: bridge, cfg: cfg, proxyState: nil)
+
+        // Forward host-initiated proxy/port/utun activity every 5s so guest reaper keeps exact idle times.
+        DispatchQueue.global(qos: .utility).async {
+            var lastPushedActive: [String: Int] = [:]
+            while true {
+                Thread.sleep(forTimeInterval: 5.0)
+                if runner.isHibernated {
+                    lastPushedActive = [:]
+                    continue
+                }
+                let localAct = autoThaw.drainActivitySnapshot()
+                let hnAct = hostNetRunning ? hostNet?.drainActivity() : nil
+                var mergedActive = localAct.active
+                if let hnAct {
+                    for (k, v) in hnAct.active {
+                        mergedActive[k, default: 0] += v
+                    }
+                }
+                var touchedSet = Set(localAct.touched)
+                if let hnAct {
+                    for p in hnAct.touched {
+                        touchedSet.insert(p)
+                    }
+                }
+                if !touchedSet.isEmpty || mergedActive != lastPushedActive {
+                    let payload: [String: Any] = [
+                        "activeProjects": mergedActive,
+                        "touchedProjects": Array(touchedSet),
+                    ]
+                    if let body = try? JSONSerialization.data(withJSONObject: payload),
+                       let (code, _) = try? bridge.guestHTTP(method: "POST", path: "/activity", body: body, timeoutSeconds: 2.0),
+                       code < 300 {
+                        lastPushedActive = mergedActive
+                    }
+                }
+            }
+        }
 
         let proxyWatcher = ProxyWatcher { proxyState in
             hostServer.updateProxyState(proxyState)
@@ -335,6 +455,8 @@ func runDaemon() throws {
             dnsServer: dnsServer,
             bridge: bridge,
             hostNet: hostNet,
+            pressureGuard: pressureGuard,
+            lockFD: lockFD,
             code: 1
         )
     }

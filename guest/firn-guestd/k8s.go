@@ -200,6 +200,12 @@ func (m *K3sManager) Enable() (K3sStatus, error) {
 		return m.Status(), err
 	}
 	_ = os.WriteFile(k3sEnabledMarker, []byte(m.version+"\n"), 0o644)
+	// Ensure k3s uses Firn's built-in OCI pull-through mirror when enabled.
+	if _, serr := os.Stat(filepath.Join(defaultRegistryCacheDir, "disabled")); os.IsNotExist(serr) {
+		regContent := fmt.Sprintf("mirrors:\n  \"docker.io\":\n    endpoint:\n      - %q\n", defaultRegistryMirrorURL)
+		_ = os.MkdirAll(filepath.Dir(defaultK3sRegistriesYAMLPath), 0o755)
+		_ = os.WriteFile(defaultK3sRegistriesYAMLPath, []byte(regContent), 0o644)
+	}
 
 	m.mu.Lock()
 	if m.pid > 0 && syscall.Kill(m.pid, 0) == nil {

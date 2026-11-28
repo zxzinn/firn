@@ -78,6 +78,7 @@ type NetEngine struct {
 	dnsServers []string
 
 	lookupPaused func(ip string) (project string, container string, paused bool)
+	touchIP      func(ip string)
 
 	rxBytes atomic.Uint64
 	txBytes atomic.Uint64
@@ -562,6 +563,10 @@ func (e *NetEngine) SetContainerLookup(fn func(ip string) (string, string, bool)
 	e.lookupPaused = fn
 }
 
+func (e *NetEngine) SetIPTouchFunc(fn func(ip string)) {
+	e.touchIP = fn
+}
+
 func (e *NetEngine) DialGuestTCP(ctx context.Context, ipStr string, port uint16) (net.Conn, error) {
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil || !addr.Is4() {
@@ -667,6 +672,9 @@ func (e *NetEngine) InjectUtunIPPacket(ipPkt []byte) error {
 		if proj, container, paused := e.lookupPaused(dstIP); paused && proj != "" {
 			triggerThawHost(e.cfg.FirndSock, proj, container)
 		}
+	}
+	if e.touchIP != nil {
+		e.touchIP(dstIP)
 	}
 	frame := make([]byte, 14+len(ipPkt))
 	copy(frame[0:6], guestMAC)

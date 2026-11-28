@@ -127,7 +127,7 @@ public final class VZMachineRunner: NSObject, VZVirtualMachineDelegate, VMBacken
         let netMode = (useFastNet && onVMNetSocketPairReady != nil) ? "jumbo" : "nat"
         let bootLoader = VZLinuxBootLoader(kernelURL: FirnPaths.kernelURL)
         bootLoader.initialRamdiskURL = FirnPaths.initramfsURL
-        var cmdLine = "console=hvc0 root=/dev/vda rootfstype=ext4 rw init=/sbin/init firn.home=\(homePath) firn.fs=\(config.fsMode) firn.net=\(netMode)"
+        var cmdLine = "console=hvc0 root=/dev/vda rootfstype=ext4 rw init=/sbin/init firn.home=\(homePath) firn.fs=\(config.fsMode) firn.net=\(netMode) firn.disksync=\(config.diskSyncMode)"
         if !activeExtraMounts.isEmpty {
             let encodedSpecs = activeExtraMounts.map { item in
                 "\(item.idx):\(Self.encodeMountKernelParam(item.guestPath)):\(item.readOnly ? "ro" : "rw")"

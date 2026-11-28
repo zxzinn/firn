@@ -90,7 +90,7 @@ public final class KrunMachineRunner: VMBackend {
         unlink(netSockURL.path)
 
         let homePath = fm.homeDirectoryForCurrentUser.path
-        let cmdline = "console=hvc0 root=/dev/vda rootfstype=ext4 rw init=/sbin/init firn.home=\(homePath) firn.fs=\(config.fsMode) firn.net=jumbo quiet"
+        let cmdline = "console=hvc0 root=/dev/vda rootfstype=ext4 rw init=/sbin/init firn.home=\(homePath) firn.fs=\(config.fsMode) firn.net=jumbo firn.disksync=\(config.diskSyncMode) quiet"
 
         fm.createFile(atPath: FirnPaths.serialLogURL.path, contents: nil)
         let lh = try FileHandle(forWritingTo: FirnPaths.serialLogURL)

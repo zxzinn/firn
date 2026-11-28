@@ -79,6 +79,7 @@ func main() {
 		EnablePortForward: *portForward,
 	})
 	engine.SetContainerLookup(proxyMgr.LookupPausedByIP)
+	engine.SetIPTouchFunc(proxyMgr.TouchProjectByIP)
 	if err := proxyMgr.Start(); err != nil {
 		log.Fatalf("[firn-hostnet] proxy init failed: %v", err)
 	}

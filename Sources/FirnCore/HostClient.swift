@@ -41,6 +41,8 @@ public struct HostProcessMetrics: Codable, Sendable, Equatable {
     private static let cpuLock = NSLock()
     private static var prevSampleAt: Date?
     private static var prevCPUNanos: UInt64 = 0
+    private static var cachedVMPIDs: [Int32] = []
+    private static var cachedVMPIDsAt: Date = .distantPast
 
     private static func cpuNanos(for pid: Int32) -> UInt64? {
         guard pid > 0 else { return nil }
@@ -107,6 +109,7 @@ public struct HostProcessMetrics: Codable, Sendable, Equatable {
 
     public static func current(daemonPID: Int32?, extraPIDs: [Int32] = []) -> HostProcessMetrics {
         guard let daemonPID, daemonPID > 0 else { return HostProcessMetrics() }
+        let vmPIDCheckTime = Date()
         var daemonFootprint: UInt64 = 0
         var vmFootprint: UInt64 = 0
         var totalRSS: UInt64 = 0
@@ -122,22 +125,40 @@ public struct HostProcessMetrics: Codable, Sendable, Equatable {
             }
         }
 
-        var vmPIDs: [Int32] = []
+        let now = vmPIDCheckTime
+
+        cpuLock.lock()
+        let stalePIDs = now.timeIntervalSince(cachedVMPIDsAt) > 10.0 ||
+            cachedVMPIDs.contains(where: { kill($0, 0) != 0 && errno != EPERM })
+        var vmPIDs = cachedVMPIDs
+        cpuLock.unlock()
+
+        if stalePIDs || vmPIDs.isEmpty {
+            var discovered: [Int32] = []
+            for pid in listAllPIDs() where pid != daemonPID {
+                if let path = pidPath(pid), path.contains("com.apple.Virtualization.VirtualMachine") || path.hasSuffix("/krunkit") {
+                    discovered.append(pid)
+                }
+            }
+            cpuLock.lock()
+            cachedVMPIDs = discovered
+            cachedVMPIDsAt = now
+            cpuLock.unlock()
+            vmPIDs = discovered
+        }
+
         var vmCPUFallbackNeeded = false
-        for pid in listAllPIDs() where pid != daemonPID {
-            if let path = pidPath(pid), path.contains("com.apple.Virtualization.VirtualMachine") || path.hasSuffix("/krunkit") {
-                vmPIDs.append(pid)
-                if let sample = samplePID(pid) {
-                    vmFootprint &+= sample.footprint
-                    totalRSS &+= sample.rss
-                    if let c = cpuNanos(for: pid) {
-                        totalCPUNanos &+= c
-                    } else {
-                        vmCPUFallbackNeeded = true
-                    }
+        for pid in vmPIDs {
+            if let sample = samplePID(pid) {
+                vmFootprint &+= sample.footprint
+                totalRSS &+= sample.rss
+                if let c = cpuNanos(for: pid) {
+                    totalCPUNanos &+= c
                 } else {
                     vmCPUFallbackNeeded = true
                 }
+            } else {
+                vmCPUFallbackNeeded = true
             }
         }
 
@@ -151,7 +172,6 @@ public struct HostProcessMetrics: Codable, Sendable, Equatable {
             vmCPUFallback = psRes.cpuPercent
         }
 
-        let now = Date()
         var cpuPct = vmCPUFallback
         cpuLock.lock()
         if let prevAt = prevSampleAt {

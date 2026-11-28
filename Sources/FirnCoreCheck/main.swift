@@ -58,6 +58,20 @@ expect(FirnVersion.normalizedTag("0.5.0") == "v0.5.0", "normalizedTag failed")
 
 expect(FirnInstallOrigin.detect(executablePath: "/opt/homebrew/Cellar/firn/0.5.0/bin/firn") == .homebrew(cellarPath: "/opt/homebrew/Cellar/firn/0.5.0"), "Homebrew origin detect failed")
 expect(FirnInstallOrigin.detect(executablePath: "/opt/firn/bin/firn") == .standalone(binDir: URL(fileURLWithPath: "/opt/firn/bin")), "Standalone origin detect failed")
+let absExe = FirnInstallOrigin.currentExecutablePath()
+expect(absExe.hasPrefix("/"), "currentExecutablePath must return an absolute path, got \(absExe)")
+if let pathEnv = ProcessInfo.processInfo.environment["PATH"], let firstDir = pathEnv.split(separator: ":").first.map(String.init) {
+    let fakeBinDir = FileManager.default.temporaryDirectory.appendingPathComponent("firn-path-check-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: fakeBinDir, withIntermediateDirectories: true)
+    let fakeExe = fakeBinDir.appendingPathComponent("firn-check-dummy")
+    FileManager.default.createFile(atPath: fakeExe.path, contents: Data("#!/bin/sh\n".utf8), attributes: [.posixPermissions: 0o755])
+    setenv("PATH", "\(fakeBinDir.path):\(pathEnv)", 1)
+    let detectedBare = FirnInstallOrigin.detect(executablePath: "firn-check-dummy")
+    expect(detectedBare == .standalone(binDir: fakeBinDir.resolvingSymlinksInPath()), "Bare PATH origin detect failed: got \(detectedBare) vs \(fakeBinDir.path)")
+    setenv("PATH", pathEnv, 1)
+    try? FileManager.default.removeItem(at: fakeBinDir)
+    _ = firstDir
+}
 
 let sampleSums = """
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  firn-darwin-arm64.tar.gz
@@ -105,7 +119,7 @@ let caStatus = CertAuthority.caTrustStatus(in: tmpCertDir)
 expect(caStatus.exists && caStatus.fingerprint.contains("SHA256") || caStatus.fingerprint.contains("Fingerprint"), "Expected CA cert + fingerprint, got \(caStatus)")
 
 let plist = FirnLaunchAgent.plistContents(firndPath: "/usr/local/bin/firnd", stateDir: URL(fileURLWithPath: "/tmp/firn-home"))
-expect(plist.contains("dev.firn.firnd") && plist.contains("/usr/local/bin/firnd") && plist.contains("/tmp/firn-home/firnd.log"), "LaunchAgent plist mismatch")
+expect(plist.contains("dev.firn.firnd") && plist.contains("/usr/local/bin/firnd") && plist.contains("/tmp/firn-home/firnd.log") && plist.contains("<key>ExitTimeOut</key>"), "LaunchAgent plist mismatch")
 let routePlist = FirnRouteDaemon.plistContents(hostnetPath: "/usr/local/bin/firn-hostnet", utunSockURL: URL(fileURLWithPath: "/tmp/firn-home/run/utun.sock"), stateDir: URL(fileURLWithPath: "/tmp/firn-home"))
 expect(routePlist.contains("dev.firn.route") && routePlist.contains("utun") && routePlist.contains("/tmp/firn-home/run/utun.sock"), "RouteDaemon plist mismatch")
 
@@ -140,16 +154,17 @@ expect(FirnHostClient.formatBytes(2 * 1024 * 1024 * 1024) == "2.00 GiB", "format
 expect(HostProcessMetrics.samplePID(getpid())?.footprint ?? 0 > 0, "Expected non-zero proc_pid_rusage footprint for current process")
 _ = FirnHostClient.metalGPUDeviceName()
 
-// v0.6.x assertions: version, extraMounts, autoTrimMinutes, k8s local DNS handling
-expect(FirnVersion.current == "0.6.1", "Expected FirnVersion.current == 0.6.1, got \(FirnVersion.current)")
-expect(defaultCfg.autoTrimMinutes == 60 && defaultCfg.extraMounts.isEmpty, "Expected v0.6.0 default autoTrimMinutes=60 and empty extraMounts")
+// v0.6.x & v0.7.0 assertions: version, extraMounts, autoTrimMinutes, memoryPressureReclaim
+expect(FirnVersion.current == "0.7.0", "Expected FirnVersion.current == 0.7.0, got \(FirnVersion.current)")
+expect(defaultCfg.autoTrimMinutes == 60 && defaultCfg.extraMounts.isEmpty && defaultCfg.memoryPressureReclaim, "Expected default autoTrimMinutes=60, empty extraMounts, and memoryPressureReclaim=true")
 
-var v06Cfg = FirnConfig()
-v06Cfg.autoTrimMinutes = 15
-v06Cfg.extraMounts = [FirnExtraMount(hostPath: "/tmp/firn-src", guestPath: "/mnt/src", readOnly: true)]
-let tmpV06Dir = tmpStateDir.appendingPathComponent("v06")
-try v06Cfg.save(to: tmpV06Dir)
-let reloadedV06 = FirnConfig.load(from: tmpV06Dir)
-expect(reloadedV06 == v06Cfg && reloadedV06.autoTrimMinutes == 15 && reloadedV06.extraMounts.count == 1 && reloadedV06.extraMounts[0].readOnly, "v0.6.0 FirnConfig extraMounts/autoTrimMinutes roundtrip failed")
+var v07Cfg = FirnConfig()
+v07Cfg.autoTrimMinutes = 15
+v07Cfg.memoryPressureReclaim = false
+v07Cfg.extraMounts = [FirnExtraMount(hostPath: "/tmp/firn-src", guestPath: "/mnt/src", readOnly: true)]
+let tmpV07Dir = tmpStateDir.appendingPathComponent("v07")
+try v07Cfg.save(to: tmpV07Dir)
+let reloadedV07 = FirnConfig.load(from: tmpV07Dir)
+expect(reloadedV07 == v07Cfg && reloadedV07.autoTrimMinutes == 15 && !reloadedV07.memoryPressureReclaim && reloadedV07.extraMounts.count == 1 && reloadedV07.extraMounts[0].readOnly, "v0.7.0 FirnConfig extraMounts/autoTrimMinutes/memoryPressureReclaim roundtrip failed")
 
 print("FirnCoreCheck: all checks passed")

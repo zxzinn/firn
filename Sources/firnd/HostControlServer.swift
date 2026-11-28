@@ -10,6 +10,7 @@ public final class HostControlServer {
     private let httpsProxy: HTTPSDomainProxy?
     private let dnsServer: LocalDNSServer
     private let hostNet: HostNetSupervisor?
+    private let pressureGuard: MemoryPressureGuard?
     private let onShutdownRequested: () -> Void
 
     private var listenFD: Int32 = -1
@@ -26,6 +27,7 @@ public final class HostControlServer {
         httpsProxy: HTTPSDomainProxy?,
         dnsServer: LocalDNSServer,
         hostNet: HostNetSupervisor? = nil,
+        pressureGuard: MemoryPressureGuard? = nil,
         onShutdownRequested: @escaping () -> Void
     ) {
         self.runner = runner
@@ -35,6 +37,7 @@ public final class HostControlServer {
         self.httpsProxy = httpsProxy
         self.dnsServer = dnsServer
         self.hostNet = hostNet
+        self.pressureGuard = pressureGuard
         self.liveConfig = runner.config
         self.onShutdownRequested = onShutdownRequested
     }
@@ -186,7 +189,29 @@ public final class HostControlServer {
             "ports": autoThaw.currentPortMappings().count,
             "topologyVersion": autoThaw.currentTopologyVersion(),
             "hibernateSeconds": cfg.hibernateSeconds,
+            "memoryPressure": pressureGuard?.statusDictionary() ?? [:],
         ]
+    }
+
+    private func enrichOrphanedProjects(_ dict: inout [String: Any]) -> [[String: Any]] {
+        let fm = FileManager.default
+        let rawProjects = (dict["projects"] as? [[String: Any]]) ?? []
+        var orphanedCount = 0
+        var enriched: [[String: Any]] = []
+        enriched.reserveCapacity(rawProjects.count)
+        for var p in rawProjects {
+            let hasCompose = (p["hasComposeProject"] as? Bool) ?? false
+            let workingDir = (p["workingDir"] as? String) ?? ""
+            let isOrphaned = hasCompose && !workingDir.isEmpty && !fm.fileExists(atPath: workingDir)
+            p["orphaned"] = isOrphaned
+            if isOrphaned {
+                orphanedCount += 1
+            }
+            enriched.append(p)
+        }
+        dict["projects"] = enriched
+        dict["orphanedProjectCount"] = orphanedCount
+        return enriched
     }
 
     private func route(method: String, fullTarget: String, path: String, body: Data) -> (Int, Data) {
@@ -248,6 +273,7 @@ public final class HostControlServer {
                     mergedCaps["metalDeviceName"] = metalGPU
                 }
                 dict["capabilities"] = mergedCaps
+                _ = enrichOrphanedProjects(&dict)
                 return jsonResponse(dict)
             } catch {
                 return jsonResponse(["error": error.localizedDescription], status: 500)
@@ -295,7 +321,7 @@ public final class HostControlServer {
                 "subnets": ["10.87.0.0/24", "10.88.0.0/16"],
             ])
         }
-        if path == "/k8s/status" || path == "/k8s/kubeconfig" || path == "/k8s/services" || path == "/machines" {
+        if path == "/k8s/status" || path == "/k8s/kubeconfig" || path == "/k8s/services" || path == "/machines" || path == "/volumes/snapshots" || path == "/cache/status" {
             do {
                 let (code, raw) = try bridge.guestHTTP(method: "GET", path: fullTarget, timeoutSeconds: 15.0)
                 return (code, raw)
@@ -303,8 +329,8 @@ public final class HostControlServer {
                 return jsonResponse(["error": error.localizedDescription], status: 500)
             }
         }
-        if method == "POST" && (path.hasPrefix("/k8s/") || path.hasPrefix("/machines/") || path == "/machines") {
-            let timeout = (path == "/k8s/enable" || path == "/k8s/load" || path == "/machines/create" || path.hasSuffix("/clone")) ? 180.0 : 30.0
+        if method == "POST" && (path.hasPrefix("/k8s/") || path.hasPrefix("/machines/") || path == "/machines" || path.hasPrefix("/volumes/") || path.hasPrefix("/cache/")) {
+            let timeout = (path == "/k8s/enable" || path == "/k8s/load" || path == "/machines/create" || path.hasSuffix("/clone") || path == "/volumes/snapshot" || path == "/volumes/clone") ? 180.0 : 30.0
             do {
                 let (code, raw) = try bridge.guestHTTP(method: "POST", path: fullTarget, body: body.isEmpty ? nil : body, timeoutSeconds: timeout)
                 autoThaw.syncTopologyNow()
@@ -312,6 +338,92 @@ public final class HostControlServer {
             } catch {
                 return jsonResponse(["error": error.localizedDescription], status: 500)
             }
+        }
+        if method == "DELETE" && path.hasPrefix("/volumes/snapshots/") {
+            do {
+                let (code, raw) = try bridge.guestHTTP(method: "DELETE", path: fullTarget, timeoutSeconds: 30.0)
+                return (code, raw)
+            } catch {
+                return jsonResponse(["error": error.localizedDescription], status: 500)
+            }
+        }
+        if method == "POST" && path.hasPrefix("/projects/") && path.hasSuffix("/remove") {
+            do {
+                let (code, raw) = try bridge.guestHTTP(method: "POST", path: fullTarget, timeoutSeconds: 60.0)
+                let shrinkInfo = balloon.shrinkToGuestDemand()
+                autoThaw.syncTopologyNow()
+                if var dict = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] {
+                    dict["balloon"] = shrinkInfo
+                    return jsonResponse(dict, status: code)
+                }
+                return (code, raw)
+            } catch {
+                return jsonResponse(["error": error.localizedDescription], status: 500)
+            }
+        }
+        if method == "POST" && path == "/stacks/prune" {
+            let dryRun = queryValue("dryRun", in: fullTarget) == "1" || queryValue("dryRun", in: fullTarget) == "true"
+            let freezeOnly = queryValue("freeze", in: fullTarget) == "1" || queryValue("freeze", in: fullTarget) == "true"
+            let rmVols = queryValue("volumes", in: fullTarget) == "1" || queryValue("volumes", in: fullTarget) == "true"
+            do {
+                let (_, raw) = try bridge.guestHTTP(method: "GET", path: "/status", timeoutSeconds: 5.0)
+                guard var dict = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else {
+                    return jsonResponse(["error": "Invalid guest status payload"], status: 500)
+                }
+                let enriched = enrichOrphanedProjects(&dict)
+                let orphans = enriched.filter { ($0["orphaned"] as? Bool) == true }
+                if dryRun {
+                    return jsonResponse([
+                        "ok": true,
+                        "dryRun": true,
+                        "orphaned": orphans,
+                        "affectedCount": orphans.count,
+                    ])
+                }
+                var affected: [[String: Any]] = []
+                for orphan in orphans {
+                    let proj = (orphan["project"] as? String) ?? ""
+                    guard !proj.isEmpty else { continue }
+                    let encoded = proj.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? proj
+                    if freezeOnly {
+                        let (c, r) = try bridge.guestHTTP(method: "POST", path: "/freeze/\(encoded)?reclaim=1", timeoutSeconds: 30.0)
+                        var item = (try? JSONSerialization.jsonObject(with: r)) as? [String: Any] ?? [:]
+                        item["project"] = proj
+                        item["action"] = "freeze"
+                        item["ok"] = (c < 300)
+                        affected.append(item)
+                    } else {
+                        let q = rmVols ? "?volumes=1" : ""
+                        let (c, r) = try bridge.guestHTTP(method: "POST", path: "/projects/\(encoded)/remove\(q)", timeoutSeconds: 60.0)
+                        var item = (try? JSONSerialization.jsonObject(with: r)) as? [String: Any] ?? [:]
+                        item["project"] = proj
+                        item["action"] = "remove"
+                        item["ok"] = (c < 300)
+                        affected.append(item)
+                    }
+                }
+                let shrinkInfo = affected.isEmpty ? [:] : balloon.shrinkToGuestDemand(dropCaches: true, converge: true)
+                autoThaw.syncTopologyNow()
+                return jsonResponse([
+                    "ok": true,
+                    "dryRun": false,
+                    "freeze": freezeOnly,
+                    "removeVolumes": rmVols,
+                    "affectedCount": affected.count,
+                    "results": affected,
+                    "balloon": shrinkInfo,
+                ])
+            } catch {
+                return jsonResponse(["error": error.localizedDescription], status: 500)
+            }
+        }
+        if method == "POST" && path == "/memory-pressure/reclaim" {
+            let level = queryValue("level", in: fullTarget) ?? "warning"
+            let force = queryValue("force", in: fullTarget) == "1" || queryValue("force", in: fullTarget) == "true"
+            guard let guardObj = pressureGuard else {
+                return jsonResponse(["error": "MemoryPressureGuard unavailable"], status: 503)
+            }
+            return jsonResponse(guardObj.triggerReclaim(level: level, force: force))
         }
         if path == "/events" {
             let since = UInt64(queryValue("since", in: fullTarget) ?? "0") ?? 0
@@ -359,8 +471,9 @@ public final class HostControlServer {
                 "hostLogicalBytes": hostStats.logicalBytes,
                 "hostAllocatedBytes": hostStats.allocatedBytes,
             ]
+            let guestTimeout = queryValue("refresh", in: fullTarget) == "1" ? 50.0 : 5.0
             if !runner.isHibernated,
-               let (_, raw) = try? bridge.guestHTTP(method: "GET", path: "/disk/usage", timeoutSeconds: 5.0),
+               let (_, raw) = try? bridge.guestHTTP(method: "GET", path: fullTarget, timeoutSeconds: guestTimeout),
                let guest = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] {
                 out["guest"] = guest
             }
@@ -410,6 +523,7 @@ public final class HostControlServer {
                 if let hib = (req["hibernateSeconds"] as? NSNumber)?.intValue, hib >= 0 { next.hibernateSeconds = hib }
                 if let drd = req["directRouteDNS"] as? Bool { next.directRouteDNS = drd }
                 if let atm = (req["autoTrimMinutes"] as? NSNumber)?.intValue, atm >= 0 { next.autoTrimMinutes = atm }
+                if let mpr = req["memoryPressureReclaim"] as? Bool { next.memoryPressureReclaim = mpr }
                 if let mountsRaw = req["extraMounts"] as? [[String: Any]] {
                     var parsedMounts: [FirnExtraMount] = []
                     for item in mountsRaw {

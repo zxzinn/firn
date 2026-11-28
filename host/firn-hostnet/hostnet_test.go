@@ -403,3 +403,44 @@ func TestFullStackTCPAndFirnFSRPC(t *testing.T) {
 		t.Fatal("expected dgramL2Endpoint to enable CapabilityRXChecksumOffload")
 	}
 }
+
+func TestProxyManagerActivityAndUtunTouch(t *testing.T) {
+	pm := NewProxyManager(ProxyManagerConfig{Domain: "firn.local"})
+	pm.ApplyTopology(TopologyUpdatePayload{
+		Version: 1,
+		Domain:  "firn.local",
+		Records: []DNSRecordEntry{
+			{
+				Names:         []string{"web.proj-a.firn.local"},
+				ContainerName: "proj-a-web-1",
+				Project:       "proj-a",
+				Service:       "web",
+				IP:            "10.88.0.5",
+				HTTPPort:      3000,
+			},
+		},
+	})
+
+	pm.TouchProjectByIP("10.88.0.5")
+	pm.TouchProjectByIP("10.88.0.99") // unknown IP ignored
+	pm.beginProjectSession("proj-b")
+
+	active, touched := pm.DrainActivity()
+	if active["proj-b"] != 1 {
+		t.Fatalf("expected proj-b active session count 1, got %+v", active)
+	}
+	if len(touched) != 2 {
+		t.Fatalf("expected 2 touched projects (proj-a, proj-b), got %v", touched)
+	}
+
+	// Drain cleared touched list, while proj-b session remains active until closed
+	active2, touched2 := pm.DrainActivity()
+	if active2["proj-b"] != 1 || len(touched2) != 0 {
+		t.Fatalf("expected active proj-b=1 and empty touched, got active=%v touched=%v", active2, touched2)
+	}
+	pm.endProjectSession("proj-b")
+	active3, touched3 := pm.DrainActivity()
+	if len(active3) != 0 || len(touched3) != 1 || touched3[0] != "proj-b" {
+		t.Fatalf("expected empty active and proj-b touched after end, got active=%v touched=%v", active3, touched3)
+	}
+}

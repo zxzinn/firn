@@ -52,6 +52,20 @@ func writeJSON(w http.ResponseWriter, code int, payload any) {
 }
 
 func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay, k3sMgr *K3sManager, hostHome string) http.Handler {
+	return buildControlMuxWithManagers(engine, relay, k3sMgr, nil, nil, hostHome)
+}
+
+func buildControlMuxWithManagers(
+	engine *ReaperEngine,
+	relay *ProxyAndDNSRelay,
+	k3sMgr *K3sManager,
+	volMgr *VolumeManager,
+	regCache *RegistryCache,
+	hostHome string,
+) http.Handler {
+	if volMgr == nil {
+		volMgr = NewVolumeManager(engine, defaultDockerVolumesRoot, defaultSnapshotsRoot, true)
+	}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -362,8 +376,169 @@ func buildControlMux(engine *ReaperEngine, relay *ProxyAndDNSRelay, k3sMgr *K3sM
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": name, "action": action})
 	})
 
+	mux.HandleFunc("/activity", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		var req struct {
+			ActiveProjects  map[string]int `json:"activeProjects"`
+			TouchedProjects []string       `json:"touchedProjects"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		engine.RecordHostActivity(req.ActiveProjects, req.TouchedProjects, time.Now())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
+	mux.HandleFunc("/projects/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/projects/")
+		proj, action, ok := strings.Cut(rest, "/")
+		proj, _ = url.PathUnescape(proj)
+		if !ok || proj == "" || action != "remove" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expected /projects/<name>/remove"})
+			return
+		}
+		rmVols := r.URL.Query().Get("volumes") == "1" || r.URL.Query().Get("volumes") == "true"
+		res, err := engine.RemoveProject(proj, rmVols)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
+
+	mux.HandleFunc("/volumes/snapshots", func(w http.ResponseWriter, r *http.Request) {
+		list, err := volMgr.ListSnapshots()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"snapshots": list})
+	})
+
+	mux.HandleFunc("/volumes/snapshot", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		var req struct {
+			Volume   string `json:"volume"`
+			Snapshot string `json:"snapshot"`
+			Quiesce  bool   `json:"quiesce"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		info, err := volMgr.CreateSnapshot(req.Volume, req.Snapshot, req.Quiesce)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, info)
+	})
+
+	mux.HandleFunc("/volumes/clone", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		var req struct {
+			Source       string `json:"source"`
+			Target       string `json:"target"`
+			FromSnapshot bool   `json:"fromSnapshot"`
+			Quiesce      bool   `json:"quiesce"`
+			Overwrite    bool   `json:"overwrite"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		res, err := volMgr.CloneVolume(req.Source, req.Target, req.FromSnapshot, req.Quiesce, req.Overwrite)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
+
+	mux.HandleFunc("/volumes/snapshots/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST or DELETE required"})
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/volumes/snapshots/")
+		snapName := strings.TrimSuffix(rest, "/delete")
+		snapName, _ = url.PathUnescape(snapName)
+		if err := volMgr.DeleteSnapshot(snapName); err != nil {
+			code := http.StatusBadRequest
+			if strings.Contains(err.Error(), "not found") {
+				code = http.StatusNotFound
+			}
+			writeJSON(w, code, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": snapName})
+	})
+
+	mux.HandleFunc("/cache/status", func(w http.ResponseWriter, r *http.Request) {
+		if regCache == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "registry cache unavailable"})
+			return
+		}
+		writeJSON(w, http.StatusOK, regCache.Status())
+	})
+
+	mux.HandleFunc("/cache/enable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || regCache == nil {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		st, err := regCache.Enable()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "status": st})
+			return
+		}
+		writeJSON(w, http.StatusOK, st)
+	})
+
+	mux.HandleFunc("/cache/disable", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || regCache == nil {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		st, err := regCache.Disable()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "status": st})
+			return
+		}
+		writeJSON(w, http.StatusOK, st)
+	})
+
+	mux.HandleFunc("/cache/prune", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || regCache == nil {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+			return
+		}
+		all := r.URL.Query().Get("all") == "1" || r.URL.Query().Get("all") == "true"
+		res, err := regCache.Prune(all)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	})
+
 	mux.HandleFunc("/disk/usage", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, engine.DiskUsage())
+		refresh := r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true"
+		writeJSON(w, http.StatusOK, engine.DiskUsageWithRefresh(refresh))
 	})
 
 	mux.HandleFunc("/disk/trim", func(w http.ResponseWriter, r *http.Request) {
@@ -454,6 +629,16 @@ func main() {
 	engine := NewReaperEngine(docker, cfg.IdleSeconds, cfg.Domain, cfg.ExemptProjects)
 	k3sMgr := NewK3sManager(cfg.Domain)
 	relay := NewProxyAndDNSRelay(engine)
+	volMgr := NewVolumeManager(engine, defaultDockerVolumesRoot, defaultSnapshotsRoot, true)
+	regCache := NewRegistryCache(defaultRegistryCacheDir, defaultRegistryCacheListenAddr, relay, true)
+	if err := regCache.Start(); err != nil {
+		log.Printf("[firn-guestd] warning: registry cache startup failed: %v", err)
+	} else {
+		defer regCache.Stop()
+	}
+	engine.extraDiskUsageFn = func() (uint64, uint64) {
+		return regCache.TotalBytes(), volMgr.TotalSnapshotsBytes()
+	}
 
 	var fsMount *firnFSMount
 	firnfsActive := false
@@ -510,7 +695,7 @@ func main() {
 		}
 	}
 
-	handler := buildControlMux(engine, relay, k3sMgr, *hostHome)
+	handler := buildControlMuxWithManagers(engine, relay, k3sMgr, volMgr, regCache, *hostHome)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

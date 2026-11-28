@@ -31,6 +31,7 @@ public struct FirnConfig: Codable, Sendable, Equatable {
     public var directRouteDNS: Bool
     public var extraMounts: [FirnExtraMount]
     public var autoTrimMinutes: Int
+    public var memoryPressureReclaim: Bool
 
     public init(
         cpus: Int = 8,
@@ -50,7 +51,8 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         gpu: Bool = false,
         directRouteDNS: Bool = false,
         extraMounts: [FirnExtraMount] = [],
-        autoTrimMinutes: Int = 60
+        autoTrimMinutes: Int = 60,
+        memoryPressureReclaim: Bool = true
     ) {
         self.cpus = cpus
         self.memoryGiB = memoryGiB
@@ -70,6 +72,7 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         self.directRouteDNS = directRouteDNS
         self.extraMounts = extraMounts
         self.autoTrimMinutes = autoTrimMinutes
+        self.memoryPressureReclaim = memoryPressureReclaim
     }
 
     public init(from decoder: Decoder) throws {
@@ -93,6 +96,7 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         self.directRouteDNS = try c.decodeIfPresent(Bool.self, forKey: .directRouteDNS) ?? d.directRouteDNS
         self.extraMounts = try c.decodeIfPresent([FirnExtraMount].self, forKey: .extraMounts) ?? d.extraMounts
         self.autoTrimMinutes = try c.decodeIfPresent(Int.self, forKey: .autoTrimMinutes) ?? d.autoTrimMinutes
+        self.memoryPressureReclaim = try c.decodeIfPresent(Bool.self, forKey: .memoryPressureReclaim) ?? d.memoryPressureReclaim
     }
 
     public static var defaultDockerContext: String {
@@ -140,6 +144,7 @@ public struct FirnConfig: Codable, Sendable, Equatable {
         if let raw = env["FIRN_GPU"], let b = parseEnvBool(raw) { cfg.gpu = b }
         if let raw = env["FIRN_DIRECT_ROUTE_DNS"], let b = parseEnvBool(raw) { cfg.directRouteDNS = b }
         if let raw = env["FIRN_AUTO_TRIM_MINUTES"], let val = Int(raw), val >= 0 { cfg.autoTrimMinutes = val }
+        if let raw = env["FIRN_MEMORY_PRESSURE_RECLAIM"], let b = parseEnvBool(raw) { cfg.memoryPressureReclaim = b }
         return cfg
     }
 
@@ -190,6 +195,8 @@ public enum FirnPaths {
     public static var hostnetSockURL: URL { runDir.appendingPathComponent("hostnet.sock") }
     public static var utunSockURL: URL { runDir.appendingPathComponent("utun.sock") }
     public static var pidFileURL: URL { runDir.appendingPathComponent("firnd.pid") }
+    public static var lockFileURL: URL { runDir.appendingPathComponent("firnd.lock") }
+    public static var hostnetPidFileURL: URL { runDir.appendingPathComponent("firn-hostnet.pid") }
     public static var prevContextURL: URL { stateDir.appendingPathComponent("prev-context") }
     public static var daemonLogURL: URL { stateDir.appendingPathComponent("firnd.log") }
     public static var hostnetLogURL: URL { stateDir.appendingPathComponent("firn-hostnet.log") }
@@ -265,6 +272,8 @@ public enum FirnLaunchAgent {
                 <key>SuccessfulExit</key>
                 <false/>
             </dict>
+            <key>ExitTimeOut</key>
+            <integer>20</integer>
             <key>StandardOutPath</key>
             <string>\(logPath)</string>
             <key>StandardErrorPath</key>

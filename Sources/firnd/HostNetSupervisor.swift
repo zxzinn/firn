@@ -25,7 +25,8 @@ public final class HostNetSupervisor {
     }
 
     public static func locateBinary() -> URL? {
-        let exeDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+        let exePath = FirnInstallOrigin.currentExecutablePath()
+        let exeDir = URL(fileURLWithPath: exePath).resolvingSymlinksInPath().deletingLastPathComponent()
         for candidate in [
             exeDir.appendingPathComponent("firn-hostnet"),
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("build/firn-hostnet"),
@@ -53,9 +54,99 @@ public final class HostNetSupervisor {
         self.binURL = bin
     }
 
+    private func processArgs(pid: pid_t) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/ps")
+        p.arguments = ["-o", "args=", "-p", String(pid)]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !s.isEmpty else {
+            return nil
+        }
+        return s
+    }
+
+    private func discoverStaleHostNetPIDs(pidURL: URL) -> [pid_t] {
+        var found: [pid_t] = []
+        var seen = Set<pid_t>()
+        let selfPID = pid_t(ProcessInfo.processInfo.processIdentifier)
+        let sockNeedle = "--control-sock \(FirnPaths.hostnetSockURL.path)"
+
+        let ps = Process()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-axo", "pid=,args="]
+        let pipe = Pipe()
+        ps.standardOutput = pipe
+        ps.standardError = FileHandle.nullDevice
+        if (try? ps.run()) != nil {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            ps.waitUntilExit()
+            if let out = String(data: data, encoding: .utf8) {
+                for line in out.split(separator: "\n") {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    guard let ws = trimmed.firstIndex(where: { $0.isWhitespace }) else { continue }
+                    guard let pid = pid_t(String(trimmed[..<ws])), pid > 1, pid != selfPID else { continue }
+                    let args = String(trimmed[ws...]).trimmingCharacters(in: .whitespaces)
+                    if args.contains("firn-hostnet") && args.contains(sockNeedle) && seen.insert(pid).inserted {
+                        found.append(pid)
+                    }
+                }
+            }
+        }
+
+        if let raw = try? String(contentsOf: pidURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           let pid = pid_t(raw),
+           pid > 1,
+           pid != selfPID,
+           !seen.contains(pid),
+           let args = processArgs(pid: pid),
+           args.contains("firn-hostnet") {
+            found.append(pid)
+        }
+        return found
+    }
+
+    private func cleanupStaleProcess() {
+        let pidURL = FirnPaths.hostnetPidFileURL
+        defer { try? FileManager.default.removeItem(at: pidURL) }
+        for pid in discoverStaleHostNetPIDs(pidURL: pidURL) {
+            if Darwin.kill(pid, SIGTERM) != 0 && errno == ESRCH {
+                continue
+            }
+            var exited = false
+            let termDeadline = Date().addingTimeInterval(2.0)
+            while Date() < termDeadline {
+                if Darwin.kill(pid, 0) != 0 && errno == ESRCH {
+                    exited = true
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if !exited {
+                _ = Darwin.kill(pid, SIGKILL)
+                let killDeadline = Date().addingTimeInterval(0.5)
+                while Date() < killDeadline {
+                    if Darwin.kill(pid, 0) != 0 && errno == ESRCH {
+                        break
+                    }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+            fputs("[firnd] reaped stale firn-hostnet pid=\(pid)\n", stderr)
+            fflush(stderr)
+        }
+    }
+
     public func start() throws {
         let fm = FileManager.default
         try fm.createDirectory(at: FirnPaths.runDir, withIntermediateDirectories: true)
+        cleanupStaleProcess()
         _ = try? CertAuthority.ensureCA()
 
         unlink(FirnPaths.hostnetSockURL.path)
@@ -93,6 +184,7 @@ public final class HostNetSupervisor {
         self.running = true
         lock.unlock()
         try p.run()
+        try? "\(p.processIdentifier)\n".write(to: FirnPaths.hostnetPidFileURL, atomically: true, encoding: .utf8)
 
         let deadline = Date().addingTimeInterval(6.0)
         while Date() < deadline {
@@ -102,10 +194,12 @@ public final class HostNetSupervisor {
                 return
             }
             if !p.isRunning {
+                stop()
                 throw NSError(domain: "FirnHostNet", code: 1, userInfo: [NSLocalizedDescriptionKey: "firn-hostnet exited prematurely"])
             }
             Thread.sleep(forTimeInterval: 0.02)
         }
+        stop()
         throw NSError(domain: "FirnHostNet", code: 2, userInfo: [NSLocalizedDescriptionKey: "firn-hostnet sockets did not become ready"])
     }
 
@@ -215,6 +309,28 @@ public final class HostNetSupervisor {
         )
     }
 
+    public func drainActivity() -> (active: [String: Int], touched: [String])? {
+        guard isRunning,
+              let obj = try? FirnHostClient.requestJSON(
+                method: "GET",
+                path: "/activity",
+                socketURL: FirnPaths.hostnetSockURL,
+                timeoutSeconds: 2
+              ) else {
+            return nil
+        }
+        var active: [String: Int] = [:]
+        if let rawActive = obj["activeProjects"] as? [String: Any] {
+            for (k, v) in rawActive {
+                if let n = (v as? NSNumber)?.intValue, n > 0 {
+                    active[k] = n
+                }
+            }
+        }
+        let touched = (obj["touchedProjects"] as? [String]) ?? []
+        return (active, touched)
+    }
+
     public func stop() {
         lock.lock()
         running = false
@@ -229,8 +345,13 @@ public final class HostNetSupervisor {
             }
             if p.isRunning {
                 _ = Darwin.kill(p.processIdentifier, SIGKILL)
+                let killDeadline = Date().addingTimeInterval(0.5)
+                while p.isRunning && Date() < killDeadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
             }
         }
+        try? FileManager.default.removeItem(at: FirnPaths.hostnetPidFileURL)
         try? logHandle?.close()
         logHandle = nil
     }

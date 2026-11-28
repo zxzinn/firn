@@ -3,8 +3,62 @@ import Foundation
 import FirnCore
 import SystemConfiguration
 
+private final class IOThreadPool {
+    static let shared = IOThreadPool()
+    private let cond = NSCondition()
+    private var queue: [() -> Void] = []
+    private var idleWorkers = 0
+    private let maxIdleWorkers = 32
+    private let idleTimeout: TimeInterval = 30.0
+
+    func submit(_ work: @escaping () -> Void) {
+        cond.lock()
+        queue.append(work)
+        if idleWorkers > 0 {
+            cond.signal()
+            cond.unlock()
+            return
+        }
+        cond.unlock()
+        Thread.detachNewThread { [self] in
+            self.workerLoop()
+        }
+    }
+
+    private func workerLoop() {
+        while true {
+            var task: (() -> Void)?
+            cond.lock()
+            if queue.isEmpty {
+                idleWorkers += 1
+                let deadline = Date().addingTimeInterval(idleTimeout)
+                while queue.isEmpty {
+                    if !cond.wait(until: deadline) {
+                        break
+                    }
+                }
+                idleWorkers = max(0, idleWorkers - 1)
+                if queue.isEmpty && idleWorkers >= maxIdleWorkers {
+                    cond.unlock()
+                    return
+                }
+                if queue.isEmpty {
+                    // Timed out idle.
+                    cond.unlock()
+                    return
+                }
+            }
+            if !queue.isEmpty {
+                task = queue.removeFirst()
+            }
+            cond.unlock()
+            task?()
+        }
+    }
+}
+
 public func spawnIOThread(_ body: @escaping () -> Void) {
-    Thread.detachNewThread(body)
+    IOThreadPool.shared.submit(body)
 }
 
 private func setNonBlocking(_ fd: Int32) {
@@ -24,7 +78,7 @@ private func setBlocking(_ fd: Int32) {
 private func tuneStreamSocket(_ fd: Int32) {
     var yes: Int32 = 1
     _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
-    for bufBytes in [Int32(4 << 20), Int32(2 << 20), Int32(1 << 20)] {
+    for bufBytes in [Int32(8 << 20), Int32(4 << 20), Int32(2 << 20), Int32(1 << 20)] {
         var val = bufBytes
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &val, socklen_t(MemoryLayout<Int32>.size))
         if setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &val, socklen_t(MemoryLayout<Int32>.size)) == 0 {
@@ -57,10 +111,10 @@ private func writeRawExact(fd: Int32, base: UnsafeRawPointer, count: Int) -> Boo
 
 private final class StreamBufferPool {
     static let shared = StreamBufferPool()
-    let bufferSize = 1 << 20
+    let bufferSize = 2 << 20
     private let lock = NSLock()
     private var free: [UnsafeMutableRawPointer] = []
-    private let maxCached = 32
+    private let maxCached = 24
 
     func borrow() -> UnsafeMutableRawPointer {
         lock.lock()
@@ -156,7 +210,7 @@ public func bindUnixSocket(at url: URL) throws -> Int32 {
             Darwin.bind(fd, $0, len)
         }
     }
-    guard rc == 0, listen(fd, 128) == 0 else {
+    guard rc == 0, listen(fd, 512) == 0 else {
         let err = errno
         close(fd)
         throw NSError(domain: NSPOSIXErrorDomain, code: Int(err))

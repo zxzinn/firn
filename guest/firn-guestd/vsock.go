@@ -99,9 +99,10 @@ func (c *vsockConn) CloseWrite() error           { return syscall.Shutdown(c.fd,
 func (c *vsockConn) LocalAddr() net.Addr         { return c.local }
 func (c *vsockConn) RemoteAddr() net.Addr        { return c.remote }
 
-func (c *vsockConn) SetDeadline(t time.Time) error      { return c.file.SetDeadline(t) }
-func (c *vsockConn) SetReadDeadline(t time.Time) error  { return c.file.SetReadDeadline(t) }
-func (c *vsockConn) SetWriteDeadline(t time.Time) error { return c.file.SetWriteDeadline(t) }
+func (c *vsockConn) SetDeadline(t time.Time) error         { return c.file.SetDeadline(t) }
+func (c *vsockConn) SetReadDeadline(t time.Time) error     { return c.file.SetReadDeadline(t) }
+func (c *vsockConn) SetWriteDeadline(t time.Time) error    { return c.file.SetWriteDeadline(t) }
+func (c *vsockConn) SyscallConn() (syscall.RawConn, error) { return c.file.SyscallConn() }
 
 func (c *vsockConn) Close() error {
 	var err error
@@ -216,9 +217,11 @@ func spliceHalfClose(a, b io.ReadWriteCloser) {
 	wg.Add(2)
 	copyDir := func(dst io.WriteCloser, src io.ReadCloser) {
 		defer wg.Done()
-		bufPtr := copyBufPool.Get().(*[]byte)
-		_, _ = io.CopyBuffer(dst, src, *bufPtr)
-		copyBufPool.Put(bufPtr)
+		if !trySpliceHalfClose(dst, src) {
+			bufPtr := copyBufPool.Get().(*[]byte)
+			_, _ = io.CopyBuffer(dst, src, *bufPtr)
+			copyBufPool.Put(bufPtr)
+		}
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		} else {

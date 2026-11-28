@@ -46,6 +46,8 @@ public final class AutoThawProxy {
     private var running = false
     private let sessionLock = NSLock()
     private var _activeSessions = 0
+    private var activeProjectSessions: [String: Int] = [:]
+    private var touchedProjects: Set<String> = []
 
     public var activeSessionCount: Int {
         sessionLock.lock()
@@ -54,13 +56,42 @@ public final class AutoThawProxy {
         return v
     }
 
-    private func trackSession(_ body: () -> Void) {
+    public func recordProjectTouch(_ project: String?) {
+        guard let project, !project.isEmpty else { return }
+        sessionLock.lock()
+        touchedProjects.insert(project)
+        sessionLock.unlock()
+    }
+
+    public func drainActivitySnapshot() -> (active: [String: Int], touched: [String]) {
+        sessionLock.lock()
+        let active = activeProjectSessions
+        let touched = Array(touchedProjects)
+        touchedProjects.removeAll()
+        sessionLock.unlock()
+        return (active, touched)
+    }
+
+    private func trackSession(project: String? = nil, _ body: () -> Void) {
         sessionLock.lock()
         _activeSessions += 1
+        if let project, !project.isEmpty {
+            activeProjectSessions[project, default: 0] += 1
+            touchedProjects.insert(project)
+        }
         sessionLock.unlock()
         defer {
             sessionLock.lock()
             _activeSessions = max(0, _activeSessions - 1)
+            if let project, !project.isEmpty {
+                let next = (activeProjectSessions[project] ?? 1) - 1
+                if next <= 0 {
+                    activeProjectSessions.removeValue(forKey: project)
+                } else {
+                    activeProjectSessions[project] = next
+                }
+                touchedProjects.insert(project)
+            }
             sessionLock.unlock()
         }
         body()
@@ -259,7 +290,7 @@ public final class AutoThawProxy {
                     Darwin.bind(fd4, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
-            if rc4 == 0 && listen(fd4, 128) == 0 {
+            if rc4 == 0 && listen(fd4, 512) == 0 {
                 bound.append(fd4)
             } else {
                 close(fd4)
@@ -282,7 +313,7 @@ public final class AutoThawProxy {
                     Darwin.bind(fd6, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
                 }
             }
-            if rc6 == 0 && listen(fd6, 128) == 0 {
+            if rc6 == 0 && listen(fd6, 512) == 0 {
                 bound.append(fd6)
             } else {
                 close(fd6)
@@ -337,7 +368,7 @@ public final class AutoThawProxy {
             let destHost = useContainerIP ? entry.containerIP! : "127.0.0.1"
             let destPort = useContainerIP ? UInt16(entry.guestPort) : UInt16(entry.hostPort)
             let vsockConn = try openTunnelWithRetry(host: destHost, port: destPort)
-            trackSession {
+            trackSession(project: entry.project) {
                 spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
             }
         } catch {
@@ -394,6 +425,7 @@ public final class AutoThawProxy {
             path += "?target=\(encodedTarget)"
         }
         _ = try bridge.guestHTTP(method: "POST", path: path, timeoutSeconds: 15.0)
+        recordProjectTouch(project)
         markLocalProjectUnpaused(project)
         spawnIOThread { [weak self] in
             self?.syncTopologyNow()
@@ -477,7 +509,7 @@ public final class AutoThawProxy {
                 close(clientFD)
                 return
             }
-            trackSession {
+            trackSession(project: target.project) {
                 spliceBidirectional(fd: clientFD, vsockConn: vsockConn)
             }
         } catch {

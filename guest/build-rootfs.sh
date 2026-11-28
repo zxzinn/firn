@@ -73,22 +73,32 @@ EOF
 
     install -m 0755 /work/init /rootfs/sbin/init
     install -m 0755 /work/firn-guestd-bin /rootfs/usr/local/bin/firn-guestd
-    printf 'user_allow_other\n' >/rootfs/etc/fuse.conf
-    mkdir -p /rootfs/etc/docker /rootfs/var/lib/firn /rootfs/var/lib/docker /rootfs/mnt/rosetta /rootfs/mnt/virtiofs-home /rootfs/run/firn /rootfs/etc/firn /rootfs/etc/udhcpc
+    printf "user_allow_other\n" >/rootfs/etc/fuse.conf
+    mkdir -p /rootfs/etc/docker /rootfs/etc/rancher/k3s /rootfs/var/lib/firn /rootfs/mnt/rosetta /rootfs/mnt/virtiofs-home /rootfs/run/firn /rootfs/etc/firn /rootfs/etc/udhcpc
+    rm -rf /rootfs/var/lib/docker
+    ln -s /var/lib/firn/docker /rootfs/var/lib/docker
     cat >/rootfs/etc/docker/daemon.json <<'\''EOF'\''
 {
+  "data-root": "/var/lib/firn/docker",
   "storage-driver": "overlay2",
   "userland-proxy": false,
   "bip": "10.87.0.1/24",
   "host-gateway-ip": "10.89.0.1",
   "dns": ["10.87.0.1"],
   "exec-opts": ["native.cgroupdriver=cgroupfs"],
+  "registry-mirrors": ["http://127.0.0.1:5000"],
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" },
   "default-address-pools": [
     { "base": "10.88.0.0/16", "size": 24 }
   ]
 }
+EOF
+    cat >/rootfs/etc/rancher/k3s/registries.yaml <<'\''EOF'\''
+mirrors:
+  "docker.io":
+    endpoint:
+      - "http://127.0.0.1:5000"
 EOF
 
     rm -f /out/rootfs.ext4.tmp

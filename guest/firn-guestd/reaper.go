@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,19 +26,20 @@ import (
 )
 
 const (
-	composeProjectLabel = "com.docker.compose.project"
-	composeServiceLabel = "com.docker.compose.service"
-	exemptLabel         = "firn.reaper.exempt"
-	idleLabel           = "firn.reaper.idle"
-	cpuActiveDeltaUsec  = uint64(50_000)
-	netActiveDeltaBytes = uint64(256)
-	reclaimChunkBytes   = uint64(64 * 1024 * 1024)
+	composeProjectLabel      = "com.docker.compose.project"
+	composeServiceLabel      = "com.docker.compose.service"
+	composeWorkingDirLabel   = "com.docker.compose.project.working_dir"
+	exemptLabel              = "firn.reaper.exempt"
+	idleLabel                = "firn.reaper.idle"
+	cpuActiveRateUsecPerSec  = uint64(250_000) // >=25% of 1 core sustained CPU keeps compute stacks active while ignoring healthchecks
+	reclaimChunkBytes        = uint64(64 * 1024 * 1024)
 )
 
 type DockerClient struct {
 	socketPath string
 	transport  *http.Transport
 	client     *http.Client
+	dfClient   *http.Client
 }
 
 func NewDockerClient(socketPath string) *DockerClient {
@@ -52,6 +55,10 @@ func NewDockerClient(socketPath string) *DockerClient {
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   30 * time.Second,
+		},
+		dfClient: &http.Client{
+			Transport: transport,
+			Timeout:   45 * time.Second,
 		},
 	}
 }
@@ -95,11 +102,18 @@ type dockerNetworkEndpoint struct {
 	IPAddress string `json:"IPAddress"`
 }
 
+type dockerMountInfo struct {
+	Type   string `json:"Type"`
+	Name   string `json:"Name"`
+	Source string `json:"Source"`
+}
+
 type dockerContainerInspect struct {
 	State struct {
 		Pid    int  `json:"Pid"`
 		Paused bool `json:"Paused"`
 	} `json:"State"`
+	Mounts          []dockerMountInfo `json:"Mounts"`
 	NetworkSettings struct {
 		Ports    map[string][]dockerPortBinding     `json:"Ports"`
 		Networks map[string]dockerNetworkEndpoint `json:"Networks"`
@@ -182,9 +196,31 @@ func (d *DockerClient) SystemDF() (DockerDFSummary, error) {
 			InUse bool  `json:"InUse"`
 		} `json:"BuildCache"`
 	}
-	status, body, err := d.doJSON(http.MethodGet, "/system/df", &raw)
+	req, err := http.NewRequest(http.MethodGet, "http://docker/system/df", nil)
 	if err != nil {
 		return DockerDFSummary{}, err
+	}
+	dfCli := d.dfClient
+	if dfCli == nil {
+		dfCli = d.client
+	}
+	resp, err := dfCli.Do(req)
+	if err != nil {
+		return DockerDFSummary{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return DockerDFSummary{}, err
+	}
+	status := resp.StatusCode
+	if status != http.StatusOK {
+		return DockerDFSummary{}, fmt.Errorf("docker system/df failed (%d): %s", status, strings.TrimSpace(string(body)))
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &raw); err != nil {
+			return DockerDFSummary{}, err
+		}
 	}
 	if status != http.StatusOK {
 		return DockerDFSummary{}, fmt.Errorf("docker system/df failed (%d): %s", status, strings.TrimSpace(string(body)))
@@ -250,7 +286,11 @@ type DockerEventStreamer interface {
 	StreamContainerEvents(ctx context.Context, onEvent func()) error
 }
 
-func (d *DockerClient) StreamContainerEvents(ctx context.Context, onEvent func()) error {
+type DockerDetailedEventStreamer interface {
+	StreamContainerEventsDetailed(ctx context.Context, onEvent func(action, containerID, project string)) error
+}
+
+func (d *DockerClient) StreamContainerEventsDetailed(ctx context.Context, onEvent func(action, containerID, project string)) error {
 	streamClient := &http.Client{Transport: d.transport}
 	req, err := http.NewRequestWithContext(
 		ctx,
@@ -274,16 +314,27 @@ func (d *DockerClient) StreamContainerEvents(ctx context.Context, onEvent func()
 	for scanner.Scan() {
 		var evt struct {
 			Action string `json:"Action"`
+			Actor  struct {
+				ID         string            `json:"ID"`
+				Attributes map[string]string `json:"Attributes"`
+			} `json:"Actor"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &evt); err != nil {
 			continue
 		}
-		switch evt.Action {
+		action := strings.Split(evt.Action, ":")[0]
+		switch action {
 		case "start", "stop", "die", "pause", "unpause", "destroy", "rename":
-			onEvent()
+			onEvent(action, evt.Actor.ID, evt.Actor.Attributes[composeProjectLabel])
 		}
 	}
 	return scanner.Err()
+}
+
+func (d *DockerClient) StreamContainerEvents(ctx context.Context, onEvent func()) error {
+	return d.StreamContainerEventsDetailed(ctx, func(_, _, _ string) {
+		onEvent()
+	})
 }
 
 type VMMemoryInfo struct {
@@ -313,6 +364,7 @@ type ContainerStatus struct {
 
 type ProjectStatus struct {
 	Project           string            `json:"project"`
+	WorkingDir        string            `json:"workingDir,omitempty"`
 	HasComposeProject bool              `json:"hasComposeProject"`
 	Exempt            bool              `json:"exempt"`
 	IdleLimitSeconds  int               `json:"idleLimitSeconds"`
@@ -339,6 +391,18 @@ type DiskUsageInfo struct {
 	DockerVolumesBytes     uint64 `json:"dockerVolumesBytes"`
 	DockerBuildCacheBytes  uint64 `json:"dockerBuildCacheBytes"`
 	DockerReclaimableBytes uint64 `json:"dockerReclaimableBytes"`
+	DockerDFStale          bool   `json:"dockerDfStale,omitempty"`
+	DockerDFPending        bool   `json:"dockerDfPending,omitempty"`
+	RegistryCacheBytes     uint64 `json:"registryCacheBytes,omitempty"`
+	SnapshotsBytes         uint64 `json:"snapshotsBytes,omitempty"`
+}
+
+type RemoveProjectResult struct {
+	Project           string `json:"project"`
+	RemovedContainers int    `json:"removedContainers"`
+	RemovedNetworks   int    `json:"removedNetworks"`
+	RemovedVolumes    int    `json:"removedVolumes"`
+	RemoveVolumes     bool   `json:"removeVolumes"`
 }
 
 type GuestCapabilities struct {
@@ -397,8 +461,15 @@ type ReclaimResult struct {
 
 type activitySample struct {
 	lastActive time.Time
+	sampledAt  time.Time
 	cpuUsec    uint64
 	netBytes   uint64
+}
+
+type cachedInspect struct {
+	info      *dockerContainerInspect
+	state     string
+	fetchedAt time.Time
 }
 
 type ReaperEngine struct {
@@ -415,9 +486,22 @@ type ReaperEngine struct {
 	extraDNSFn        func(domain string) []DNSRecord
 	k3sRunningFn      func() bool
 	capabilitiesFn    func() GuestCapabilities
+	extraDiskUsageFn  func() (registryCacheBytes, snapshotsBytes uint64)
 
-	mu       sync.Mutex
-	activity map[string]activitySample
+	mu           sync.Mutex
+	activity     map[string]activitySample
+	inspectCache map[string]cachedInspect
+
+	actMu              sync.Mutex
+	hostActiveProjects map[string]int
+	hostTouchedAt      map[string]time.Time
+
+	dfMu         sync.Mutex
+	dfCache      DockerDFSummary
+	dfCachedAt   time.Time
+	dfHasCache   bool
+	dfRefreshing bool
+	dfWaitCh     chan struct{}
 
 	topoMu      sync.Mutex
 	topoCond    *sync.Cond
@@ -435,21 +519,67 @@ func NewReaperEngine(docker DockerAPI, idleSeconds int, domain string, exempt []
 		}
 	}
 	eng := &ReaperEngine{
-		docker:            docker,
-		procRoot:          "/proc",
-		cgroupRoot:        "/sys/fs/cgroup",
-		meminfoPath:       "/proc/meminfo",
-		dropCachesPath:    "/proc/sys/vm/drop_caches",
-		compactMemoryPath: "/proc/sys/vm/compact_memory",
-		idleSeconds:       idleSeconds,
-		domain:            domain,
-		exemptProjects:    exemptSet,
-		activity:          make(map[string]activitySample),
-		topoPorts:         []PortMapping{},
-		topoDNS:           []DNSRecord{},
+		docker:             docker,
+		procRoot:           "/proc",
+		cgroupRoot:         "/sys/fs/cgroup",
+		meminfoPath:        "/proc/meminfo",
+		dropCachesPath:     "/proc/sys/vm/drop_caches",
+		compactMemoryPath:  "/proc/sys/vm/compact_memory",
+		idleSeconds:        idleSeconds,
+		domain:             domain,
+		exemptProjects:     exemptSet,
+		activity:           make(map[string]activitySample),
+		inspectCache:       make(map[string]cachedInspect),
+		hostActiveProjects: make(map[string]int),
+		hostTouchedAt:      make(map[string]time.Time),
+		topoPorts:          []PortMapping{},
+		topoDNS:            []DNSRecord{},
 	}
 	eng.topoCond = sync.NewCond(&eng.topoMu)
 	return eng
+}
+
+func (e *ReaperEngine) InvalidateInspectCache(cid string) {
+	e.mu.Lock()
+	if cid == "" {
+		e.inspectCache = make(map[string]cachedInspect)
+	} else {
+		delete(e.inspectCache, cid)
+	}
+	e.mu.Unlock()
+}
+
+func (e *ReaperEngine) RecordHostActivity(activeProjects map[string]int, touchedProjects []string, now time.Time) {
+	touchedSet := make(map[string]bool)
+	e.actMu.Lock()
+	if activeProjects != nil {
+		next := make(map[string]int, len(activeProjects))
+		for proj, cnt := range activeProjects {
+			if proj != "" && cnt > 0 {
+				next[proj] = cnt
+				e.hostTouchedAt[proj] = now
+				touchedSet[proj] = true
+			}
+		}
+		e.hostActiveProjects = next
+	}
+	for _, proj := range touchedProjects {
+		if proj != "" {
+			e.hostTouchedAt[proj] = now
+			touchedSet[proj] = true
+		}
+	}
+	e.actMu.Unlock()
+	_ = touchedSet
+}
+
+func (e *ReaperEngine) RecordProjectTouch(project string, now time.Time) {
+	if project == "" {
+		return
+	}
+	e.actMu.Lock()
+	e.hostTouchedAt[project] = now
+	e.actMu.Unlock()
 }
 
 func (e *ReaperEngine) Domain() string {
@@ -586,13 +716,48 @@ func DiscoverCgroupDir(pid int, cid, procRoot, cgroupRoot string) string {
 	return ""
 }
 
-func countEstablishedSockets(pid int, procRoot string) int {
+func parseProcNetRemoteAddr(addrPort string, isV6 bool) (netip.Addr, bool) {
+	hexIP, _, ok := strings.Cut(addrPort, ":")
+	if !ok {
+		return netip.Addr{}, false
+	}
+	raw, err := hex.DecodeString(hexIP)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	if !isV6 && len(raw) == 4 {
+		// Linux /proc/net/tcp prints IPv4 32-bit addresses in host endianness (little-endian on arm64/amd64).
+		var b4 [4]byte
+		b4[0], b4[1], b4[2], b4[3] = raw[3], raw[2], raw[1], raw[0]
+		return netip.AddrFrom4(b4), true
+	}
+	if isV6 && len(raw) == 16 {
+		// Linux /proc/net/tcp6 prints four 32-bit words in host endianness.
+		var b16 [16]byte
+		for i := 0; i < 16; i += 4 {
+			b16[i+0] = raw[i+3]
+			b16[i+1] = raw[i+2]
+			b16[i+2] = raw[i+1]
+			b16[i+3] = raw[i+0]
+		}
+		return netip.AddrFrom16(b16).Unmap(), true
+	}
+	return netip.Addr{}, false
+}
+
+func countExternalEstablishedSockets(pid int, procRoot string, ignoredIPs map[netip.Addr]bool) int {
 	if pid <= 0 {
 		return 0
 	}
 	count := 0
-	for _, file := range []string{"tcp", "tcp6"} {
-		raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "net", file))
+	for _, spec := range []struct {
+		file string
+		v6   bool
+	}{
+		{file: "tcp", v6: false},
+		{file: "tcp6", v6: true},
+	} {
+		raw, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "net", spec.file))
 		if err != nil {
 			continue
 		}
@@ -602,9 +767,17 @@ func countEstablishedSockets(pid int, procRoot string) int {
 				continue
 			}
 			fields := strings.Fields(line)
-			if len(fields) >= 4 && fields[3] == "01" {
-				count++
+			if len(fields) < 4 || fields[3] != "01" {
+				continue
 			}
+			remAddr, ok := parseProcNetRemoteAddr(fields[2], spec.v6)
+			if !ok {
+				continue
+			}
+			if remAddr.IsLoopback() || remAddr.IsUnspecified() || ignoredIPs[remAddr] {
+				continue
+			}
+			count++
 		}
 	}
 	return count
@@ -726,8 +899,97 @@ func (e *ReaperEngine) collectLocked(now time.Time) (map[string]*ProjectStatus, 
 	serviceGroups := make(map[string][]string)
 	customIdleSet := make(map[string]bool)
 
+	// Pass 1: inspect running/paused containers using cache + bounded concurrent fetches.
+	inspectedByID := make(map[string]*dockerContainerInspect, len(items))
+	var needInspect []dockerContainerSummary
 	for _, item := range items {
 		liveIDs[item.ID] = true
+		if item.State != "running" && item.State != "paused" {
+			continue
+		}
+		if cached, ok := e.inspectCache[item.ID]; ok &&
+			cached.info != nil &&
+			cached.state == item.State &&
+			cached.info.State.Pid > 0 &&
+			now.Sub(cached.fetchedAt) < 60*time.Second {
+			inspectedByID[item.ID] = cached.info
+		} else {
+			needInspect = append(needInspect, item)
+		}
+	}
+	if len(needInspect) > 0 {
+		var inspMu sync.Mutex
+		var wg sync.WaitGroup
+		jobs := make(chan dockerContainerSummary, len(needInspect))
+		for _, it := range needInspect {
+			jobs <- it
+		}
+		close(jobs)
+		workers := min(8, len(needInspect))
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for it := range jobs {
+					ins, ierr := e.docker.InspectContainer(it.ID)
+					if ierr == nil && ins != nil {
+						inspMu.Lock()
+						inspectedByID[it.ID] = ins
+						e.inspectCache[it.ID] = cachedInspect{
+							info:      ins,
+							state:     it.State,
+							fetchedAt: now,
+						}
+						inspMu.Unlock()
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	for cid := range e.inspectCache {
+		if !liveIDs[cid] {
+			delete(e.inspectCache, cid)
+		}
+	}
+
+	// Build set of intra-project container IPs so internal service meshes/DB pools don't mask idleness.
+	projectIPs := make(map[string]map[netip.Addr]bool)
+	for _, item := range items {
+		ins := inspectedByID[item.ID]
+		if ins == nil {
+			continue
+		}
+		groupKey := item.Labels[composeProjectLabel]
+		if groupKey == "" {
+			groupKey = "(standalone)"
+		}
+		ipSet := projectIPs[groupKey]
+		if ipSet == nil {
+			ipSet = make(map[netip.Addr]bool)
+			projectIPs[groupKey] = ipSet
+		}
+		for _, netInfo := range ins.NetworkSettings.Networks {
+			if netInfo.IPAddress != "" {
+				if addr, perr := netip.ParseAddr(netInfo.IPAddress); perr == nil {
+					ipSet[addr.Unmap()] = true
+				}
+			}
+		}
+	}
+
+	e.actMu.Lock()
+	hostActiveSnap := make(map[string]int, len(e.hostActiveProjects))
+	for k, v := range e.hostActiveProjects {
+		hostActiveSnap[k] = v
+	}
+	hostTouchSnap := make(map[string]time.Time, len(e.hostTouchedAt))
+	for k, v := range e.hostTouchedAt {
+		hostTouchSnap[k] = v
+	}
+	e.actMu.Unlock()
+
+	for _, item := range items {
 		project := item.Labels[composeProjectLabel]
 		groupKey := project
 		if groupKey == "" {
@@ -744,17 +1006,14 @@ func (e *ReaperEngine) collectLocked(now time.Time) (map[string]*ProjectStatus, 
 		paused := item.State == "paused" || strings.Contains(item.Status, "(Paused)")
 		var pid int
 		var ip string
-		var inspected *dockerContainerInspect
-		if item.State == "running" || item.State == "paused" {
-			inspected, err = e.docker.InspectContainer(item.ID)
-			if err == nil && inspected != nil {
-				pid = inspected.State.Pid
-				paused = inspected.State.Paused
-				for _, netInfo := range inspected.NetworkSettings.Networks {
-					if netInfo.IPAddress != "" {
-						ip = netInfo.IPAddress
-						break
-					}
+		inspected := inspectedByID[item.ID]
+		if inspected != nil {
+			pid = inspected.State.Pid
+			paused = inspected.State.Paused
+			for _, netInfo := range inspected.NetworkSettings.Networks {
+				if netInfo.IPAddress != "" {
+					ip = netInfo.IPAddress
+					break
 				}
 			}
 		}
@@ -774,7 +1033,7 @@ func (e *ReaperEngine) collectLocked(now time.Time) (map[string]*ProjectStatus, 
 				frozen = paused
 			}
 			if item.State == "running" && !paused {
-				established = countEstablishedSockets(pid, e.procRoot)
+				established = countExternalEstablishedSockets(pid, e.procRoot, projectIPs[groupKey])
 				netBytes = readNetDevBytes(pid, e.procRoot)
 			}
 		}
@@ -782,24 +1041,42 @@ func (e *ReaperEngine) collectLocked(now time.Time) (map[string]*ProjectStatus, 
 		prev, seen := e.activity[item.ID]
 		lastActive := now
 		if seen {
-			activeNow := item.State == "running" && !paused && (established > 0 ||
-				(netBytes > prev.netBytes && netBytes-prev.netBytes > netActiveDeltaBytes) ||
-				(cpuUsec > prev.cpuUsec && cpuUsec-prev.cpuUsec > cpuActiveDeltaUsec))
+			cpuActive := false
+			if item.State == "running" && !paused {
+				dt := now.Sub(prev.sampledAt).Seconds()
+				if dt >= 1.0 && cpuUsec > prev.cpuUsec {
+					rate := float64(cpuUsec-prev.cpuUsec) / dt
+					if rate >= float64(cpuActiveRateUsecPerSec) {
+						cpuActive = true
+					}
+				}
+			}
+			hostTouch := hostTouchSnap[groupKey]
+			hostTouched := !hostTouch.IsZero() && (hostTouch.After(prev.sampledAt) || (!now.Before(hostTouch) && now.Sub(hostTouch) < 5*time.Second))
+			activeNow := item.State == "running" && !paused && (hostActiveSnap[groupKey] > 0 || hostTouched || established > 0 || cpuActive)
 			if !activeNow {
 				lastActive = prev.lastActive
 			}
 		}
-		e.activity[item.ID] = activitySample{lastActive: lastActive, cpuUsec: cpuUsec, netBytes: netBytes}
+		e.activity[item.ID] = activitySample{
+			lastActive: lastActive,
+			sampledAt:  now,
+			cpuUsec:    cpuUsec,
+			netBytes:   netBytes,
+		}
 
 		group, exists := projects[groupKey]
 		if !exists {
 			group = &ProjectStatus{
 				Project:           groupKey,
+				WorkingDir:        item.Labels[composeWorkingDirLabel],
 				HasComposeProject: project != "",
 				Exempt:            project == "" || e.exemptProjects[project],
 				IdleLimitSeconds:  e.idleSeconds,
 			}
 			projects[groupKey] = group
+		} else if group.WorkingDir == "" && item.Labels[composeWorkingDirLabel] != "" {
+			group.WorkingDir = item.Labels[composeWorkingDirLabel]
 		}
 		if strings.EqualFold(item.Labels[exemptLabel], "true") {
 			group.Exempt = true
@@ -933,6 +1210,7 @@ func (e *ReaperEngine) FreezeProject(project string, reclaim, dropCaches bool) (
 				if err := e.docker.PauseContainer(c.ID); err != nil {
 					return FreezeResult{}, err
 				}
+				delete(e.inspectCache, c.ID)
 				out.PausedContainers = append(out.PausedContainers, c.ID)
 			}
 		}
@@ -1024,8 +1302,10 @@ func (e *ReaperEngine) ThawProjectTarget(project, target string) (ThawResult, er
 		if err := e.docker.UnpauseContainer(targetID); err != nil {
 			return ThawResult{}, err
 		}
+		e.InvalidateInspectCache(targetID)
 		waitUnpaused(targetID, 2*time.Millisecond)
 		now := time.Now()
+		e.RecordProjectTouch(project, now)
 		e.mu.Lock()
 		sample := e.activity[targetID]
 		sample.lastActive = now
@@ -1037,8 +1317,10 @@ func (e *ReaperEngine) ThawProjectTarget(project, target string) (ThawResult, er
 			if len(rest) > 0 {
 				unpauseBatch(rest, 5*time.Millisecond)
 				t := time.Now()
+				e.RecordProjectTouch(project, t)
 				e.mu.Lock()
 				for _, id := range rest {
+					delete(e.inspectCache, id)
 					s := e.activity[id]
 					s.lastActive = t
 					e.activity[id] = s
@@ -1066,6 +1348,7 @@ func (e *ReaperEngine) ThawProjectTarget(project, target string) (ThawResult, er
 					errsMu.Unlock()
 					return
 				}
+				e.InvalidateInspectCache(id)
 				waitUnpaused(id, 4*time.Millisecond)
 			}(cid)
 		}
@@ -1074,6 +1357,7 @@ func (e *ReaperEngine) ThawProjectTarget(project, target string) (ThawResult, er
 			return ThawResult{}, firstErr
 		}
 		now := time.Now()
+		e.RecordProjectTouch(project, now)
 		e.mu.Lock()
 		for _, cid := range otherPaused {
 			s := e.activity[cid]
@@ -1157,7 +1441,102 @@ func (e *ReaperEngine) ReapIdleOnce(now time.Time) ([]FreezeResult, error) {
 	return results, nil
 }
 
+func (e *ReaperEngine) RemoveProject(project string, removeVolumes bool) (RemoveProjectResult, error) {
+	project = strings.TrimSpace(project)
+	if project == "" || project == "(standalone)" {
+		return RemoveProjectResult{}, fmt.Errorf("invalid Compose project name %q", project)
+	}
+	res := RemoveProjectResult{Project: project, RemoveVolumes: removeVolumes}
+
+	listFilter := composeProjectLabel + "=" + project
+	psOut, err := exec.Command("docker", "ps", "-aq", "--filter", "label="+listFilter).CombinedOutput()
+	if err != nil {
+		return res, fmt.Errorf("docker ps failed: %w (%s)", err, strings.TrimSpace(string(psOut)))
+	}
+	var cids []string
+	for _, f := range strings.Fields(string(psOut)) {
+		if f != "" {
+			cids = append(cids, f)
+		}
+	}
+	if len(cids) > 0 {
+		rmArgs := append([]string{"rm", "-f"}, cids...)
+		if out, rerr := exec.Command("docker", rmArgs...).CombinedOutput(); rerr != nil {
+			return res, fmt.Errorf("docker rm -f failed: %w (%s)", rerr, strings.TrimSpace(string(out)))
+		}
+		res.RemovedContainers = len(cids)
+		e.InvalidateInspectCache("")
+	}
+
+	if netOut, nerr := exec.Command("docker", "network", "ls", "-q", "--filter", "label="+listFilter).CombinedOutput(); nerr == nil {
+		var nids []string
+		for _, f := range strings.Fields(string(netOut)) {
+			if f != "" {
+				nids = append(nids, f)
+			}
+		}
+		if len(nids) > 0 {
+			if exec.Command("docker", append([]string{"network", "rm"}, nids...)...).Run() == nil {
+				res.RemovedNetworks = len(nids)
+			}
+		}
+	}
+
+	if removeVolumes {
+		if volOut, verr := exec.Command("docker", "volume", "ls", "-q", "--filter", "label="+listFilter).CombinedOutput(); verr == nil {
+			var vids []string
+			for _, f := range strings.Fields(string(volOut)) {
+				if f != "" {
+					vids = append(vids, f)
+				}
+			}
+			if len(vids) > 0 {
+				if exec.Command("docker", append([]string{"volume", "rm", "-f"}, vids...)...).Run() == nil {
+					res.RemovedVolumes = len(vids)
+				}
+			}
+		}
+	}
+
+	e.actMu.Lock()
+	delete(e.hostActiveProjects, project)
+	delete(e.hostTouchedAt, project)
+	e.actMu.Unlock()
+
+	_, _ = e.RefreshTopology(time.Now())
+	return res, nil
+}
+
+func (e *ReaperEngine) triggerDFRefreshLocked() chan struct{} {
+	if !e.dfRefreshing && e.docker != nil {
+		e.dfRefreshing = true
+		ch := make(chan struct{})
+		e.dfWaitCh = ch
+		go func() {
+			df, err := e.docker.SystemDF()
+			e.dfMu.Lock()
+			if err == nil {
+				e.dfCache = df
+				e.dfCachedAt = time.Now()
+				e.dfHasCache = true
+			}
+			e.dfRefreshing = false
+			waitCh := e.dfWaitCh
+			e.dfWaitCh = nil
+			e.dfMu.Unlock()
+			if waitCh != nil {
+				close(waitCh)
+			}
+		}()
+	}
+	return e.dfWaitCh
+}
+
 func (e *ReaperEngine) DiskUsage() DiskUsageInfo {
+	return e.DiskUsageWithRefresh(false)
+}
+
+func (e *ReaperEngine) DiskUsageWithRefresh(forceRefresh bool) DiskUsageInfo {
 	var out DiskUsageInfo
 	var st unix.Statfs_t
 	target := "/var/lib/firn"
@@ -1185,14 +1564,45 @@ func (e *ReaperEngine) DiskUsage() DiskUsageInfo {
 			out.ZramUsedBytes, _ = strconv.ParseUint(cols[2], 10, 64)
 		}
 	}
+	if e.extraDiskUsageFn != nil {
+		out.RegistryCacheBytes, out.SnapshotsBytes = e.extraDiskUsageFn()
+	}
 	if e.docker != nil {
-		if df, err := e.docker.SystemDF(); err == nil {
-			out.DockerImagesBytes = df.ImagesBytes
-			out.DockerContainersBytes = df.ContainersBytes
-			out.DockerVolumesBytes = df.VolumesBytes
-			out.DockerBuildCacheBytes = df.BuildCacheBytes
-			out.DockerReclaimableBytes = df.ReclaimableBytes
+		e.dfMu.Lock()
+		wasUncached := !e.dfHasCache
+		stale := !e.dfHasCache || time.Since(e.dfCachedAt) > 5*time.Minute
+		var waitCh chan struct{}
+		if forceRefresh || stale {
+			waitCh = e.triggerDFRefreshLocked()
 		}
+		e.dfMu.Unlock()
+
+		if waitCh != nil {
+			if forceRefresh {
+				select {
+				case <-waitCh:
+				case <-time.After(45 * time.Second):
+				}
+			} else if wasUncached {
+				// Allow instant mock/small Docker engines to populate synchronously without blocking slow disks.
+				select {
+				case <-waitCh:
+				case <-time.After(150 * time.Millisecond):
+				}
+			}
+		}
+
+		e.dfMu.Lock()
+		if e.dfHasCache {
+			out.DockerImagesBytes = e.dfCache.ImagesBytes
+			out.DockerContainersBytes = e.dfCache.ContainersBytes
+			out.DockerVolumesBytes = e.dfCache.VolumesBytes
+			out.DockerBuildCacheBytes = e.dfCache.BuildCacheBytes
+			out.DockerReclaimableBytes = e.dfCache.ReclaimableBytes
+			out.DockerDFStale = time.Since(e.dfCachedAt) > 5*time.Minute
+		}
+		out.DockerDFPending = e.dfRefreshing
+		e.dfMu.Unlock()
 	}
 	return out
 }
@@ -1230,12 +1640,16 @@ func (e *ReaperEngine) PruneDisk(all bool) (map[string]any, error) {
 	if trimOut, err := e.TrimDisk(); err == nil && trimOut != "" {
 		summaries = append(summaries, trimOut)
 	}
+	e.dfMu.Lock()
+	e.dfCachedAt = time.Time{}
+	_ = e.triggerDFRefreshLocked()
+	e.dfMu.Unlock()
 	_, _ = e.RefreshTopology(time.Now())
 	return map[string]any{
 		"ok":      true,
 		"all":     all,
 		"summary": strings.Join(summaries, "\n"),
-		"disk":    e.DiskUsage(),
+		"disk":    e.DiskUsageWithRefresh(false),
 	}, nil
 }
 
@@ -1385,12 +1799,29 @@ func (e *ReaperEngine) WatchDockerEvents(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		err := streamer.StreamContainerEvents(ctx, func() {
-			select {
-			case trigger <- struct{}{}:
-			default:
-			}
-		})
+		var err error
+		if detailed, ok := e.docker.(DockerDetailedEventStreamer); ok {
+			err = detailed.StreamContainerEventsDetailed(ctx, func(action, cid, project string) {
+				if cid != "" {
+					e.InvalidateInspectCache(cid)
+				}
+				if (action == "start" || action == "unpause") && project != "" {
+					e.RecordProjectTouch(project, time.Now())
+				}
+				select {
+				case trigger <- struct{}{}:
+				default:
+				}
+			})
+		} else {
+			err = streamer.StreamContainerEvents(ctx, func() {
+				e.InvalidateInspectCache("")
+				select {
+				case trigger <- struct{}{}:
+				default:
+				}
+			})
+		}
 		if err != nil && ctx.Err() == nil {
 			time.Sleep(500 * time.Millisecond)
 			_, _ = e.RefreshTopology(time.Now())
