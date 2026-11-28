@@ -326,13 +326,14 @@ private final class SettingsWindowController: NSWindowController {
     private var fsModePopup: NSPopUpButton!
     private var nestedVirtCheck: NSButton!
     private var directRouteDNSCheck: NSButton!
+    private var memoryPressureCheck: NSButton!
     private var statusLabel: NSTextField!
     private let onSaved: () -> Void
 
     init(config: FirnConfig, onSaved: @escaping () -> Void) {
         self.onSaved = onSaved
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 424),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 454),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -369,7 +370,7 @@ private final class SettingsWindowController: NSWindowController {
         ]
 
         var fields: [NSTextField] = []
-        var y = 376
+        var y = 406
         for idx in 0..<labels.count {
             let lbl = NSTextField(labelWithString: labels[idx])
             lbl.frame = NSRect(x: 20, y: y, width: 215, height: 22)
@@ -419,6 +420,12 @@ private final class SettingsWindowController: NSWindowController {
         directRouteDNSCheck.frame = NSRect(x: 242, y: y, width: 210, height: 22)
         directRouteDNSCheck.state = config.directRouteDNS ? .on : .off
         content.addSubview(directRouteDNSCheck)
+        y -= 28
+
+        memoryPressureCheck = NSButton(checkboxWithTitle: "Auto-Reclaim on macOS Memory Pressure", target: nil, action: nil)
+        memoryPressureCheck.frame = NSRect(x: 242, y: y, width: 215, height: 22)
+        memoryPressureCheck.state = config.memoryPressureReclaim ? .on : .off
+        content.addSubview(memoryPressureCheck)
 
         statusLabel = NSTextField(labelWithString: "")
         statusLabel.frame = NSRect(x: 20, y: 20, width: 320, height: 20)
@@ -452,6 +459,7 @@ private final class SettingsWindowController: NSWindowController {
         }
         next.nestedVirtualization = (nestedVirtCheck.state == .on)
         next.directRouteDNS = (directRouteDNSCheck.state == .on)
+        next.memoryPressureReclaim = (memoryPressureCheck.state == .on)
 
         let payload: [String: Any] = [
             "cpus": next.cpus,
@@ -464,6 +472,7 @@ private final class SettingsWindowController: NSWindowController {
             "fsMode": next.fsMode,
             "nestedVirtualization": next.nestedVirtualization,
             "directRouteDNS": next.directRouteDNS,
+            "memoryPressureReclaim": next.memoryPressureReclaim,
         ]
         if FirnHostClient.isDaemonAlive(), let data = try? JSONSerialization.data(withJSONObject: payload) {
             if let resp = try? FirnHostClient.requestJSON(method: "POST", path: "/config", body: data, timeoutSeconds: 5) {
@@ -487,6 +496,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var fallbackTimer: Timer?
     private var actionBoxes: [StatusActionBox] = []
+    private var store: FirnStore!
+    private var dashboardController: DashboardWindowController?
     private var settingsController: SettingsWindowController?
     private var logControllers: [ContainerLogsWindowController] = []
     private var metricSamples: [MetricSample] = []
@@ -499,21 +510,40 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestK8sServicesPayload: [String: Any]?
     private var latestMachinesPayload: [String: Any]?
     private var latestDiskPayload: [String: Any]?
+    private var latestVolumesPayload: [String: Any]?
+    private var latestCachePayload: [String: Any]?
     private var currentDockerContext: String?
     private var stopping = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         configureButton(title: "Firn")
+        MainActor.assumeIsolated {
+            let s = FirnStore()
+            s.onRequestRefresh = { [weak self] in
+                self?.refreshStatus()
+            }
+            self.store = s
+        }
         rebuildMenu(statusPayload: nil, dnsPayload: nil, k8sPayload: nil, machinesPayload: nil)
         refreshStatus()
         startEventWatcher()
+        if !CommandLine.arguments.contains("--menubar-only") {
+            DispatchQueue.main.async { [weak self] in
+                self?.openDashboardWindow()
+            }
+        }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5.0) { [weak self] in
             self?.checkForUpdates(userInitiated: false)
         }
         fallbackTimer = Timer.scheduledTimer(withTimeInterval: 10.0, repeats: true) { [weak self] _ in
             self?.refreshStatus()
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openDashboardWindow()
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -525,16 +555,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         logControllers.removeAll()
     }
 
-    private func configureButton(title: String) {
+    private func configureButton(title: String, hibernated: Bool = false, pressureWarning: Bool = false) {
         guard let button = statusItem.button else { return }
-        if let sym = NSImage(systemSymbolName: "snowflake", accessibilityDescription: "Firn") {
-            sym.isTemplate = true
-            button.image = sym
-            button.imagePosition = .imageLeading
-            button.title = " \(title)"
-        } else {
-            button.title = "❄︎ \(title)"
-        }
+        let sym = FirnBrandMark.menuBarImage(hibernated: hibernated, pressureWarning: pressureWarning)
+        button.image = sym
+        button.imagePosition = .imageLeading
+        button.title = " \(title)"
     }
 
     private func startEventWatcher() {
@@ -569,6 +595,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             let k8sServices = (status != nil && !hibernated) ? (try? FirnHostClient.requestJSON(method: "GET", path: "/k8s/services", timeoutSeconds: 3)) : nil
             let machines = (status != nil && !hibernated) ? (try? FirnHostClient.requestJSON(method: "GET", path: "/machines", timeoutSeconds: 3)) : nil
             let diskUsage = (status != nil) ? (try? FirnHostClient.requestJSON(method: "GET", path: "/disk/usage", timeoutSeconds: 3)) : nil
+            let volSnaps = (status != nil && !hibernated) ? (try? FirnHostClient.requestJSON(method: "GET", path: "/volumes/snapshots", timeoutSeconds: 3)) : nil
+            let regCache = (status != nil && !hibernated) ? (try? FirnHostClient.requestJSON(method: "GET", path: "/cache/status", timeoutSeconds: 3)) : nil
             let dockerCtx = Self.readCurrentDockerContext()
 
             if let tv = (status?["topologyVersion"] as? NSNumber)?.uint64Value {
@@ -582,6 +610,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.latestK8sServicesPayload = k8sServices
                 self.latestMachinesPayload = machines
                 self.latestDiskPayload = diskUsage
+                self.latestVolumesPayload = volSnaps
+                self.latestCachePayload = regCache
                 self.currentDockerContext = dockerCtx
                 if let hostMem = status?["hostMemory"] as? [String: Any] {
                     let fpBytes = (hostMem["footprintBytes"] as? NSNumber)?.doubleValue ?? 0
@@ -597,8 +627,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     k8sPayload: k8s,
                     machinesPayload: machines,
                     diskPayload: diskUsage,
-                    k8sServicesPayload: k8sServices
+                    k8sServicesPayload: k8sServices,
+                    volumesPayload: volSnaps,
+                    cachePayload: regCache
                 )
+                Task { @MainActor in
+                    self.store?.applyPayloads(
+                        statusPayload: status,
+                        dnsPayload: dns,
+                        k8sPayload: k8s,
+                        machinesPayload: machines,
+                        diskPayload: diskUsage,
+                        k8sServicesPayload: k8sServices,
+                        volumesPayload: volSnaps,
+                        cachePayload: regCache,
+                        currentDockerContext: dockerCtx,
+                        availableUpdateTag: self.availableUpdateTag
+                    )
+                }
             }
         }
     }
@@ -646,7 +692,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     k8sPayload: self.latestK8sPayload,
                     machinesPayload: self.latestMachinesPayload,
                     diskPayload: self.latestDiskPayload,
-                    k8sServicesPayload: self.latestK8sServicesPayload
+                    k8sServicesPayload: self.latestK8sServicesPayload,
+                    volumesPayload: self.latestVolumesPayload,
+                    cachePayload: self.latestCachePayload
                 )
             }
         }
@@ -677,8 +725,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func siblingCLIExecutable() -> String {
         let bundleParent = Bundle.main.bundleURL.deletingLastPathComponent()
-        let siblingCLI = bundleParent.appendingPathComponent("firn").path
-        return FileManager.default.isExecutableFile(atPath: siblingCLI) ? siblingCLI : "firn"
+        let candidates = [
+            bundleParent.appendingPathComponent("firn").path,
+            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/firn").path,
+            "/opt/homebrew/bin/firn",
+            "/usr/local/bin/firn",
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return "firn"
     }
 
     private func runCLIAction(_ args: [String]) {
@@ -695,6 +753,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             try? proc.run()
             proc.waitUntilExit()
             self?.refreshStatus()
+        }
+    }
+
+    private func openDashboardWindow() {
+        Task { @MainActor in
+            guard let store = self.store else { return }
+            if self.dashboardController == nil {
+                self.dashboardController = DashboardWindowController(store: store)
+            }
+            self.dashboardController?.showAndActivate()
         }
     }
 
@@ -823,13 +891,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         k8sPayload: [String: Any]?,
         machinesPayload: [String: Any]?,
         diskPayload: [String: Any]? = nil,
-        k8sServicesPayload: [String: Any]? = nil
+        k8sServicesPayload: [String: Any]? = nil,
+        volumesPayload: [String: Any]? = nil,
+        cachePayload: [String: Any]? = nil
     ) {
         actionBoxes.removeAll()
         let menu = NSMenu()
 
         guard let payload = statusPayload else {
             configureButton(title: "Offline")
+            addAction("Open Firn Control Center", to: menu, keyEquivalent: "0") { [weak self] in
+                self?.openDashboardWindow()
+            }
+            menu.addItem(.separator())
             let offlineItem = NSMenuItem(title: "Firn VM offline", action: nil, keyEquivalent: "")
             offlineItem.isEnabled = false
             menu.addItem(offlineItem)
@@ -854,7 +928,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let cpuPct = (hostMem?["cpuPercent"] as? NSNumber)?.doubleValue ?? 0
 
         if hibernated {
-            configureButton(title: "Hibernated")
+            configureButton(title: "Hibernated", hibernated: true)
+            addAction("Open Firn Control Center", to: menu, keyEquivalent: "0") { [weak self] in
+                self?.openDashboardWindow()
+            }
+            menu.addItem(.separator())
             if !metricSamples.isEmpty {
                 appendSparklineItem(to: menu)
             }
@@ -906,12 +984,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let swapUsed = (vmMem["swapUsedBytes"] as? NSNumber)?.uint64Value ?? 0
         let balloonTarget = ((payload["balloon"] as? [String: Any])?["targetBytes"] as? NSNumber)?.uint64Value ?? total
 
-        configureButton(title: FirnHostClient.formatBytes(hostFootprint > 0 ? hostFootprint : used))
+        let mpObj = payload["memoryPressure"] as? [String: Any]
+        let mpLevel = (mpObj?["level"] as? String) ?? "normal"
+        configureButton(
+            title: FirnHostClient.formatBytes(hostFootprint > 0 ? hostFootprint : used),
+            hibernated: false,
+            pressureWarning: mpLevel != "normal"
+        )
+        addAction("Open Firn Control Center", to: menu, keyEquivalent: "0") { [weak self] in
+            self?.openDashboardWindow()
+        }
+        menu.addItem(.separator())
         appendSparklineItem(to: menu)
 
         if hostFootprint > 0 {
+            let mpTag = mpLevel != "normal" ? " • Pressure: \(mpLevel.uppercased())" : ""
             let hostLine = NSMenuItem(
-                title: String(format: "Host Footprint: %@ (RSS: %@, CPU: %.1f%%)", FirnHostClient.formatBytes(hostFootprint), FirnHostClient.formatBytes(hostRSS), cpuPct),
+                title: String(format: "Host Footprint: %@ (RSS: %@, CPU: %.1f%%%@)", FirnHostClient.formatBytes(hostFootprint), FirnHostClient.formatBytes(hostRSS), cpuPct, mpTag),
                 action: nil,
                 keyEquivalent: ""
             )
@@ -956,6 +1045,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 let volB = (guestDisk["dockerVolumesBytes"] as? NSNumber)?.uint64Value ?? 0
                 let bcB = (guestDisk["dockerBuildCacheBytes"] as? NSNumber)?.uint64Value ?? 0
                 let recB = (guestDisk["dockerReclaimableBytes"] as? NSNumber)?.uint64Value ?? 0
+                let cacheB = (guestDisk["registryCacheBytes"] as? NSNumber)?.uint64Value ?? 0
+                let snapB = (guestDisk["snapshotsBytes"] as? NSNumber)?.uint64Value ?? 0
                 if imgB + volB + bcB > 0 {
                     let bItem = NSMenuItem(
                         title: "Images: \(FirnHostClient.formatBytes(imgB)) • Volumes: \(FirnHostClient.formatBytes(volB)) • Cache: \(FirnHostClient.formatBytes(bcB))",
@@ -972,6 +1063,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     rItem.isEnabled = false
                     diskSub.addItem(rItem)
                     diskSub.addItem(.separator())
+                }
+                if cacheB + snapB > 0 {
+                    let xItem = NSMenuItem(
+                        title: "Registry Mirror: \(FirnHostClient.formatBytes(cacheB)) • Snapshots: \(FirnHostClient.formatBytes(snapB))",
+                        action: nil,
+                        keyEquivalent: ""
+                    )
+                    xItem.isEnabled = false
+                    diskSub.addItem(xItem)
                 }
             }
             addAction("Trim Sparse Disk (fstrim)", to: diskSub) { [weak self] in
@@ -995,6 +1095,102 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.refreshStatus()
                 }
             }
+
+            // Registry Pull-Through Cache submenu
+            let regEnabled = (cachePayload?["enabled"] as? Bool) ?? true
+            let regUsed = (cachePayload?["usedBytes"] as? NSNumber)?.uint64Value ?? 0
+            let regHits = (cachePayload?["hits"] as? NSNumber)?.uint64Value ?? 0
+            let regMisses = (cachePayload?["misses"] as? NSNumber)?.uint64Value ?? 0
+            let regSaved = (cachePayload?["savedBytes"] as? NSNumber)?.uint64Value ?? 0
+            let cacheMenuItem = NSMenuItem(
+                title: "Registry Cache [\(regEnabled ? "On" : "Off") • \(FirnHostClient.formatBytes(regUsed))]",
+                action: nil,
+                keyEquivalent: ""
+            )
+            let cacheSub = NSMenu()
+            let statsItem = NSMenuItem(
+                title: "Hits: \(regHits) • Misses: \(regMisses) • Saved: \(FirnHostClient.formatBytes(regSaved))",
+                action: nil,
+                keyEquivalent: ""
+            )
+            statsItem.isEnabled = false
+            cacheSub.addItem(statsItem)
+            addAction(regEnabled ? "Disable Pull-Through Cache" : "Enable Pull-Through Cache", to: cacheSub) { [weak self] in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = try? FirnHostClient.requestJSON(method: "POST", path: regEnabled ? "/cache/disable" : "/cache/enable", timeoutSeconds: 15)
+                    self?.refreshStatus()
+                }
+            }
+            addAction("Prune Expired Manifests / LRU", to: cacheSub) { [weak self] in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = try? FirnHostClient.requestJSON(method: "POST", path: "/cache/prune", timeoutSeconds: 60)
+                    self?.refreshStatus()
+                }
+            }
+            addAction("Clear All Cached Blobs…", to: cacheSub) { [weak self] in
+                guard let self, self.confirmAlert(title: "Clear Registry Cache", message: "Delete all cached OCI blobs and manifests inside the Firn VM?", confirmTitle: "Clear Cache") else {
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = try? FirnHostClient.requestJSON(method: "POST", path: "/cache/prune?all=1", timeoutSeconds: 60)
+                    self.refreshStatus()
+                }
+            }
+            cacheMenuItem.submenu = cacheSub
+            diskSub.addItem(.separator())
+            diskSub.addItem(cacheMenuItem)
+
+            // Volume Snapshots submenu
+            let snapList = (volumesPayload?["snapshots"] as? [[String: Any]]) ?? []
+            let snapMenuItem = NSMenuItem(title: "Volume Snapshots (\(snapList.count))", action: nil, keyEquivalent: "")
+            let snapSub = NSMenu()
+            addAction("Snapshot Volume…", to: snapSub) { [weak self] in
+                guard let self, let vol = self.promptTextAlert(title: "Snapshot Docker Volume", message: "Source Docker volume name:") else {
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    if let body = try? JSONSerialization.data(withJSONObject: ["volume": vol, "quiesce": true]) {
+                        _ = try? FirnHostClient.requestJSON(method: "POST", path: "/volumes/snapshot", body: body, timeoutSeconds: 180)
+                    }
+                    self.refreshStatus()
+                }
+            }
+            if !snapList.isEmpty {
+                snapSub.addItem(.separator())
+                for s in snapList {
+                    let sName = (s["name"] as? String) ?? ""
+                    let sVol = (s["volume"] as? String) ?? ""
+                    let sBytes = (s["bytes"] as? NSNumber)?.uint64Value ?? 0
+                    let sItem = NSMenuItem(title: "\(sName) (\(sVol) • \(FirnHostClient.formatBytes(sBytes)))", action: nil, keyEquivalent: "")
+                    let sSub = NSMenu()
+                    addAction("Clone to Volume…", to: sSub) { [weak self] in
+                        guard let self, let dst = self.promptTextAlert(title: "Clone Snapshot '\(sName)'", message: "Target Docker volume name:", defaultValue: "\(sVol)-clone") else {
+                            return
+                        }
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            if let body = try? JSONSerialization.data(withJSONObject: ["source": sName, "target": dst, "fromSnapshot": true]) {
+                                _ = try? FirnHostClient.requestJSON(method: "POST", path: "/volumes/clone", body: body, timeoutSeconds: 180)
+                            }
+                            self.refreshStatus()
+                        }
+                    }
+                    addAction("Delete Snapshot…", to: sSub) { [weak self] in
+                        guard let self, self.confirmAlert(title: "Delete Volume Snapshot '\(sName)'", message: "Remove snapshot data '\(sName)'?", confirmTitle: "Delete") else {
+                            return
+                        }
+                        let enc = sName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? sName
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            _ = try? FirnHostClient.requestJSON(method: "POST", path: "/volumes/snapshots/\(enc)/delete", timeoutSeconds: 30)
+                            self.refreshStatus()
+                        }
+                    }
+                    sItem.submenu = sSub
+                    snapSub.addItem(sItem)
+                }
+            }
+            snapMenuItem.submenu = snapSub
+            diskSub.addItem(snapMenuItem)
+
             diskMenuItem.submenu = diskSub
             menu.addItem(diskMenuItem)
         }
@@ -1005,13 +1201,50 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let httpProxyPort = (dnsObj?["httpProxyPort"] as? Int) ?? 8088
         let httpsProxyPort = (dnsObj?["httpsProxyPort"] as? Int) ?? 8443
         let caTrusted = (dnsObj?["caTrusted"] as? Bool) ?? false
-        let dnsItem = NSMenuItem(
-            title: "DNS/Proxy: *.\(domain) (DNS :\(dnsPort), HTTP :\(httpProxyPort), HTTPS :\(httpsProxyPort)\(caTrusted ? ", CA ✓" : ""))",
+        let pfActive = (dnsObj?["pfRedirectActive"] as? Bool) ?? false
+        let utunConnected = (routeObj["utunConnected"] as? Bool) ?? false
+        let hasResolver = FileManager.default.fileExists(atPath: "/etc/resolver/\(domain)")
+
+        let netSetupItem = NSMenuItem(
+            title: "Local Network: *.\(domain) (HTTP :\(httpProxyPort), HTTPS :\(httpsProxyPort)\(caTrusted ? ", CA ✓" : ""))",
             action: nil,
             keyEquivalent: ""
         )
-        dnsItem.isEnabled = false
-        menu.addItem(dnsItem)
+        let netSub = NSMenu()
+        let dnsStatusItem = NSMenuItem(title: "Split DNS (/etc/resolver/\(domain), :\(dnsPort)): \(hasResolver ? "Installed ✓" : "Not installed")", action: nil, keyEquivalent: "")
+        dnsStatusItem.isEnabled = false
+        netSub.addItem(dnsStatusItem)
+        if !hasResolver {
+            addAction("Install Split DNS in Terminal (`firn dns install`)…", to: netSub) { [weak self] in
+                self?.openShellInTerminal(args: ["dns", "install"])
+            }
+        }
+        let caStatusItem = NSMenuItem(title: "System Root CA Trust: \(caTrusted ? "Trusted ✓" : "Not trusted")", action: nil, keyEquivalent: "")
+        caStatusItem.isEnabled = false
+        netSub.addItem(caStatusItem)
+        if !caTrusted {
+            addAction("Trust Firn Root CA in Terminal (`firn ca install`)…", to: netSub) { [weak self] in
+                self?.openShellInTerminal(args: ["ca", "install"])
+            }
+        }
+        let pfStatusItem = NSMenuItem(title: "Zero-Port :80/:443 pf Anchor: \(pfActive ? "Active ✓" : "Not installed")", action: nil, keyEquivalent: "")
+        pfStatusItem.isEnabled = false
+        netSub.addItem(pfStatusItem)
+        if !pfActive {
+            addAction("Install :80/:443 Redirect in Terminal (`firn https install`)…", to: netSub) { [weak self] in
+                self?.openShellInTerminal(args: ["https", "install"])
+            }
+        }
+        let utunStatusItem = NSMenuItem(title: "Host utun Container Routing: \(utunConnected ? "Connected ✓" : "Offline")", action: nil, keyEquivalent: "")
+        utunStatusItem.isEnabled = false
+        netSub.addItem(utunStatusItem)
+        if !utunConnected {
+            addAction("Install utun Route Daemon in Terminal (`firn route install`)…", to: netSub) { [weak self] in
+                self?.openShellInTerminal(args: ["route", "install"])
+            }
+        }
+        netSetupItem.submenu = netSub
+        menu.addItem(netSetupItem)
 
         if let proxy = payload["proxy"] as? [String: Any] {
             let vpn = (proxy["vpnActive"] as? Bool) ?? false
@@ -1179,6 +1412,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         // Compose stacks
         let records = (dnsPayload?["records"] as? [[String: Any]]) ?? []
         let projects = (payload["projects"] as? [[String: Any]]) ?? []
+        let orphanedProjects = projects.filter { ($0["orphaned"] as? Bool) == true }
+        if !orphanedProjects.isEmpty {
+            addAction("Prune \(orphanedProjects.count) Orphaned Stack(s)…", to: menu) { [weak self] in
+                let names = orphanedProjects.compactMap { $0["project"] as? String }.joined(separator: ", ")
+                guard let self, self.confirmAlert(
+                    title: "Prune \(orphanedProjects.count) Orphaned Compose Stack(s)",
+                    message: "Remove containers and networks whose worktree directory no longer exists on macOS? (\(names))",
+                    confirmTitle: "Remove Orphaned Stacks"
+                ) else {
+                    return
+                }
+                DispatchQueue.global(qos: .userInitiated).async {
+                    _ = try? FirnHostClient.requestJSON(method: "POST", path: "/stacks/prune", timeoutSeconds: 120)
+                    self.refreshStatus()
+                }
+            }
+        }
         if projects.isEmpty {
             let empty = NSMenuItem(title: "No active stacks", action: nil, keyEquivalent: "")
             empty.isEnabled = false
@@ -1190,11 +1440,33 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 let paused = ((proj["pausedCount"] as? Int) ?? 0) > 0
                 let running = (proj["runningCount"] as? Int) ?? 0
                 let exempt = (proj["exempt"] as? Bool) ?? false
-                let stateTag = exempt ? "Exempt" : (paused ? "Frozen" : "Running(\(running))")
+                let orphaned = (proj["orphaned"] as? Bool) ?? false
+                let workingDir = (proj["workingDir"] as? String) ?? ""
+                let baseTag = exempt ? "Exempt" : (paused ? "Frozen" : "Running(\(running))")
+                let stateTag = orphaned ? "\(baseTag) • Orphaned" : baseTag
 
                 let item = NSMenuItem(title: "\(name)  [\(stateTag)]  \(FirnHostClient.formatBytes(mem))", action: nil, keyEquivalent: "")
                 let sub = NSMenu()
                 let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+                if orphaned && !workingDir.isEmpty {
+                    let wdItem = NSMenuItem(title: "Missing dir: \(workingDir)", action: nil, keyEquivalent: "")
+                    wdItem.isEnabled = false
+                    sub.addItem(wdItem)
+                    addAction("Remove Orphaned Stack…", to: sub) { [weak self] in
+                        guard let self, self.confirmAlert(
+                            title: "Remove Orphaned Stack '\(name)'",
+                            message: "Directory '\(workingDir)' no longer exists on macOS. Remove its containers and networks (preserving named volumes)?",
+                            confirmTitle: "Remove Stack"
+                        ) else {
+                            return
+                        }
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            _ = try? FirnHostClient.requestJSON(method: "POST", path: "/projects/\(encoded)/remove", timeoutSeconds: 60)
+                            self.refreshStatus()
+                        }
+                    }
+                    sub.addItem(.separator())
+                }
                 if paused {
                     addAction("Thaw Stack", to: sub) { [weak self] in
                         DispatchQueue.global(qos: .userInitiated).async {
@@ -1230,8 +1502,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     let hdr = NSMenuItem(title: "Containers (\(containers.count))", action: nil, keyEquivalent: "")
                     hdr.isEnabled = false
                     sub.addItem(hdr)
-                    let dockerExe = findDockerExecutable()
-                    let dockerPrefix = dockerExe == "/usr/bin/env" ? ["docker"] : []
                     for c in containers {
                         let cName = (c["name"] as? String) ?? ""
                         let cSvc = (c["service"] as? String) ?? cName
@@ -1241,10 +1511,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                         let cSub = NSMenu()
                         if !cName.isEmpty {
                             addAction("Shell in Terminal", to: cSub) { [weak self] in
-                                self?.openCommandInTerminal(
-                                    executable: dockerExe,
-                                    args: dockerPrefix + ["--context", FirnConfig.defaultDockerContext, "exec", "-it", cName, "/bin/sh"]
-                                )
+                                Task { @MainActor in
+                                    if let store = self?.store {
+                                        store.openDockerExecInTerminal(containerName: cName)
+                                    }
+                                }
                             }
                             addAction("View Logs…", to: cSub) { [weak self] in
                                 self?.openLogsWindow(

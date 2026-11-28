@@ -104,6 +104,16 @@ make e2e                                            # Full E2E verification (ino
 | Zero-config k8s dev loop (`firn k8s enable`, `load`, `services`) | `k3s v1.31.6+k3s1` Ready + direct pod access via `https://<svc>.<ns>.k8s.firn.local:8443` |
 | Machine Clone & Buildx Rosetta (`make e2e`) | `firn machine clone` preserves root + `-home` volumes; `firn buildx setup` builds & runs `linux/amd64` (`uname -m == x86_64`) |
 
+### v0.7.0 Highlights & Live Verification
+
+Live `v0.7.0` upgrades and verification on the same **Apple M5 Max** workstation (under active 5–6 Compose stacks / 33 running containers):
+
+- **Control-Plane & Disk Cache**: `firn status` median dropped `2,488.7 ms → 52.2 ms` (**`47.7×` faster**), `docker version` `485.4 ms → 28.9 ms` (**`16.8×` faster**), `docker.sock` `/_ping` `242.9 ms → 9.1 ms` (**`26.7×` faster**), and `firn disk usage` `>35s` → **`175.5 ms` fast-path / `18.4 ms` cached**.
+- **Storage, Mounts & Loaded Network**: Halved `/proc/mounts` `overlay` entries (`94 → 45`) via native `"data-root": "/var/lib/firn/docker"`, tuned `/dev/vdb` (`scheduler=none`, `read_ahead_kb=1024`, `commit=60,barrier=0`) reaching **`1.4–1.7 GB/s`** 256 MiB `conv=fsync` sequential write (`2.2 GB/s` read), and boosted loaded 128 MiB TCP to **`648.2 MiB/s` (`880.5 MiB/s` max)** host→container and **`457.3 MiB/s` (`560.5 MiB/s` max)** container→host (`4.8×` vs loaded v0.6.0).
+- **True Auto-Freeze, Memory Pressure Guard & Orphaned Stacks**: Filters internal mesh sockets and Docker `HEALTHCHECK` probes, automatically freezes orphaned/idlest stacks under macOS `warning`/`critical` memory pressure (`firn stacks`), and cleans up missing-worktree stacks.
+- **Volume Snapshots & Registry Pull-Through Cache**: Snapshotted a `50.0 MiB` volume in **`37.8 ms`** and cloned in **`96.3 ms`** (`copy_file_range`, 100% SHA-256 + write isolation); accelerated `busybox:1.36.1-musl` pull via built-in `127.0.0.1:5000` mirror (`firn cache`) from **`4,912.8 ms` → `1,209.3 ms`** (`4.06×`).
+- **Liquid Glass Control Center, Layered Strata Brand & Distroless Shell**: Native SwiftUI 7-section `Firn.app` Control Center (Graphite Pro Light/Dark theme, macOS 26+ Liquid Glass with `.ultraThinMaterial` fallback), pure-SVG Layered Strata icons (`assets/brand/`), and smart container shell detection (`/bin/bash` → `/bin/sh` → `/bin/ash` → `/busybox/sh`) with automatic `firn shell -t` + `nsenter` debug shell fallback for distroless images.
+
 ## Architecture
 
 ```mermaid
@@ -161,7 +171,7 @@ flowchart LR
 | `firn hibernate [--json]` | Save VM state to APFS (`vm-state.vzvmsave`) or park VM, dropping VM XPC memory to `0 MiB` |
 | `firn resume [--json]` | Restore hibernated VM immediately (`firn` also wakes automatically on traffic) |
 | `firn status [--json]` | Show guest/host memory, CPU%, capabilities, APFS disk, DNS/HTTPS, route, and stacks |
-| `firn shell [-- COMMAND...]` | Open interactive PTY shell (`vsock:2382`) with `SSH_AUTH_SOCK` forwarding |
+| `firn shell [-t\|--tty] [-- COMMAND...]` | Open interactive PTY shell (`vsock:2382`) with `SSH_AUTH_SOCK` forwarding (`-t` forces PTY for custom commands) |
 | `firn k8s <status\|enable\|disable\|reset\|freeze\|thaw\|services\|load <img...>\|kubeconfig>` | Manage built-in `k3s` cluster, list ClusterIP `*.k8s.<domain>` routes, or load local Docker images into `k8s.io` |
 | `firn machine <list\|create <name> [--distro D]\|clone <src> <dst>\|shell\|start\|stop\|delete>` | Manage persistent Ubuntu/Debian/Alpine/Arch/Fedora machines sharing `$HOME` or clone existing machines |
 | `firn mount <list\|add <hostPath> [--guest PATH] [--read-only]\|remove <hostPath>>` | Configure additional VirtioFS shared host directories |
@@ -171,8 +181,11 @@ flowchart LR
 | `firn freeze <project> [--reclaim]` | Freeze Compose stack (`cgroup.freeze`) and reclaim RAM + drop caches |
 | `firn thaw <project>` | Unpause a frozen Compose stack (auto-thaws on traffic) |
 | `firn reclaim [project]` | Reclaim cold container pages without manual pause |
+| `firn stacks <list\|prune [--dry-run] [--freeze] [--volumes]>` | List Compose stacks with worktree status or prune orphaned stacks |
+| `firn volume <snapshots\|snapshot <vol> [snap]\|clone <src> <dst>\|rm-snapshot>` | Snapshot and clone Docker volumes (CoW `FICLONE` / `copy_file_range` + `--quiesce`) |
+| `firn cache <status\|enable\|disable\|prune [--all]>` | Manage built-in OCI registry pull-through cache (`127.0.0.1:5000` for Docker & `k3s`) |
 | `firn balloon <shrink\|reset>` | Shrink memory balloon to guest demand or reset to `maxMemoryBytes` |
-| `firn disk <usage\|trim\|prune [--all]> [--json]` | Inspect APFS + Docker `/system/df` + `zram0` usage, run online `fstrim`, or prune cache/images + trim |
+| `firn disk <usage [--refresh]\|trim\|prune [--all]> [--json]` | Inspect APFS + cached Docker `/system/df` + `zram0` usage, run online `fstrim`, or prune cache/images |
 | `firn dns <status\|install\|uninstall>` | Inspect DNS records or install/remove `/etc/resolver/<domain>` (`sudo`) |
 | `firn ca <status\|install\|uninstall>` | Inspect Firn Root CA or trust/untrust in macOS System Keychain (`sudo`) |
 | `firn https <status\|install\|uninstall>` | Inspect `:8443` TLS proxy or manage `:80`/`:443` `pf` anchor (`sudo`) |
@@ -214,7 +227,7 @@ Global settings live in `~/.firn/config.json` (editable via `FirnBar` → **Sett
 - `FIRN_BACKEND` (`vz` default or `krun`), `FIRN_GPU` (`false` default), `FIRN_NESTED_VIRT` (`false` default)
 - `FIRN_HIBERNATE_SECONDS` (`0` disables auto-hibernate), `FIRN_IDLE_SECONDS` (`900`), `FIRN_EXEMPT_PROJECTS`
 - `FIRN_DOMAIN` (`firn.local`), `FIRN_DNS_PORT` (`53535`), `FIRN_HTTP_PROXY_PORT` (`8088`), `FIRN_HTTPS_PROXY_PORT` (`8443`), `FIRN_DIRECT_ROUTE_DNS` (`false`)
-- `FIRN_AUTO_TRIM_MINUTES` (`60`, background idle `fstrim` interval; `0` disables), `extraMounts` via `firn mount`
+- `FIRN_AUTO_TRIM_MINUTES` (`60`, background idle `fstrim` interval; `0` disables), `FIRN_MEMORY_PRESSURE_RECLAIM` (`true` default, freeze+reclaim orphaned/idle stacks on macOS `warning`/`critical` memory pressure), `extraMounts` via `firn mount`
 - `FIRN_INSTALL_DIR` (used by `scripts/install.sh`), `FIRN_IMAGE_VERSION` / `BUILD_DOCKER_CONTEXT` (used by `make build` / `guest/build-rootfs.sh`)
 
 ## Packaging & Homebrew

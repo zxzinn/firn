@@ -12,7 +12,8 @@ private func urlEncoded(_ value: String) -> String {
 }
 
 private func findRepoRootBinary(_ name: String) -> URL? {
-    let exeDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+    let exePath = FirnInstallOrigin.currentExecutablePath()
+    let exeDir = URL(fileURLWithPath: exePath).resolvingSymlinksInPath().deletingLastPathComponent()
     let sibling = exeDir.appendingPathComponent(name)
     if FileManager.default.isExecutableFile(atPath: sibling.path) {
         return sibling
@@ -35,7 +36,8 @@ private func findRepoRootBinary(_ name: String) -> URL? {
 }
 
 private func findFirnApp() -> URL? {
-    let exeDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+    let exePath = FirnInstallOrigin.currentExecutablePath()
+    let exeDir = URL(fileURLWithPath: exePath).resolvingSymlinksInPath().deletingLastPathComponent()
     for candidate in [
         exeDir.appendingPathComponent("Firn.app"),
         URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("build/Firn.app"),
@@ -175,11 +177,15 @@ private func printStatus(_ statusData: [String: Any]) {
     }
     if !hostMem.isEmpty {
         let cpu = dbl(hostMem, "cpuPercent")
+        let mp = (statusData["memoryPressure"] as? [String: Any]) ?? [:]
+        let mpLevel = (mp["level"] as? String) ?? "normal"
+        let mpEnabled = (mp["enabled"] as? Bool) ?? true
+        let mpStr = mpEnabled ? mpLevel : "\(mpLevel) (guard off)"
         print(
             "Host Memory: footprint=\(FirnHostClient.formatBytes(u64(hostMem, "footprintBytes"))) " +
             "(firnd=\(FirnHostClient.formatBytes(u64(hostMem, "daemonFootprintBytes"))), " +
             "vm=\(FirnHostClient.formatBytes(u64(hostMem, "vmFootprintBytes")))) " +
-            "rss=\(FirnHostClient.formatBytes(u64(hostMem, "rssBytes"))) cpu=\(String(format: "%.1f", cpu))%"
+            "rss=\(FirnHostClient.formatBytes(u64(hostMem, "rssBytes"))) cpu=\(String(format: "%.1f", cpu))% pressure=\(mpStr)"
         )
     }
     if !caps.isEmpty {
@@ -221,16 +227,23 @@ private func printStatus(_ statusData: [String: Any]) {
         print("No containers present.")
         return
     }
-    print("\(padRight("PROJECT", 32)) \(padLeft("RUN", 3)) \(padLeft("PAUSED", 6)) \(padRight("EXEMPT", 6)) \(padLeft("IDLE(s)", 8)) \(padLeft("MEM", 10)) \(padLeft("SWAP", 10))")
+    var orphanedCount = 0
+    print("\(padRight("PROJECT", 36)) \(padLeft("RUN", 3)) \(padLeft("PAUSED", 6)) \(padRight("EXEMPT", 6)) \(padLeft("IDLE(s)", 8)) \(padLeft("MEM", 10)) \(padLeft("SWAP", 10))")
     for proj in projects {
-        let name = (proj["project"] as? String) ?? ""
+        let rawName = (proj["project"] as? String) ?? ""
+        let orphaned = (proj["orphaned"] as? Bool) ?? false
+        if orphaned { orphanedCount += 1 }
+        let name = orphaned ? "\(rawName) [orphaned]" : rawName
         let run = "\(u64(proj, "runningCount"))"
         let paused = "\(u64(proj, "pausedCount"))"
         let exempt = ((proj["exempt"] as? Bool) ?? false) ? "true" : "false"
         let idle = String(format: "%.1f", dbl(proj, "idleForSeconds"))
         let mem = FirnHostClient.formatBytes(u64(proj, "memoryBytes"))
         let swap = FirnHostClient.formatBytes(u64(proj, "swapBytes"))
-        print("\(padRight(name, 32)) \(padLeft(run, 3)) \(padLeft(paused, 6)) \(padRight(exempt, 6)) \(padLeft(idle, 8)) \(padLeft(mem, 10)) \(padLeft(swap, 10))")
+        print("\(padRight(name, 36)) \(padLeft(run, 3)) \(padLeft(paused, 6)) \(padRight(exempt, 6)) \(padLeft(idle, 8)) \(padLeft(mem, 10)) \(padLeft(swap, 10))")
+    }
+    if orphanedCount > 0 {
+        print("Hint: \(orphanedCount) orphaned Compose stack(s) have missing worktree directories. Inspect or clean up with `firn stacks prune --dry-run`.")
     }
 }
 
@@ -393,11 +406,22 @@ private func cmdShell(_ args: [String], machine: String? = nil) throws -> Int32 
         throw NSError(domain: "Firn", code: 60, userInfo: [NSLocalizedDescriptionKey: "Shell socket \(sockPath) not found. Run `firn up` first."])
     }
 
-    var cmdArgs = args
-    if cmdArgs.first == "--" {
-        cmdArgs.removeFirst()
+    var rawArgs = args
+    var forceTTY = false
+    while let first = rawArgs.first {
+        if first == "--" {
+            rawArgs.removeFirst()
+            break
+        }
+        if first == "-t" || first == "--tty" {
+            forceTTY = true
+            rawArgs.removeFirst()
+            continue
+        }
+        break
     }
-    let interactive = cmdArgs.isEmpty && isatty(STDIN_FILENO) == 1
+    let cmdArgs = rawArgs
+    let interactive = (cmdArgs.isEmpty || forceTTY) && isatty(STDIN_FILENO) == 1
     let argv: [String]
     if cmdArgs.isEmpty {
         argv = ["/bin/sh", "-l"]
@@ -678,7 +702,8 @@ private func cmdDoctor() -> Int32 {
     let imgVer = FirnDistribution.installedImageVersion() ?? "unknown"
     let hasDataDisk = fm.fileExists(atPath: FirnPaths.dataDiskURL.path)
     let originLabel: String
-    switch FirnInstallOrigin.detect(executablePath: CommandLine.arguments[0]) {
+    let exePath = FirnInstallOrigin.currentExecutablePath()
+    switch FirnInstallOrigin.detect(executablePath: exePath) {
     case .homebrew(let cellar): originLabel = "homebrew (\(cellar))"
     case .standalone(let dir): originLabel = "standalone (\(dir.path))"
     }
@@ -892,10 +917,13 @@ private func cmdDisk(_ args: [String]) throws -> Int32 {
     let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "usage"
     let jsonMode = args.contains("--json")
     let allMode = args.contains("--all")
+    let refreshMode = args.contains("--refresh")
     switch sub {
     case "usage":
         if FirnHostClient.isDaemonAlive() {
-            let res = try FirnHostClient.requestJSON(method: "GET", path: "/disk/usage")
+            let usagePath = refreshMode ? "/disk/usage?refresh=1" : "/disk/usage"
+            let timeout = refreshMode ? 55 : 15
+            let res = try FirnHostClient.requestJSON(method: "GET", path: usagePath, timeoutSeconds: timeout)
             if jsonMode {
                 printPrettyJSON(res)
                 return 0
@@ -908,8 +936,18 @@ private func cmdDisk(_ args: [String]) throws -> Int32 {
                 let volB = u64(guest, "dockerVolumesBytes")
                 let bcB = u64(guest, "dockerBuildCacheBytes")
                 let recB = u64(guest, "dockerReclaimableBytes")
+                let dfPending = (guest["dockerDfPending"] as? Bool) ?? false
+                let dfStale = (guest["dockerDfStale"] as? Bool) ?? false
                 if imgB + cntB + volB + bcB > 0 {
-                    print("Docker storage: images=\(FirnHostClient.formatBytes(imgB)), containers=\(FirnHostClient.formatBytes(cntB)), volumes=\(FirnHostClient.formatBytes(volB)), buildCache=\(FirnHostClient.formatBytes(bcB)), reclaimable=\(FirnHostClient.formatBytes(recB))")
+                    let tag = dfStale ? " (cached; updating in background)" : ""
+                    print("Docker storage: images=\(FirnHostClient.formatBytes(imgB)), containers=\(FirnHostClient.formatBytes(cntB)), volumes=\(FirnHostClient.formatBytes(volB)), buildCache=\(FirnHostClient.formatBytes(bcB)), reclaimable=\(FirnHostClient.formatBytes(recB))\(tag)")
+                } else if dfPending {
+                    print("Docker storage: calculating breakdown in background (run `firn disk usage` again or `--refresh`)...")
+                }
+                let regB = u64(guest, "registryCacheBytes")
+                let snapB = u64(guest, "snapshotsBytes")
+                if regB + snapB > 0 {
+                    print("Firn storage extras: registryCache=\(FirnHostClient.formatBytes(regB)), volumeSnapshots=\(FirnHostClient.formatBytes(snapB))")
                 }
             }
             return 0
@@ -944,7 +982,220 @@ private func cmdDisk(_ args: [String]) throws -> Int32 {
         }
         return 0
     default:
-        throw NSError(domain: "Firn", code: 24, userInfo: [NSLocalizedDescriptionKey: "Usage: firn disk <usage|trim|prune [--all]> [--json]"])
+        throw NSError(domain: "Firn", code: 24, userInfo: [NSLocalizedDescriptionKey: "Usage: firn disk <usage [--refresh]|trim|prune [--all]> [--json]"])
+    }
+}
+
+private func cmdStacks(_ args: [String]) throws -> Int32 {
+    let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "list"
+    let rest = Array(args.dropFirst())
+    let asJSON = args.contains("--json")
+    switch sub {
+    case "list", "ls":
+        let st = try FirnHostClient.requestJSON(method: "GET", path: "/status")
+        let projects = (st["projects"] as? [[String: Any]]) ?? []
+        if asJSON {
+            printPrettyJSON(["projects": projects, "orphanedProjectCount": u64(st, "orphanedProjectCount")])
+            return 0
+        }
+        if projects.isEmpty {
+            print("No Compose stacks present.")
+            return 0
+        }
+        print("\(padRight("PROJECT", 32)) \(padRight("STATUS", 14)) \(padLeft("IDLE(s)", 8)) \(padLeft("MEM", 10)) WORKING_DIR")
+        for p in projects {
+            let name = (p["project"] as? String) ?? ""
+            let orphaned = (p["orphaned"] as? Bool) ?? false
+            let run = u64(p, "runningCount")
+            let paused = u64(p, "pausedCount")
+            let state = orphaned ? "ORPHANED" : (paused > 0 ? "Frozen" : (run > 0 ? "Running(\(run))" : "Stopped"))
+            let idle = String(format: "%.1f", dbl(p, "idleForSeconds"))
+            let mem = FirnHostClient.formatBytes(u64(p, "memoryBytes"))
+            let wd = (p["workingDir"] as? String) ?? "-"
+            print("\(padRight(name, 32)) \(padRight(state, 14)) \(padLeft(idle, 8)) \(padLeft(mem, 10)) \(wd)")
+        }
+        return 0
+
+    case "prune":
+        let dryRun = rest.contains("--dry-run")
+        let freezeOnly = rest.contains("--freeze")
+        let rmVols = rest.contains("--volumes")
+        var q: [String] = []
+        if dryRun { q.append("dryRun=1") }
+        if freezeOnly { q.append("freeze=1") }
+        if rmVols { q.append("volumes=1") }
+        let suffix = q.isEmpty ? "" : "?\(q.joined(separator: "&"))"
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/stacks/prune\(suffix)", timeoutSeconds: 120)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        if dryRun {
+            let orphans = (res["orphaned"] as? [[String: Any]]) ?? []
+            if orphans.isEmpty {
+                print("No orphaned Compose stacks found.")
+                return 0
+            }
+            print("Found \(orphans.count) orphaned Compose stack(s):")
+            for o in orphans {
+                let name = (o["project"] as? String) ?? ""
+                let wd = (o["workingDir"] as? String) ?? ""
+                let mem = FirnHostClient.formatBytes(u64(o, "memoryBytes"))
+                print("  \(padRight(name, 32)) \(padLeft(mem, 10))  missing: \(wd)")
+            }
+            return 0
+        }
+        let count = u64(res, "affectedCount")
+        if count == 0 {
+            print("[firn] No orphaned Compose stacks to prune.")
+            return 0
+        }
+        let verb = freezeOnly ? "Froze + reclaimed" : "Removed"
+        print("[firn] \(verb) \(count) orphaned Compose stack(s).")
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 28, userInfo: [NSLocalizedDescriptionKey: "Usage: firn stacks <list|prune [--dry-run] [--freeze] [--volumes]> [--json]"])
+    }
+}
+
+private func cmdVolume(_ args: [String]) throws -> Int32 {
+    let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "snapshots"
+    let rest = Array(args.dropFirst())
+    let asJSON = args.contains("--json")
+    let quiesce = args.contains("--quiesce")
+    let overwrite = args.contains("--overwrite")
+    let fromSnapshot = args.contains("--snapshot")
+    let pos = rest.filter { !$0.hasPrefix("-") }
+
+    switch sub {
+    case "snapshots", "ls":
+        let res = try FirnHostClient.requestJSON(method: "GET", path: "/volumes/snapshots", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        let items = (res["snapshots"] as? [[String: Any]]) ?? []
+        if items.isEmpty {
+            print("No volume snapshots present. Create one with `firn volume snapshot <volume> [snapshot-name]`.")
+            return 0
+        }
+        print("\(padRight("SNAPSHOT", 28)) \(padRight("VOLUME", 26)) \(padLeft("FILES", 7)) \(padLeft("SIZE", 10)) \(padRight("MODE", 16)) CREATED")
+        for s in items {
+            let name = (s["name"] as? String) ?? ""
+            let vol = (s["volume"] as? String) ?? ""
+            let files = "\(u64(s, "files"))"
+            let sz = FirnHostClient.formatBytes(u64(s, "bytes"))
+            let mode = (s["cloneMode"] as? String) ?? ""
+            let created = (s["createdAt"] as? String) ?? ""
+            print("\(padRight(name, 28)) \(padRight(vol, 26)) \(padLeft(files, 7)) \(padLeft(sz, 10)) \(padRight(mode, 16)) \(created)")
+        }
+        return 0
+
+    case "snapshot":
+        guard let volume = pos.first, !volume.isEmpty else {
+            throw NSError(domain: "Firn", code: 29, userInfo: [NSLocalizedDescriptionKey: "Usage: firn volume snapshot <volume> [snapshot-name] [--quiesce] [--json]"])
+        }
+        let snapshot = pos.count > 1 ? pos[1] : ""
+        let payload: [String: Any] = ["volume": volume, "snapshot": snapshot, "quiesce": quiesce]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/volumes/snapshot", body: body, timeoutSeconds: 180)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Created snapshot '\(res["name"] ?? snapshot)' from volume '\(volume)' (\(u64(res, "files")) files, \(FirnHostClient.formatBytes(u64(res, "bytes"))), mode=\(res["cloneMode"] ?? "copy"), \(String(format: "%.1f", dbl(res, "durationMs"))) ms).")
+        return 0
+
+    case "clone":
+        guard pos.count >= 2 else {
+            throw NSError(domain: "Firn", code: 30, userInfo: [NSLocalizedDescriptionKey: "Usage: firn volume clone <source> <target-volume> [--snapshot] [--quiesce] [--overwrite] [--json]"])
+        }
+        let payload: [String: Any] = [
+            "source": pos[0],
+            "target": pos[1],
+            "fromSnapshot": fromSnapshot,
+            "quiesce": quiesce,
+            "overwrite": overwrite,
+        ]
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/volumes/clone", body: body, timeoutSeconds: 180)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Cloned \(res["sourceType"] ?? "source") '\(pos[0])' -> volume '\(pos[1])' (\(u64(res, "files")) files, \(FirnHostClient.formatBytes(u64(res, "bytes"))), mode=\(res["cloneMode"] ?? "copy"), \(String(format: "%.1f", dbl(res, "durationMs"))) ms).")
+        return 0
+
+    case "rm-snapshot", "delete-snapshot", "rm":
+        guard let snapName = pos.first, !snapName.isEmpty else {
+            throw NSError(domain: "Firn", code: 31, userInfo: [NSLocalizedDescriptionKey: "Usage: firn volume rm-snapshot <snapshot-name>"])
+        }
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/volumes/snapshots/\(urlEncoded(snapName))/delete", timeoutSeconds: 30)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Deleted snapshot '\(snapName)'.")
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 32, userInfo: [NSLocalizedDescriptionKey: "Usage: firn volume <snapshots|snapshot <vol> [snap]|clone <src> <dst>|rm-snapshot <snap>> [--json]"])
+    }
+}
+
+private func cmdCache(_ args: [String]) throws -> Int32 {
+    let sub = args.first(where: { !$0.hasPrefix("-") }) ?? "status"
+    let asJSON = args.contains("--json")
+    let allMode = args.contains("--all")
+    switch sub {
+    case "status":
+        let res = try FirnHostClient.requestJSON(method: "GET", path: "/cache/status", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        let enabled = (res["enabled"] as? Bool) ?? false
+        let listening = (res["listening"] as? Bool) ?? false
+        let mirror = (res["mirrorUrl"] as? String) ?? "http://127.0.0.1:5000"
+        let upstream = (res["upstream"] as? String) ?? ""
+        let used = FirnHostClient.formatBytes(u64(res, "usedBytes"))
+        let maxB = FirnHostClient.formatBytes(u64(res, "maxBytes"))
+        let saved = FirnHostClient.formatBytes(u64(res, "savedBytes"))
+        print("Registry Pull-Through Cache: enabled=\(enabled), listening=\(listening), mirror=\(mirror), upstream=\(upstream)")
+        print("Usage: \(used) / \(maxB) (blobs=\(u64(res, "blobCount")), manifests=\(u64(res, "manifestCount")), hits=\(u64(res, "hits")), misses=\(u64(res, "misses")), saved=\(saved))")
+        return 0
+
+    case "enable", "on":
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/cache/enable", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Enabled registry pull-through cache at \(res["mirrorUrl"] ?? "http://127.0.0.1:5000") (reloaded dockerd & k3s mirror config).")
+        return 0
+
+    case "disable", "off":
+        let res = try FirnHostClient.requestJSON(method: "POST", path: "/cache/disable", timeoutSeconds: 15)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Disabled registry pull-through cache (reloaded dockerd & removed k3s mirror).")
+        return 0
+
+    case "prune":
+        let path = allMode ? "/cache/prune?all=1" : "/cache/prune"
+        let res = try FirnHostClient.requestJSON(method: "POST", path: path, timeoutSeconds: 60)
+        if asJSON {
+            printPrettyJSON(res)
+            return 0
+        }
+        print("[firn] Pruned registry cache\(allMode ? " (--all)" : ""): removed \(u64(res, "removedBlobs")) blobs, \(u64(res, "removedManifests")) manifests, freed \(FirnHostClient.formatBytes(u64(res, "freedBytes"))).")
+        return 0
+
+    default:
+        throw NSError(domain: "Firn", code: 33, userInfo: [NSLocalizedDescriptionKey: "Usage: firn cache <status|enable|disable|prune [--all]> [--json]"])
     }
 }
 
@@ -1973,7 +2224,8 @@ private func cmdUpgrade(_ args: [String]) throws -> Int32 {
         throw NSError(domain: "Firn", code: 90, userInfo: [NSLocalizedDescriptionKey: "Usage: firn upgrade [--check] [--version vX.Y.Z] [--no-images] [--no-restart] [--force]"])
     }
 
-    let origin = FirnInstallOrigin.detect(executablePath: CommandLine.arguments[0])
+    let exePath = FirnInstallOrigin.currentExecutablePath()
+    let origin = FirnInstallOrigin.detect(executablePath: exePath)
     let release = try fetchGitHubReleaseJSON(version: targetVersion)
     guard let tagName = release["tag_name"] as? String else {
         throw NSError(domain: "Firn", code: 92, userInfo: [NSLocalizedDescriptionKey: "Unexpected GitHub release JSON response"])
@@ -2050,7 +2302,7 @@ private func cmdUpgrade(_ args: [String]) throws -> Int32 {
         throw NSError(domain: "Firn", code: 98, userInfo: [NSLocalizedDescriptionKey: "tar extraction failed: \(untar.stderr)"])
     }
 
-    let installDir = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
+    let installDir = URL(fileURLWithPath: FirnInstallOrigin.currentExecutablePath()).resolvingSymlinksInPath().deletingLastPathComponent()
     let unpackedFirnd = unpackDir.appendingPathComponent("firnd")
     if fm.fileExists(atPath: unpackedFirnd.path) {
         try verifyOrResignFirnd(binaryURL: unpackedFirnd, unpackedDir: unpackDir, installDir: installDir)
@@ -2145,7 +2397,7 @@ private func printHelp() {
       firn images <status|pull [--version vX.Y.Z] [--force]> [--json]
       firn hibernate [--json]
       firn resume [--json]
-      firn shell [-- COMMAND...]
+      firn shell [-t|--tty] [-- COMMAND...]
       firn k8s <status|enable [--no-kubeconfig] [--use]|disable|reset [--purge-binary]|freeze|thaw|services|load <image...>|kubeconfig [--write] [--use]>
       firn machine <list|create <name> [--distro D]|clone <src> <dst>|shell <name> [-- CMD]|start|stop|delete>
       firn mount <list|add <hostPath> [--guest PATH] [--read-only]|remove <hostPath>>
@@ -2155,8 +2407,11 @@ private func printHelp() {
       firn freeze <project> [--reclaim]
       firn thaw <project>
       firn reclaim [project]
+      firn stacks <list|prune [--dry-run] [--freeze] [--volumes]> [--json]
+      firn volume <snapshots|snapshot <vol> [snap] [--quiesce]|clone <src> <dst> [--quiesce] [--overwrite]|rm-snapshot <snap>> [--json]
+      firn cache <status|enable|disable|prune [--all]> [--json]
       firn balloon <shrink|reset>
-      firn disk <usage|trim|prune [--all]> [--json]
+      firn disk <usage [--refresh]|trim|prune [--all]> [--json]
       firn dns <status|install|uninstall>
       firn ca <status|install|uninstall>
       firn https <status|install|uninstall>
@@ -2232,6 +2487,12 @@ private func runCLI() throws -> Int32 {
         let res = try FirnHostClient.requestJSON(method: "POST", path: path)
         printPrettyJSON(res)
         return 0
+    case "stacks", "stack":
+        return try cmdStacks(rest)
+    case "volume", "volumes":
+        return try cmdVolume(rest)
+    case "cache":
+        return try cmdCache(rest)
     case "balloon":
         guard let action = rest.first, action == "shrink" || action == "reset" else {
             throw NSError(domain: "Firn", code: 15, userInfo: [NSLocalizedDescriptionKey: "Usage: firn balloon <shrink|reset>"])

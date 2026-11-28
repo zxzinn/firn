@@ -104,6 +104,16 @@ make e2e                                            # 完整 E2E 驗證（inotif
 | 零設定 Kubernetes 閉環（`firn k8s enable`, `load`, `services`） | `k3s v1.31.6+k3s1` 就緒並透過 `https://<svc>.<ns>.k8s.firn.local:8443` 直連叢集 Pod |
 | Linux Machine Clone 與 Buildx Rosetta（`make e2e`） | `firn machine clone` 保留根目錄與 `-home` 資料卷；`firn buildx setup` 支援 `linux/amd64` 建置與 Rosetta 執行（`uname -m == x86_64`） |
 
+### v0.7.0 重點新功能與同機實測
+
+於同台 **Apple M5 Max** 工作站（背景同時運行 5–6 組 Compose 堆疊／33 個活躍容器）升級並實測 `v0.7.0`：
+
+- **控制面與非阻塞磁碟分析**：`firn status` 中位數從 `2,488.7 ms` 降至 **`52.2 ms`**（**`47.7×` 加速**），`docker version` 從 `485.4 ms` 降至 **`28.9 ms`**（**`16.8×` 加速**），`docker.sock` `/_ping` 從 `242.9 ms` 降至 **`9.1 ms`**（**`26.7×` 加速**），`firn disk usage` 從 `>35s` 卡頓縮短為 **`175.5 ms` fast-path / `18.4 ms` 快取命中**。
+- **儲存層、掛載清理與高負載網路**：透過原生 `"data-root": "/var/lib/firn/docker"` 移除雙重 bind-mount（`/proc/mounts` `overlay` 項目由 `94` 減半為 `45`），調校 `/dev/vdb`（`scheduler=none`、`read_ahead_kb=1024`、`commit=60,barrier=0`）使 256 MiB `conv=fsync` 循序寫入達 **`1.4–1.7 GB/s`**（循序讀取 **`2.2 GB/s`**）；高負載下 128 MiB 原始 TCP 達 **`648.2 MiB/s`（峰值 `880.5 MiB/s`）** 宿主→容器與 **`457.3 MiB/s`（峰值 `560.5 MiB/s`）** 容器→宿主（較同負載 v0.6.0 **快 `4.8×`**）。
+- **精準自動冷凍、記憶體壓力防線與孤兒 Worktree 清理**：排除專案內網連線與 Docker `HEALTHCHECK` Probe 雜訊，並在 macOS 發出 `warning`/`critical` 記憶體壓力警報時自動優先冷凍孤兒／閒置專案並縮減 Balloon（`firn stacks`）。
+- **即時 Volume 快照複製與內建 Registry Pull-Through Cache**：`50.0 MiB` Volume 於 **`37.8 ms`** 完成快照、**`96.3 ms`** 完成複製（`copy_file_range`，SHA-256 與寫入隔離 100% 通過）；透過內建 `127.0.0.1:5000` 快取（`firn cache`），`busybox:1.36.1-musl` 第二次拉取由 **`4,912.8 ms` 加速至 `1,209.3 ms`**（`4.06×`）。
+- **Liquid Glass 主控台、Layered Strata SVG 識別與 Distroless Shell**：`Firn.app` 新增 7 分頁原生 SwiftUI 控制中心（Graphite Pro 淺／深自適應與 macOS 26+ 原生液態玻璃，舊版退回 `.ultraThinMaterial`）、純 SVG Layered Strata 品牌圖示（[assets/brand/](./assets/brand/)），以及支援 `/bin/bash` → `/bin/sh` → `/bin/ash` → `/busybox/sh` 探測與無 shell 映像檔（distroless）自動 `firn shell -t` + `nsenter` 除錯連線。
+
 ## 系統架構
 
 ```mermaid
@@ -161,7 +171,7 @@ flowchart LR
 | `firn hibernate [--json]` | 將 VM 狀態儲存於 APFS（`vm-state.vzvmsave`）或停機休眠，釋放 VM XPC 記憶體至 `0 MiB` |
 | `firn resume [--json]` | 立即還原休眠中的 VM（收到流量時亦會自動喚醒） |
 | `firn status [--json]` | 查看 VM／主機記憶體、CPU%、能力旗標、APFS 稀疏磁碟、DNS／HTTPS、路由與各專案狀態 |
-| `firn shell [-- COMMAND...]` | 經由 `vsock:2382` 開啟互動式 PTY Shell（內建 `SSH_AUTH_SOCK` 轉發） |
+| `firn shell [-t\|--tty] [-- COMMAND...]` | 經由 `vsock:2382` 開啟互動式 PTY Shell（內建 `SSH_AUTH_SOCK` 轉發，`-t` 可為自訂指令強制配置 PTY） |
 | `firn k8s <status\|enable\|disable\|reset\|freeze\|thaw\|services\|load <img...>\|kubeconfig>` | 管理內建 `k3s` 叢集、檢視自動探索的 `*.k8s.<domain>` 服務，或匯入本地映像檔至 `k8s.io` |
 | `firn machine <list\|create <name> [--distro D]\|clone <src> <dst>\|shell\|start\|stop\|delete>` | 管理共享 `$HOME` 的持久化 Linux Machines，並支援完整系統與資料卷複製 |
 | `firn mount <list\|add <hostPath> [--guest PATH] [--read-only]\|remove <hostPath>>` | 管理額外 VirtioFS 宿主共享目錄掛載點 |
@@ -171,8 +181,11 @@ flowchart LR
 | `firn freeze <project> [--reclaim]` | 使用 `cgroup.freeze` 暫停專案並回收記憶體與釋放快取 |
 | `firn thaw <project>` | 手動解凍指定專案（連線進入時也會自動解凍） |
 | `firn reclaim [project]` | 回收閒置記憶體頁面而不強制暫停容器 |
+| `firn stacks <list\|prune [--dry-run] [--freeze] [--volumes]>` | 列出 Compose 堆疊與 worktree 狀態，或清理目錄已不存在的孤兒堆疊 |
+| `firn volume <snapshots\|snapshot <vol> [snap]\|clone <src> <dst>\|rm-snapshot>` | 快速建立與複製 Docker Volume 快照（`FICLONE` / `copy_file_range` ＋ `--quiesce`） |
+| `firn cache <status\|enable\|disable\|prune [--all]>` | 管理內建 OCI Registry pull-through 快取（`127.0.0.1:5000`，同時服務 Docker 與 `k3s`） |
 | `firn balloon <shrink\|reset>` | 將 VZ Balloon 縮放至 guest 需求量或恢復上限 |
-| `firn disk <usage\|trim\|prune [--all]> [--json]` | 查看 APFS／Docker `/system/df`／`zram0` 用量，線上執行 `fstrim` 或一鍵清理快取並縮容 |
+| `firn disk <usage [--refresh]\|trim\|prune [--all]> [--json]` | 非阻塞檢視 APFS／Docker `/system/df`／快取／快照用量，執行 `fstrim` 或清理縮容 |
 | `firn dns <status\|install\|uninstall>` | 檢視本機 DNS 紀錄或管理 `/etc/resolver/<domain>`（`sudo`） |
 | `firn ca <status\|install\|uninstall>` | 檢視 Firn 本機 Root CA 或寫入 macOS System Keychain（`sudo`） |
 | `firn https <status\|install\|uninstall>` | 檢視 `:8443` HTTPS 代理或安裝 `:80`/`:443` `pf` 轉向規則（`sudo`） |
@@ -214,7 +227,7 @@ services:
 - `FIRN_BACKEND`（預設 `vz`，可設 `krun`）、`FIRN_GPU`（預設 `false`）、`FIRN_NESTED_VIRT`（預設 `false`）
 - `FIRN_HIBERNATE_SECONDS`（預設 `0` 停用自動休眠）、`FIRN_IDLE_SECONDS`（預設 `900`）、`FIRN_EXEMPT_PROJECTS`
 - `FIRN_DOMAIN`（`firn.local`）、`FIRN_DNS_PORT`（`53535`）、`FIRN_HTTP_PROXY_PORT`（`8088`）、`FIRN_HTTPS_PROXY_PORT`（`8443`）、`FIRN_DIRECT_ROUTE_DNS`（`false`）
-- `FIRN_AUTO_TRIM_MINUTES`（預設 `60`，閒置定時執行 `fstrim`，設 `0` 停用）、另可透過 `firn mount` 設定 `extraMounts`
+- `FIRN_AUTO_TRIM_MINUTES`（預設 `60`，閒置定時執行 `fstrim`，設 `0` 停用）、`FIRN_MEMORY_PRESSURE_RECLAIM`（預設 `true`，當 macOS 發出 `warning`/`critical` 記憶體壓力警報時自動冷凍回收孤兒與閒置專案）、另可透過 `firn mount` 設定 `extraMounts`
 - `FIRN_INSTALL_DIR`（`scripts/install.sh` 安裝目標目錄）、`FIRN_IMAGE_VERSION` / `BUILD_DOCKER_CONTEXT`（`make build`／`guest/build-rootfs.sh` 使用）
 
 ## 套件分發與 Homebrew

@@ -44,7 +44,8 @@ let package = Package(
             name: "FirnBar",
             dependencies: ["FirnCore"],
             linkerSettings: [
-                .linkedFramework("AppKit")
+                .linkedFramework("AppKit"),
+                .linkedFramework("SwiftUI")
             ]
         ),
         .executableTarget(

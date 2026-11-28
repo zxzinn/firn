@@ -17,12 +17,14 @@ hostnet:
 
 swift:
 	swift build $(SWIFT_BUILD_FLAGS) -c release
-	mkdir -p build build/Firn.app/Contents/MacOS
+	mkdir -p build build/Firn.app/Contents/MacOS build/Firn.app/Contents/Resources
 	rm -f build/firn build/firnd build/Firn.app/Contents/MacOS/FirnBar
 	cp -f "$(SWIFT_REL_BIN)/firn" build/firn
 	cp -f "$(SWIFT_REL_BIN)/firnd" build/firnd
 	cp -f "$(SWIFT_REL_BIN)/FirnBar" build/Firn.app/Contents/MacOS/FirnBar
 	cp -f entitlements.plist build/entitlements.plist
+	[ -f assets/brand/AppIcon.icns ] && cp -f assets/brand/AppIcon.icns build/Firn.app/Contents/Resources/AppIcon.icns || true
+	[ -f assets/brand/FirnIcon.png ] && cp -f assets/brand/FirnIcon.png build/Firn.app/Contents/Resources/FirnIcon.png || true
 	chmod 755 build/firn build/firnd build/Firn.app/Contents/MacOS/FirnBar
 	codesign --entitlements entitlements.plist --force -s - build/firnd
 	printf '%s\n' \
@@ -32,14 +34,16 @@ swift:
 	  '<dict>' \
 	  '    <key>CFBundleExecutable</key>' \
 	  '    <string>FirnBar</string>' \
+	  '    <key>CFBundleIconFile</key>' \
+	  '    <string>AppIcon</string>' \
 	  '    <key>CFBundleIdentifier</key>' \
 	  '    <string>dev.firn.app</string>' \
 	  '    <key>CFBundleName</key>' \
 	  '    <string>Firn</string>' \
 	  '    <key>CFBundleShortVersionString</key>' \
-	  '    <string>0.6.1</string>' \
+	  '    <string>0.7.0</string>' \
 	  '    <key>CFBundleVersion</key>' \
-	  '    <string>0.6.1</string>' \
+	  '    <string>0.7.0</string>' \
 	  '    <key>LSUIElement</key>' \
 	  '    <true/>' \
 	  '</dict>' \
